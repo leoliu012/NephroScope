@@ -1,0 +1,17 @@
+[Unit]
+Description=AGH Viewer API
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agh-viewer/backend
+Environment="AGH_DATA_ROOT=/data/AGH_APP"
+Environment="AGH_ANN_ROOT=/data/agh_annotations"
+Environment="AGH_CACHE_ROOT=/data/agh_cache"
+Environment="PATH=/home/ubuntu/agh-viewer/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/agh-viewer/venv/bin/gunicorn --bind 127.0.0.1:5055 --workers 2 --threads 4 --timeout 120 "agh_api:create_app()"
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
