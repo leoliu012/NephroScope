@@ -1,0 +1,51 @@
+import shutil
+
+from flask import jsonify, request, send_file
+
+from .analysis_artifacts import artifact_mimetype, artifact_path, run_directory
+from .analysis_service import create_metric_run
+from .analysis_validation import validate_analysis_request
+from .path_guard import image_path
+
+
+def register_analysis_routes(app, config, cache, store):
+    @app.route("/agh/api/cases/<path:case>/files/<path:filename>/analysis-runs", methods=["POST"])
+    def create_analysis_run(case, filename):
+        path = image_path(config.data_root, case, filename)
+        metadata = cache.get_metadata(path)
+        payload = validate_analysis_request(request.get_json(silent=True), metadata)
+        run = store.create_run(case, filename, "magnifyseg-segmentation", payload)
+        return jsonify({"runId": run["runId"], "status": run["status"]}), 202
+
+    @app.route("/agh/api/cases/<path:case>/files/<path:filename>/analysis-runs", methods=["GET"])
+    def list_analysis_runs(case, filename):
+        image_path(config.data_root, case, filename)
+        operation = request.args.get("operation") or None
+        limit = request.args.get("limit", 20)
+        return jsonify({"runs": store.list_runs(case, filename, operation=operation, limit=limit)})
+
+    @app.route("/agh/api/analysis-runs/<run_id>")
+    def get_analysis_run(run_id):
+        return jsonify(store.get_run(run_id))
+
+    @app.route("/agh/api/analysis-runs/<run_id>", methods=["DELETE"])
+    def delete_analysis_run(run_id):
+        run = store.delete_run(run_id)
+        if run["operation"] == "magnifyseg-segmentation":
+            shutil.rmtree(run_directory(config.analysis_root, run_id), ignore_errors=True)
+        return jsonify({"deleted": True, "runId": run_id})
+
+    @app.route("/agh/api/analysis-runs/<run_id>/artifacts/<path:artifact>")
+    def get_analysis_artifact(run_id, artifact):
+        path = artifact_path(config.analysis_root, run_id, artifact)
+        return send_file(path, mimetype=artifact_mimetype(path), conditional=True, max_age=0)
+
+    @app.route("/agh/api/analysis-runs/<run_id>/metrics/gbm-thickness", methods=["POST"])
+    def compute_gbm_thickness(run_id):
+        run = create_metric_run(store, run_id, "gbm-thickness", request.get_json(silent=True) or {})
+        return jsonify({"runId": run["runId"], "status": run["status"], "operation": run["operation"]}), 202
+
+    @app.route("/agh/api/analysis-runs/<run_id>/metrics/process-nnd", methods=["POST"])
+    def compute_process_nnd(run_id):
+        run = create_metric_run(store, run_id, "process-nnd", request.get_json(silent=True) or {})
+        return jsonify({"runId": run["runId"], "status": run["status"], "operation": run["operation"]}), 202

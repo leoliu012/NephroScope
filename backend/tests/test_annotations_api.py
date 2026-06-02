@@ -34,15 +34,16 @@ class AnnotationApiTests(unittest.TestCase):
     def test_health_meta_channel_and_thumbnail(self):
         health = self.client.get("/agh/api/health")
         self.assertEqual(health.status_code, 200)
-        self.assertEqual(health.get_json(), {
-            "ok": True,
-            "service": "agh-viewer-api",
-            "version": "0.2.0",
-        })
+        health_json = health.get_json()
+        self.assertTrue(health_json["ok"])
+        self.assertEqual(health_json["service"], "agh-viewer-api")
+        self.assertEqual(health_json["version"], "0.3.0")
+        self.assertTrue(health_json["analysis"]["enabled"])
 
         meta = self.client.get("/agh/api/cases/case1/files/image.tif/meta")
         self.assertEqual(meta.status_code, 200)
         self.assertEqual(meta.get_json()["numChannels"], 1)
+        self.assertEqual(meta.get_json()["numZSlices"], 1)
 
         channel = self.client.get("/agh/api/cases/case1/files/image.tif/channel/0")
         self.assertEqual(channel.status_code, 200)

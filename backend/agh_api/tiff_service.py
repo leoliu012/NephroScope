@@ -4,6 +4,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from xml.etree import ElementTree
 
 import numpy as np
 import tifffile
@@ -11,6 +12,22 @@ from PIL import Image
 
 from .errors import BadRequest, UnsupportedTiff
 from .file_lock import file_lock
+
+METADATA_REQUIRED_KEYS = {
+    "cacheKey",
+    "sourceRelPath",
+    "sourceSize",
+    "sourceMtimeNs",
+    "numChannels",
+    "numZSlices",
+    "axes",
+    "width",
+    "height",
+    "pixelSize",
+    "pixelUnit",
+    "sampleDtype",
+    "bitsPerSample",
+}
 
 
 @dataclass(frozen=True)
@@ -49,7 +66,12 @@ def infer_axes(shape):
 
 
 def normalise_shape_to_czyx(shape, axes=""):
+    return normalise_shape_to_czyx_with_axes(shape, axes)[0]
+
+
+def normalise_shape_to_czyx_with_axes(shape, axes=""):
     dims = list(shape)
+    source_axes = (axes or "").upper()
     axes = _prepare_axes(axes, dims)
 
     dims, axes = _drop_extra_singletons(dims, axes)
@@ -58,7 +80,7 @@ def normalise_shape_to_czyx(shape, axes=""):
     dims, axes = _prepare_czyx_axes(dims, axes)
 
     order = [axes.index(axis) for axis in "CZYX"]
-    return tuple(dims[i] for i in order)
+    return tuple(dims[i] for i in order), "".join(axes), source_axes
 
 
 def load_channels(filepath: Path):
@@ -69,7 +91,25 @@ def load_channels(filepath: Path):
     return normalise_array_to_channels(data, axes)
 
 
-def normalise_array_to_channels(data, axes=""):
+def load_raw_plane(filepath: Path, channel_index: int, z_index: int = 0) -> np.ndarray:
+    """Return one raw YX plane from a TIFF without applying MIP or display scaling."""
+    if channel_index < 0:
+        raise BadRequest("Channel index must be non-negative")
+    if z_index < 0:
+        raise BadRequest("Z-slice index must be non-negative")
+    with tifffile.TiffFile(filepath) as tf:
+        series = tf.series[0]
+        axes = (series.axes or "").upper()
+        data = series.asarray()
+    czyx = normalise_array_to_czyx(data, axes)
+    if channel_index >= czyx.shape[0]:
+        raise BadRequest("Channel index out of range")
+    if z_index >= czyx.shape[1]:
+        raise BadRequest("Z-slice index out of range")
+    return czyx[channel_index, z_index].astype(np.float32, copy=False)
+
+
+def normalise_array_to_czyx(data, axes=""):
     arr = np.asarray(data)
     axes = _prepare_axes(axes, list(arr.shape))
     arr, axes = _drop_array_extra_singletons(arr, axes)
@@ -79,7 +119,11 @@ def normalise_array_to_channels(data, axes=""):
 
     arr, axes = _prepare_array_czyx_axes(arr, axes)
     order = [axes.index(axis) for axis in "CZYX"]
-    czyx = np.transpose(arr, order)
+    return np.transpose(arr, order)
+
+
+def normalise_array_to_channels(data, axes=""):
+    czyx = normalise_array_to_czyx(data, axes)
     mip = czyx.max(axis=1)
     return [mip[c].astype(np.float32, copy=False) for c in range(mip.shape[0])]
 
@@ -175,13 +219,15 @@ class ImageCacheService:
         ctx = self._context(image_path)
         metadata_path = ctx.directory / "metadata.json"
         if metadata_path.exists():
-            with metadata_path.open("r", encoding="utf-8") as f:
-                return json.load(f)
+            metadata = _read_json(metadata_path)
+            if _metadata_complete(metadata):
+                return metadata
 
         with file_lock(self._lock_path(ctx)):
             if metadata_path.exists():
-                with metadata_path.open("r", encoding="utf-8") as f:
-                    return json.load(f)
+                metadata = _read_json(metadata_path)
+                if _metadata_complete(metadata):
+                    return metadata
             metadata = self._read_metadata_fast(image_path, ctx)
             ctx.directory.mkdir(parents=True, exist_ok=True)
             _atomic_write_json(metadata_path, metadata)
@@ -234,15 +280,24 @@ class ImageCacheService:
     def _read_metadata_fast(self, image_path: Path, ctx: CacheContext):
         with tifffile.TiffFile(image_path) as tf:
             series = tf.series[0]
-            c, _z, y, x = normalise_shape_to_czyx(series.shape, series.axes)
+            (c, z, y, x), _normalized_axes, source_axes = normalise_shape_to_czyx_with_axes(series.shape, series.axes)
+            pixel_size, pixel_unit = _read_pixel_calibration(tf)
+            sample_dtype, bits_per_sample = _read_sample_info(series)
         return {
             "cacheKey": ctx.key,
             "sourceRelPath": ctx.rel_path,
             "sourceSize": ctx.size,
             "sourceMtimeNs": ctx.mtime_ns,
             "numChannels": int(c),
+            "numZSlices": int(z),
+            "axes": "CZYX",
+            "sourceAxes": source_axes or None,
             "width": int(x),
             "height": int(y),
+            "pixelSize": pixel_size,
+            "pixelUnit": pixel_unit,
+            "sampleDtype": sample_dtype,
+            "bitsPerSample": bits_per_sample,
         }
 
     def _cache_complete(self, ctx: CacheContext):
@@ -251,8 +306,9 @@ class ImageCacheService:
         if not metadata_path.exists() or not thumbnail_path.exists():
             return False
         try:
-            with metadata_path.open("r", encoding="utf-8") as f:
-                metadata = json.load(f)
+            metadata = _read_json(metadata_path)
+            if not _metadata_complete(metadata):
+                return False
             num_channels = int(metadata["numChannels"])
         except Exception:
             return False
@@ -263,20 +319,15 @@ class ImageCacheService:
 
     def _render_cache(self, image_path: Path, ctx: CacheContext):
         ctx.directory.mkdir(parents=True, exist_ok=True)
+        metadata = self._read_metadata_fast(image_path, ctx)
         channels = load_channels(image_path)
         if not channels:
             raise UnsupportedTiff("TIFF did not contain any renderable channels")
 
         height, width = channels[0].shape[:2]
-        metadata = {
-            "cacheKey": ctx.key,
-            "sourceRelPath": ctx.rel_path,
-            "sourceSize": ctx.size,
-            "sourceMtimeNs": ctx.mtime_ns,
-            "numChannels": len(channels),
-            "width": int(width),
-            "height": int(height),
-        }
+        metadata["numChannels"] = len(channels)
+        metadata["width"] = int(width)
+        metadata["height"] = int(height)
 
         for index, channel in enumerate(channels):
             _atomic_write_png(ctx.directory / f"channel_{index}.png", auto_scale(channel))
@@ -306,3 +357,93 @@ def _atomic_write_json(path: Path, payload):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _read_json(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _metadata_complete(metadata):
+    return isinstance(metadata, dict) and METADATA_REQUIRED_KEYS.issubset(metadata.keys())
+
+
+def _read_sample_info(series):
+    try:
+        dtype = np.dtype(series.dtype)
+        return str(dtype), int(dtype.itemsize * 8)
+    except Exception:
+        pass
+
+    try:
+        page = series.pages[0]
+        bits_tag = page.tags.get("BitsPerSample")
+        if not bits_tag:
+            return None, None
+        value = bits_tag.value
+        if isinstance(value, (tuple, list)):
+            value = max(int(v) for v in value)
+        return None, int(value)
+    except Exception:
+        return None, None
+
+
+def _read_pixel_calibration(tf: tifffile.TiffFile):
+    ome_pixel_size = _read_ome_physical_size_x(tf)
+    if ome_pixel_size[0] is not None:
+        return ome_pixel_size
+
+    imagej = getattr(tf, "imagej_metadata", None) or {}
+    for key in ("pixel_width", "pixelWidth"):
+        value = imagej.get(key)
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value), _normalize_unit(imagej.get("unit") or "um")
+
+    try:
+        page = tf.series[0].pages[0]
+        x_resolution = page.tags.get("XResolution")
+        resolution_unit = page.tags.get("ResolutionUnit")
+        if not x_resolution or not resolution_unit:
+            return None, "um"
+        num, den = x_resolution.value
+        if not num or not den:
+            return None, "um"
+        pixels_per_unit = float(num) / float(den)
+        unit_value = getattr(resolution_unit.value, "value", resolution_unit.value)
+        if pixels_per_unit <= 0:
+            return None, "um"
+        if unit_value == 2:  # inch
+            return 25400.0 / pixels_per_unit, "um"
+        if unit_value == 3:  # centimeter
+            return 10000.0 / pixels_per_unit, "um"
+    except Exception:
+        return None, "um"
+    return None, "um"
+
+
+def _read_ome_physical_size_x(tf: tifffile.TiffFile):
+    xml = getattr(tf, "ome_metadata", None)
+    if not xml:
+        return None, "um"
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError:
+        return None, "um"
+    for pixels in root.iter():
+        if pixels.tag.rsplit("}", 1)[-1] != "Pixels":
+            continue
+        value = pixels.attrib.get("PhysicalSizeX")
+        if value is None:
+            continue
+        try:
+            pixel_size = float(value)
+        except ValueError:
+            continue
+        if pixel_size > 0:
+            return pixel_size, _normalize_unit(pixels.attrib.get("PhysicalSizeXUnit") or "um")
+    return None, "um"
+
+
+def _normalize_unit(unit):
+    value = str(unit or "um").strip() or "um"
+    return value.replace("\u00b5", "u")

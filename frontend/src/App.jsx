@@ -1,5 +1,15 @@
-import { useState, useEffect } from 'react'
-import { FolderOpen, FileImage, ChevronRight, Loader2, Eye } from 'lucide-react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
+import {
+  ArrowRight,
+  ChevronRight,
+  Eye,
+  FileImage,
+  FolderOpen,
+  Layers3,
+  Loader2,
+  Microscope,
+  Search,
+} from 'lucide-react'
 import ImageViewer from './components/ImageViewer.jsx'
 
 const API = '/agh/api'
@@ -13,27 +23,52 @@ async function fetchJson(url, options = {}) {
   return res.json()
 }
 
+function EmptyState({ icon: Icon = FileImage, children }) {
+  return (
+    <div className="px-4 py-8 text-center text-xs text-[var(--text-subtle)]">
+      <Icon size={22} className="mx-auto mb-2 opacity-50" />
+      <p>{children}</p>
+    </div>
+  )
+}
+
+function SearchField({ value, onChange, placeholder }) {
+  return (
+    <label className="ux-search">
+      <Search size={13} className="flex-shrink-0 text-[var(--text-subtle)]" />
+      <input
+        value={value}
+        onChange={event => onChange(event.target.value)}
+        placeholder={placeholder}
+        className="min-w-0 flex-1 bg-transparent text-xs text-[var(--text)] outline-none placeholder:text-[var(--text-subtle)]"
+      />
+    </label>
+  )
+}
+
 export default function App() {
-  const [cases, setCases]           = useState([])
-  const [selectedCase, setCase]     = useState(null)
-  const [files, setFiles]           = useState([])
-  const [loadingCases, setLC]       = useState(true)
-  const [loadingFiles, setLF]       = useState(false)
+  const [cases, setCases] = useState([])
+  const [selectedCase, setCase] = useState(null)
+  const [files, setFiles] = useState([])
+  const [loadingCases, setLC] = useState(true)
+  const [loadingFiles, setLF] = useState(false)
   const [casesError, setCasesError] = useState(null)
   const [filesError, setFilesError] = useState(null)
   const [casesReload, setCasesReload] = useState(0)
   const [filesReload, setFilesReload] = useState(0)
-  const [previewFile, setPreview]   = useState(null)   // hovered file name
+  const [caseQuery, setCaseQuery] = useState('')
+  const [fileQuery, setFileQuery] = useState('')
+  const [selectedFile, setSelectedFile] = useState(null)
   const [previewError, setPreviewError] = useState(null)
-  const [openFile, setOpenFile]     = useState(null)   // {case, filename} currently in viewer
+  const [openFile, setOpenFile] = useState(null)
 
   useEffect(() => {
     const controller = new AbortController()
     setLC(true)
     setCasesError(null)
     fetchJson(`${API}/cases`, { signal: controller.signal })
-      .then(d => { setCases(d.cases || []) })
-      .catch(err => { if (err.name !== 'AbortError') setCasesError(err.message) })
+      .then(data => { setCases(data.cases || []) })
+      .catch(error => { if (error.name !== 'AbortError') setCasesError(error.message) })
       .finally(() => { if (!controller.signal.aborted) setLC(false) })
     return () => controller.abort()
   }, [casesReload])
@@ -45,135 +80,231 @@ export default function App() {
     setFiles([])
     setFilesError(null)
     fetchJson(`${API}/cases/${encodeURIComponent(selectedCase)}/files`, { signal: controller.signal })
-      .then(d => { setFiles(d.files || []) })
-      .catch(err => { if (err.name !== 'AbortError') setFilesError(err.message) })
+      .then(data => { setFiles(data.files || []) })
+      .catch(error => { if (error.name !== 'AbortError') setFilesError(error.message) })
       .finally(() => { if (!controller.signal.aborted) setLF(false) })
     return () => controller.abort()
   }, [selectedCase, filesReload])
 
-  const openViewer = (filename) => setOpenFile({ case: selectedCase, filename })
+  const filteredCases = useMemo(() => {
+    const query = caseQuery.trim().toLowerCase()
+    if (!query) return cases
+    return cases.filter(item => item.toLowerCase().includes(query))
+  }, [cases, caseQuery])
+
+  const filteredFiles = useMemo(() => {
+    const query = fileQuery.trim().toLowerCase()
+    if (!query) return files
+    return files.filter(item => item.toLowerCase().includes(query))
+  }, [files, fileQuery])
+
+  useEffect(() => {
+    if (!selectedCase || loadingFiles) return
+    if (!filteredFiles.length) {
+      setSelectedFile(null)
+      setPreviewError(null)
+      return
+    }
+    if (!selectedFile || !filteredFiles.includes(selectedFile)) {
+      setSelectedFile(filteredFiles[0])
+      setPreviewError(null)
+    }
+  }, [selectedCase, loadingFiles, filteredFiles, selectedFile])
+
+  const openViewer = useCallback((filename = selectedFile) => {
+    if (!selectedCase || !filename) return
+    setSelectedFile(filename)
+    setPreviewError(null)
+    setOpenFile({ case: selectedCase, filename })
+  }, [selectedCase, selectedFile])
+
+  const moveSelection = useCallback((delta) => {
+    if (!filteredFiles.length) return
+    const current = Math.max(0, filteredFiles.findIndex(item => item === selectedFile))
+    const next = Math.max(0, Math.min(filteredFiles.length - 1, current + delta))
+    setSelectedFile(filteredFiles[next])
+    setPreviewError(null)
+  }, [filteredFiles, selectedFile])
+
+  const handleFileKeyDown = useCallback((event) => {
+    const tag = event.target?.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || event.target?.isContentEditable) return
+    if (!selectedCase || openFile) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      moveSelection(1)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      moveSelection(-1)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      openViewer()
+    }
+  }, [selectedCase, openFile, moveSelection, openViewer])
+
+  useEffect(() => {
+    window.addEventListener('keydown', handleFileKeyDown)
+    return () => window.removeEventListener('keydown', handleFileKeyDown)
+  }, [handleFileKeyDown])
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-[#0d0d1a] text-gray-200">
-      {/* ── Left: Case list ─────────────────────────────────────────── */}
-      <aside className="w-56 flex-shrink-0 bg-[#1a1a2e] border-r border-[#223] flex flex-col">
-        <div className="px-4 py-3 border-b border-[#223] flex items-center gap-2">
-          <FolderOpen size={16} className="text-[#e94560]" />
-          <span className="text-sm font-semibold tracking-wide uppercase text-gray-400">Cases</span>
+    <div className="app-shell flex h-screen w-screen flex-col overflow-hidden">
+      <header className="app-header flex flex-shrink-0 items-center justify-between px-4">
+        <div className="flex items-center gap-3">
+          <span className="app-brand-mark"><Microscope size={15} /></span>
+          <div>
+            <h1 className="text-sm font-semibold leading-tight text-[var(--text)]">AGH Viewer</h1>
+            <p className="text-[10px] leading-tight text-[var(--text-subtle)]">Microscopy review workspace</p>
+          </div>
         </div>
-        <div className="flex-1 overflow-y-auto py-2">
-          {loadingCases
-            ? <div className="flex justify-center mt-8"><Loader2 size={20} className="animate-spin text-gray-500" /></div>
-            : casesError
-              ? (
-                <div className="px-4 mt-4 text-xs text-red-300">
-                  <p className="break-words">{casesError}</p>
-                  <button onClick={() => setCasesReload(v => v + 1)} className="mt-2 px-2 py-1 rounded bg-[#223] text-gray-200 hover:bg-[#334]">Retry</button>
-                </div>
-              )
-            : cases.length === 0
-              ? <p className="text-xs text-gray-500 px-4 mt-4">No cases found</p>
-              : cases.map(c => (
-                  <button
-                    key={c}
-                    onClick={() => { setCase(c); setFiles([]); setPreview(null); setPreviewError(null) }}
-                    className={`w-full text-left px-4 py-2 text-sm flex items-center gap-2 transition-colors
-                      ${selectedCase === c
-                        ? 'bg-[#0f3460] text-white'
-                        : 'hover:bg-[#223] text-gray-300'}`}
-                  >
-                    <ChevronRight size={12} className={selectedCase === c ? 'text-[#e94560]' : 'text-gray-600'} />
-                    {c}
-                  </button>
-                ))
-          }
+        <div className="flex items-center gap-2 text-[10px] text-[var(--text-subtle)]">
+          <Layers3 size={12} />
+          <span>{cases.length} cases indexed</span>
         </div>
-      </aside>
+      </header>
 
-      {/* ── Center: File list ───────────────────────────────────────── */}
-      <aside className="w-72 flex-shrink-0 bg-[#16213e] border-r border-[#223] flex flex-col">
-        <div className="px-4 py-3 border-b border-[#223] flex items-center gap-2">
-          <FileImage size={16} className="text-[#e94560]" />
-          <span className="text-sm font-semibold tracking-wide uppercase text-gray-400">
-            {selectedCase ? selectedCase : 'Files'}
-          </span>
-        </div>
-        <div className="flex-1 overflow-y-auto py-2">
-          {!selectedCase
-            ? <p className="text-xs text-gray-500 px-4 mt-4">Select a case</p>
-            : loadingFiles
-              ? <div className="flex justify-center mt-8"><Loader2 size={20} className="animate-spin text-gray-500" /></div>
-              : filesError
+      <div className="flex min-h-0 flex-1">
+        <aside className="app-pane flex w-60 flex-shrink-0 flex-col border-r">
+          <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+            <div className="flex items-center gap-2">
+              <FolderOpen size={15} className="text-[var(--accent)]" />
+              <span className="text-xs font-semibold text-[var(--text)]">Cases</span>
+            </div>
+            <span className="ux-meta">{filteredCases.length}</span>
+          </div>
+          <div className="border-b border-[var(--border)] px-3 py-3">
+            <SearchField value={caseQuery} onChange={setCaseQuery} placeholder="Filter cases" />
+          </div>
+          <div className="flex-1 overflow-y-auto py-2">
+            {loadingCases
+              ? <div className="flex justify-center py-8"><Loader2 size={18} className="animate-spin text-[var(--text-subtle)]" /></div>
+              : casesError
                 ? (
-                  <div className="px-4 mt-4 text-xs text-red-300">
-                    <p className="break-words">{filesError}</p>
-                    <button onClick={() => setFilesReload(v => v + 1)} className="mt-2 px-2 py-1 rounded bg-[#223] text-gray-200 hover:bg-[#334]">Retry</button>
+                  <div className="px-4 py-4 text-xs text-[var(--danger)]">
+                    <p className="break-words">{casesError}</p>
+                    <button onClick={() => setCasesReload(value => value + 1)} className="ux-button ux-button-secondary mt-3">Retry</button>
                   </div>
                 )
-              : files.length === 0
-                ? <p className="text-xs text-gray-500 px-4 mt-4">No TIFF files found</p>
-                : files.map(f => (
-                    <div
-                      key={f}
-                      onMouseEnter={() => { setPreview(f); setPreviewError(null) }}
-                      onMouseLeave={() => { setPreview(null); setPreviewError(null) }}
-                      onDoubleClick={() => openViewer(f)}
-                      onClick={() => { setPreview(f); setPreviewError(null) }}
-                      className="px-3 py-2 mx-2 my-0.5 rounded cursor-pointer flex items-start gap-2 hover:bg-[#0f3460] group transition-colors"
-                    >
-                      <FileImage size={14} className="mt-0.5 flex-shrink-0 text-gray-500 group-hover:text-[#e94560]" />
-                      <div className="min-w-0">
-                        <p className="text-xs text-gray-200 break-all leading-snug">{f}</p>
-                        <p className="text-[10px] text-gray-500 mt-0.5">Double-click to open</p>
-                      </div>
+                : cases.length === 0
+                  ? <EmptyState icon={FolderOpen}>No cases found</EmptyState>
+                  : filteredCases.length === 0
+                    ? <EmptyState icon={Search}>No matching cases</EmptyState>
+                    : filteredCases.map(item => (
                       <button
-                        onClick={e => { e.stopPropagation(); openViewer(f) }}
-                        className="ml-auto flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
-                        title="Open in viewer"
+                        key={item}
+                        onClick={() => { setCase(item); setFiles([]); setSelectedFile(null); setFileQuery(''); setPreviewError(null) }}
+                        className={`ux-list-item flex w-full items-center gap-2 px-4 py-2.5 text-left text-xs ${selectedCase === item ? 'ux-list-item-selected text-[var(--text)]' : 'text-[var(--text-muted)]'}`}
                       >
-                        <Eye size={14} className="text-[#e94560]" />
+                        <ChevronRight size={12} className={selectedCase === item ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'} />
+                        <span className="truncate">{item}</span>
                       </button>
-                    </div>
-                  ))
-          }
-        </div>
-      </aside>
+                    ))}
+          </div>
+        </aside>
 
-      {/* ── Right: Preview pane ─────────────────────────────────────── */}
-      <main className="flex-1 flex flex-col items-center justify-center bg-[#0d0d1a] relative overflow-hidden">
-        {previewFile && selectedCase ? (
-          <div className="flex flex-col items-center gap-4 w-full h-full p-6">
-            <p className="text-xs text-gray-500 text-center max-w-md break-all">{previewFile}</p>
-            <div className="flex-1 w-full flex items-center justify-center">
-              <img
-                src={`${API}/cases/${encodeURIComponent(selectedCase)}/files/${encodeURIComponent(previewFile)}/thumbnail`}
-                alt="Preview"
-                onError={() => setPreviewError('Preview failed to load')}
-                className="max-w-full max-h-full object-contain rounded border border-[#223]"
-                style={{ imageRendering: 'pixelated' }}
-              />
-              {previewError && <p className="absolute bottom-24 text-xs text-red-300">{previewError}</p>}
+        <aside className="app-pane app-pane-secondary flex w-80 flex-shrink-0 flex-col border-r">
+          <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <FileImage size={15} className="flex-shrink-0 text-[var(--accent)]" />
+                <span className="truncate text-xs font-semibold text-[var(--text)]">Images</span>
+              </div>
+              {selectedCase && <p className="mt-1 truncate text-[10px] text-[var(--text-subtle)]">{selectedCase}</p>}
             </div>
-            <button
-              onClick={() => openViewer(previewFile)}
-              className="px-5 py-2 bg-[#e94560] hover:bg-[#c73050] rounded text-sm font-medium transition-colors"
-            >
-              Open in Viewer
-            </button>
+            {selectedCase && <span className="ux-meta">{filteredFiles.length} TIFF</span>}
           </div>
-        ) : (
-          <div className="text-center text-gray-600">
-            <FileImage size={64} className="mx-auto mb-4 opacity-20" />
-            <p className="text-sm">Hover a file to preview · Double-click to open</p>
+          {selectedCase && (
+            <div className="border-b border-[var(--border)] px-3 py-3">
+              <SearchField value={fileQuery} onChange={setFileQuery} placeholder="Filter images" />
+            </div>
+          )}
+          <div className="flex-1 overflow-y-auto py-2" tabIndex={0} onKeyDown={handleFileKeyDown}>
+            {!selectedCase
+              ? <EmptyState icon={FolderOpen}>Choose a case to browse images</EmptyState>
+              : loadingFiles
+                ? <div className="flex justify-center py-8"><Loader2 size={18} className="animate-spin text-[var(--text-subtle)]" /></div>
+                : filesError
+                  ? (
+                    <div className="px-4 py-4 text-xs text-[var(--danger)]">
+                      <p className="break-words">{filesError}</p>
+                      <button onClick={() => setFilesReload(value => value + 1)} className="ux-button ux-button-secondary mt-3">Retry</button>
+                    </div>
+                  )
+                  : files.length === 0
+                    ? <EmptyState>No TIFF images found</EmptyState>
+                    : filteredFiles.length === 0
+                      ? <EmptyState icon={Search}>No matching TIFF images</EmptyState>
+                      : filteredFiles.map(item => (
+                        <div
+                          key={item}
+                          onDoubleClick={() => openViewer(item)}
+                          onClick={() => { setSelectedFile(item); setPreviewError(null) }}
+                          className={`ux-list-item group mx-2 my-0.5 flex cursor-pointer items-start gap-2 rounded-r-md px-3 py-2.5 ${selectedFile === item ? 'ux-list-item-selected' : ''}`}
+                        >
+                          <FileImage size={14} className={`mt-0.5 flex-shrink-0 ${selectedFile === item ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`} />
+                          <div className="min-w-0 flex-1">
+                            <p className="break-all text-xs leading-snug text-[var(--text)]">{item}</p>
+                            <p className="mt-1 text-[10px] text-[var(--text-subtle)]">TIFF image</p>
+                          </div>
+                          <button
+                            onClick={event => { event.stopPropagation(); openViewer(item) }}
+                            className="ux-icon-button h-6 w-6 flex-shrink-0 opacity-0 group-hover:opacity-100"
+                            title="Open in viewer"
+                          >
+                            <Eye size={13} />
+                          </button>
+                        </div>
+                      ))}
           </div>
-        )}
-      </main>
+        </aside>
 
-      {/* ── Full-screen Image Viewer ─────────────────────────────────── */}
+        <main className="app-canvas relative flex flex-1 items-center justify-center overflow-hidden">
+          {selectedFile && selectedCase ? (
+            <div className="flex h-full w-full flex-col p-6">
+              <div className="mb-4 flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <p className="ux-section-label">Selected image</p>
+                  <h2 className="mt-1 truncate text-sm font-medium text-[var(--text)]">{selectedFile}</h2>
+                  <p className="mt-1 text-[10px] text-[var(--text-subtle)]">{selectedCase}</p>
+                </div>
+                <button onClick={() => openViewer(selectedFile)} className="ux-button ux-button-primary flex-shrink-0">
+                  Open viewer <ArrowRight size={13} />
+                </button>
+              </div>
+              <div className="flex min-h-0 flex-1 items-center justify-center">
+                <div className="app-preview-frame flex h-full w-full items-center justify-center overflow-hidden p-3">
+                  <img
+                    src={`${API}/cases/${encodeURIComponent(selectedCase)}/files/${encodeURIComponent(selectedFile)}/thumbnail`}
+                    alt="Preview"
+                    onError={() => setPreviewError('Preview failed to load')}
+                    className="max-h-full max-w-full object-contain"
+                    style={{ imageRendering: 'pixelated' }}
+                  />
+                </div>
+              </div>
+              {previewError && <p className="mt-3 text-xs text-[var(--danger)]">{previewError}</p>}
+              <p className="mt-3 text-[10px] text-[var(--text-subtle)]">Double-click an image or press Enter to open it. Use ↑ and ↓ to browse.</p>
+            </div>
+          ) : (
+            <div className="max-w-sm text-center text-[var(--text-subtle)]">
+              <span className="app-brand-mark mx-auto mb-4 h-12 w-12 rounded-xl"><Microscope size={24} /></span>
+              <h2 className="text-sm font-semibold text-[var(--text-muted)]">Choose an image to begin</h2>
+              <p className="mt-2 text-xs leading-relaxed">Browse a case and select a TIFF image to inspect channels, run MagnifySeg analysis, or add annotations.</p>
+            </div>
+          )}
+        </main>
+      </div>
+
       {openFile && (
         <ImageViewer
           caseId={openFile.case}
           filename={openFile.filename}
+          files={filteredFiles}
+          onNavigateFile={filename => {
+            setSelectedFile(filename)
+            setPreviewError(null)
+            setOpenFile(current => current ? { ...current, filename } : { case: selectedCase, filename })
+          }}
           onClose={() => setOpenFile(null)}
         />
       )}

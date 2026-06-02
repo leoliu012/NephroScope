@@ -9,6 +9,47 @@ function toImgCoords(svg, clientX, clientY) {
   return pt.matrixTransform(svg.getScreenCTM().inverse())
 }
 
+function distanceSq(x0, y0, x1, y1) {
+  const dx = x1 - x0
+  const dy = y1 - y0
+  return dx * dx + dy * dy
+}
+
+function simplifyCoords(coords, epsilon = 1.4) {
+  if (!coords || coords.length <= 4) return coords || []
+  const points = []
+  for (let i = 0; i < coords.length; i += 2) points.push([coords[i], coords[i + 1]])
+  const keep = new Array(points.length).fill(false)
+  keep[0] = true
+  keep[points.length - 1] = true
+
+  const simplifyRange = (start, end) => {
+    if (end <= start + 1) return
+    const [x1, y1] = points[start]
+    const [x2, y2] = points[end]
+    const denom = distanceSq(x1, y1, x2, y2) || 1
+    let bestIndex = -1
+    let bestDistance = 0
+    for (let i = start + 1; i < end; i++) {
+      const [x0, y0] = points[i]
+      const area = Math.abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
+      const dist = (area * area) / denom
+      if (dist > bestDistance) {
+        bestDistance = dist
+        bestIndex = i
+      }
+    }
+    if (bestDistance > epsilon * epsilon && bestIndex > -1) {
+      keep[bestIndex] = true
+      simplifyRange(start, bestIndex)
+      simplifyRange(bestIndex, end)
+    }
+  }
+
+  simplifyRange(0, points.length - 1)
+  return points.flatMap((point, index) => keep[index] ? point : [])
+}
+
 function ArrowMarker({ id, color }) {
   return (
     <defs>
@@ -115,10 +156,11 @@ function PreviewShape({ drawing, color }) {
 export default function AnnotationLayer({
   imgMeta, annotations, setAnnotations,
   activeTool, annotatorName, annotationColor,
-  fontSize, onEditAnnotation,
+  fontSize, onEditAnnotation, panActive = false,
   selectedId, setSelectedId, svgRef
 }) {
   const [drawing, setDrawing] = useState(null)
+  const lastFreehandRef = useRef({ time: 0, x: null, y: null })
   const { width = 100, height = 100 } = imgMeta || {}
 
   const makeAnn = useCallback((type, coords, label = '') => ({
@@ -130,7 +172,7 @@ export default function AnnotationLayer({
   }), [annotatorName, annotationColor, fontSize])
 
   const handleMouseDown = useCallback((e) => {
-    if (activeTool === 'select' || !svgRef?.current) return
+    if (activeTool === 'select' || panActive || !svgRef?.current) return
     e.preventDefault()
     const { x, y } = toImgCoords(svgRef.current, e.clientX, e.clientY)
 
@@ -141,31 +183,38 @@ export default function AnnotationLayer({
       return
     }
     if (activeTool === 'text') {
-      const label = prompt('Annotation text:')
-      if (label == null) return
-      const ann = makeAnn('text', [x, y], label)
+      const ann = makeAnn('text', [x, y], '')
       setAnnotations(prev => [...prev, ann])
       setSelectedId(ann.id)
+      onEditAnnotation?.(ann.id)
       return
     }
+    lastFreehandRef.current = { time: performance.now(), x, y }
     setDrawing({ type: activeTool, start: { x, y }, coords: [x, y, x, y] })
-  }, [activeTool, svgRef, makeAnn, setAnnotations, setSelectedId])
+  }, [activeTool, panActive, svgRef, makeAnn, setAnnotations, setSelectedId, onEditAnnotation])
 
   const handleMouseMove = useCallback((e) => {
-    if (!drawing || !svgRef?.current) return
+    if (!drawing || panActive || !svgRef?.current) return
     e.preventDefault()
     const { x, y } = toImgCoords(svgRef.current, e.clientX, e.clientY)
     if (drawing.type === 'freehand') {
+      const now = performance.now()
+      const last = lastFreehandRef.current
+      if (now - last.time < 10 && distanceSq(last.x, last.y, x, y) < 9) return
+      lastFreehandRef.current = { time: now, x, y }
       setDrawing(d => ({ ...d, coords: [...d.coords, x, y] }))
     } else {
       setDrawing(d => ({ ...d, coords: [d.start.x, d.start.y, x, y] }))
     }
-  }, [drawing, svgRef])
+  }, [drawing, panActive, svgRef])
 
   const handleMouseUp = useCallback((e) => {
     if (!drawing) return
     e.preventDefault()
-    const ann = makeAnn(drawing.type, drawing.coords)
+    const coords = drawing.type === 'freehand'
+      ? simplifyCoords(drawing.coords)
+      : drawing.coords
+    const ann = makeAnn(drawing.type, coords)
     setAnnotations(prev => [...prev, ann])
     setSelectedId(ann.id)
     setDrawing(null)
@@ -175,7 +224,7 @@ export default function AnnotationLayer({
     if (activeTool === 'select') setSelectedId(null)
   }, [activeTool, setSelectedId])
 
-  const isSelect = activeTool === 'select'
+  const isSelect = activeTool === 'select' || panActive
 
   return (
     <svg

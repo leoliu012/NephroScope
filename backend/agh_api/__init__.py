@@ -4,6 +4,8 @@ from typing import Optional
 from flask import Flask, jsonify, request, send_file
 
 from .annotation_service import AnnotationService
+from .analysis_routes import register_analysis_routes
+from .analysis_store import AnalysisStore
 from .config import Config
 from .errors import APIError
 from .path_guard import image_path, list_cases, list_tiff_files
@@ -11,7 +13,7 @@ from .tiff_service import ImageCacheService
 
 
 log = logging.getLogger(__name__)
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def create_app(config: Optional[Config] = None):
@@ -21,6 +23,7 @@ def create_app(config: Optional[Config] = None):
     app = Flask(__name__)
     cache = ImageCacheService(cfg.data_root, cfg.cache_root)
     annotations = AnnotationService(cfg.ann_root)
+    analysis_store = AnalysisStore(cfg.analysis_db)
 
     @app.errorhandler(APIError)
     def handle_api_error(exc):
@@ -38,6 +41,10 @@ def create_app(config: Optional[Config] = None):
             "ok": True,
             "service": "agh-viewer-api",
             "version": VERSION,
+            "analysis": {
+                "queue": "sqlite",
+                "enabled": True,
+            },
         })
 
     @app.route("/agh/api/cases")
@@ -82,5 +89,7 @@ def create_app(config: Optional[Config] = None):
             require_revision=request.method == "PUT",
         )
         return jsonify(result)
+
+    register_analysis_routes(app, cfg, cache, analysis_store)
 
     return app

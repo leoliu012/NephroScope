@@ -1,36 +1,46 @@
 import { Eye, EyeOff } from 'lucide-react'
+import { CHANNEL_ROLES, roleInfo } from '../channelMapping.js'
 
-const CH_DEFAULTS = [
-  { label: 'Ch 0 – DAPI',        color: '#4488ff', dot: '#4488ff' },
-  { label: 'Ch 1 – Pan-protein', color: '#ffffff', dot: '#aaaaaa' },
-  { label: 'Ch 2 – Albumin',     color: '#ff4444', dot: '#ff4444' },
-  { label: 'Ch 3 – IgM',         color: '#ff44ff', dot: '#ff44ff' },
-]
-
-export default function ChannelControls({ settings, onChange, numChannels }) {
+export default function ChannelControls({
+  settings,
+  onChange,
+  numChannels,
+  channelMapping,
+  onMappingChange,
+}) {
   if (!settings.length) return null
 
   return (
     <div className="flex flex-col gap-3 w-full">
       {settings.slice(0, numChannels).map((ch, i) => {
-        const def = CH_DEFAULTS[i] || { label: `Ch ${i}`, color: '#ffffff', dot: '#888' }
+        const mapping = channelMapping?.[i] || { channel: i, role: 'unassigned' }
+        const def = roleInfo(mapping.role)
         return (
-          <div key={i} className="bg-[#0f1a30] rounded-lg p-3 flex flex-col gap-2">
+          <div key={i} className="ux-card flex flex-col gap-2 p-3">
             <div className="flex items-center gap-2">
               <button
                 onClick={() => onChange(i, { enabled: !ch.enabled })}
-                className="flex-shrink-0 text-gray-400 hover:text-white transition-colors"
+                className="ux-icon-button h-6 w-6 flex-shrink-0"
                 title={ch.enabled ? 'Hide channel' : 'Show channel'}
               >
                 {ch.enabled
-                  ? <Eye size={15} style={{ color: def.dot }} />
+                  ? <Eye size={15} style={{ color: def.color }} />
                   : <EyeOff size={15} className="text-gray-600" />}
               </button>
               <span
                 className="w-2.5 h-2.5 rounded-full flex-shrink-0"
-                style={{ background: def.dot }}
+                style={{ background: def.color }}
               />
-              <span className="text-xs text-gray-300 flex-1 leading-tight">{def.label}</span>
+              <span className="text-xs text-gray-300 flex-1 leading-tight">Ch {i}</span>
+              <select
+                value={mapping.role}
+                onChange={e => onMappingChange?.(i, e.target.value)}
+                className="ux-select max-w-[8.25rem] py-1 text-[11px]"
+              >
+                {CHANNEL_ROLES.map(role => (
+                  <option key={role.id} value={role.id}>{role.label}</option>
+                ))}
+              </select>
             </div>
 
             {ch.enabled && (
@@ -42,7 +52,7 @@ export default function ChannelControls({ settings, onChange, numChannels }) {
                     value={ch.minVal}
                     onChange={e => onChange(i, { minVal: +e.target.value })}
                     className="flex-1"
-                    style={{ accentColor: def.dot }}
+                    style={{ accentColor: def.color }}
                   />
                   <span className="text-[10px] text-gray-500 w-7 text-right">{ch.minVal}</span>
                 </div>
@@ -53,7 +63,7 @@ export default function ChannelControls({ settings, onChange, numChannels }) {
                     value={ch.maxVal}
                     onChange={e => onChange(i, { maxVal: +e.target.value })}
                     className="flex-1"
-                    style={{ accentColor: def.dot }}
+                    style={{ accentColor: def.color }}
                   />
                   <span className="text-[10px] text-gray-500 w-7 text-right">{ch.maxVal}</span>
                 </div>
@@ -65,3 +75,5 @@ export default function ChannelControls({ settings, onChange, numChannels }) {
     </div>
   )
 }
+
+

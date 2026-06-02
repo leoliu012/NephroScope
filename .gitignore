@@ -5,6 +5,7 @@ __pycache__/
 .env
 .venv/
 venv/
+inference-venv/
 node_modules/
 dist/
 coverage/
@@ -15,4 +16,9 @@ Thumbs.db
 *:encryptable
 .agh_watcher_state.json
 backend/annotations/
-backend/.local_data/
+backend/.local_data/agh_annotations
+backend/.local_data/agh_cache
+backend/.local_data/agh_models
+backend/.local_data/agh_analysis
+
+

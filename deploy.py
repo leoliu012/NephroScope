@@ -7,8 +7,9 @@ Steps:
   2. Copy built files       ->  /var/www/html/agh
   3. Copy backend           ->  /home/ubuntu/agh-viewer/backend
   4. Install Python deps in a venv
-  5. Install / restart systemd service
-  6. Install Apache config and run configtest
+  5. Install Python inference deps in a separate venv
+  6. Install / restart systemd services
+  7. Install Apache config and run configtest
 
 Image data is intentionally not deployed by this script. Use agh_watcher.py
 or a dedicated sync job for NAS -> /data/AGH_APP.
@@ -103,16 +104,19 @@ frontend_required = [
 frontend_optional = [HERE / "frontend" / "package-lock.json"]
 backend_required = [
     HERE / "backend" / "app.py",
+    HERE / "backend" / "worker.py",
     HERE / "backend" / "requirements.lock.txt",
+    HERE / "backend" / "requirements-inference.txt",
     HERE / "backend" / "agh_api",
     HERE / "backend" / "agh_backend.service",
+    HERE / "backend" / "agh_analysis_worker.service",
     HERE / "infra" / "apache" / "agh-viewer.conf",
 ]
 ensure_files(frontend_required, frontend_optional)
 ensure_files(backend_required)
 
 # ── 1. Upload frontend source to server and build there ──────────────────────
-print("\n[1/6] Uploading frontend source to server...")
+print("\n[1/7] Uploading frontend source to server...")
 ssh("mkdir -p /home/ubuntu/agh-viewer/frontend && rm -rf /home/ubuntu/agh-viewer/frontend/src")
 
 # Upload individual config files
@@ -122,22 +126,24 @@ for path in ensure_files(frontend_required, frontend_optional):
 # Upload src/ directory
 scp(str(HERE / "frontend" / "src"), "/home/ubuntu/agh-viewer/frontend/")
 
-print("\n[2/6] Building React frontend on server...")
+print("\n[2/7] Building React frontend on server...")
 ssh("cd /home/ubuntu/agh-viewer/frontend && "
     "if [ -f package-lock.json ]; then npm ci --no-fund --no-audit; "
     "else npm install --no-fund --no-audit; fi && npm run build")
 
 # ── 2. Deploy frontend build ──────────────────────────────────────────────────
-print("\n[3/6] Copying frontend build to /var/www/html/agh...")
+print("\n[3/7] Copying frontend build to /var/www/html/agh...")
 ssh("sudo mkdir -p /var/www/html/agh && sudo chown ubuntu:ubuntu /var/www/html/agh && "
     "cp -r /home/ubuntu/agh-viewer/frontend/dist/. /var/www/html/agh/")
 
 # ── 3. Deploy backend ─────────────────────────────────────────────────────────
-print("\n[4/6] Copying backend to /home/ubuntu/agh-viewer/backend...")
+print("\n[4/7] Copying backend to /home/ubuntu/agh-viewer/backend...")
 ssh("mkdir -p /home/ubuntu/agh-viewer/backend && rm -rf /home/ubuntu/agh-viewer/backend/agh_api")
 scp(str(HERE / "backend" / "app.py"),          "/home/ubuntu/agh-viewer/backend/")
+scp(str(HERE / "backend" / "worker.py"),       "/home/ubuntu/agh-viewer/backend/")
 scp(str(HERE / "backend" / "requirements.txt"),"/home/ubuntu/agh-viewer/backend/")
 scp(str(HERE / "backend" / "requirements.lock.txt"),"/home/ubuntu/agh-viewer/backend/")
+scp(str(HERE / "backend" / "requirements-inference.txt"),"/home/ubuntu/agh-viewer/backend/")
 scp(str(HERE / "backend" / "agh_api"),         "/home/ubuntu/agh-viewer/backend/")
 
 print("\n  Installing Python dependencies on server...")
@@ -145,17 +151,27 @@ ssh("python3 -m venv /home/ubuntu/agh-viewer/venv && "
     "/home/ubuntu/agh-viewer/venv/bin/python -m pip install -U pip && "
     "/home/ubuntu/agh-viewer/venv/bin/pip install -q -r /home/ubuntu/agh-viewer/backend/requirements.lock.txt")
 
-# ── 4. Install / restart systemd service ─────────────────────────────────────
-print("\n[5/6] Installing systemd service...")
+# ── 4. Install inference dependencies ────────────────────────────────────────
+print("\n[5/7] Installing inference dependencies on server...")
+ssh("python3 -m venv /home/ubuntu/agh-viewer/inference-venv && "
+    "/home/ubuntu/agh-viewer/inference-venv/bin/python -m pip install -U pip && "
+    "/home/ubuntu/agh-viewer/inference-venv/bin/pip install -q -r /home/ubuntu/agh-viewer/backend/requirements-inference.txt")
+
+# ── 5. Install / restart systemd services ────────────────────────────────────
+print("\n[6/7] Installing systemd services...")
 scp(str(HERE / "backend" / "agh_backend.service"), "/tmp/agh_backend.service")
+scp(str(HERE / "backend" / "agh_analysis_worker.service"), "/tmp/agh_analysis_worker.service")
 ssh("sudo cp /tmp/agh_backend.service /etc/systemd/system/ && "
+    "sudo cp /tmp/agh_analysis_worker.service /etc/systemd/system/ && "
     "sudo systemctl daemon-reload && "
     "sudo systemctl enable agh_backend && "
-    "sudo systemctl restart agh_backend")
+    "sudo systemctl enable agh_analysis_worker && "
+    "sudo systemctl restart agh_backend && "
+    "sudo systemctl restart agh_analysis_worker")
 ssh("sleep 2 && curl -fsS http://127.0.0.1:5055/agh/api/health")
 
-# ── 5. Install Apache config ─────────────────────────────────────────────────
-print("\n[6/6] Installing Apache config for /agh...")
+# ── 6. Install Apache config ─────────────────────────────────────────────────
+print("\n[7/7] Installing Apache config for /agh...")
 auth_file = write_htpasswd_file()
 try:
     scp(str(auth_file), "/tmp/agh-viewer.htpasswd")

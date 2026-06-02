@@ -1,5 +1,5 @@
 [Unit]
-Description=AGH Viewer API
+Description=AGH MagnifySeg Analysis Worker
 After=network.target
 
 [Service]
@@ -11,8 +11,8 @@ Environment="AGH_CACHE_ROOT=/data/agh_cache"
 Environment="AGH_ANALYSIS_ROOT=/data/agh_analysis"
 Environment="AGH_MODEL_ROOT=/data/agh_models"
 Environment="AGH_ANALYSIS_DB=/data/agh_analysis/jobs.sqlite3"
-Environment="PATH=/home/ubuntu/agh-viewer/venv/bin:/usr/local/bin:/usr/bin:/bin"
-ExecStart=/home/ubuntu/agh-viewer/venv/bin/gunicorn --bind 127.0.0.1:5055 --workers 2 --threads 4 --timeout 120 "agh_api:create_app()"
+Environment="PATH=/home/ubuntu/agh-viewer/inference-venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/agh-viewer/inference-venv/bin/python /home/ubuntu/agh-viewer/backend/worker.py
 Restart=always
 RestartSec=5
 
