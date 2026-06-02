@@ -5,13 +5,18 @@ function artifactUrl(runId, artifactPath) {
   return `${API}/analysis-runs/${encodeURIComponent(runId)}/artifacts/${encodedPath}`
 }
 
+function isRemovedDapiArtifact(name) {
+  const basename = String(name).split('/').pop()
+  return basename === 'overlay_DAPI.png' || basename === 'overlay_NHS_NUCLEI.png'
+}
+
 export default function AnalysisMaskCanvas({ run, visibleOverlays, processMetric, imgMeta }) {
   if (!run?.runId || !run?.result || !imgMeta) return null
 
   const overlays = [
     ...(run.result.overlays || []),
     ...(processMetric?.contourOverlays || []),
-  ]
+  ].filter(name => !isRemovedDapiArtifact(name))
 
   return (
     <div

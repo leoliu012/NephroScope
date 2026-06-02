@@ -15,6 +15,16 @@ function distanceSq(x0, y0, x1, y1) {
   return dx * dx + dy * dy
 }
 
+function normalizeRect(coords) {
+  const [x1, y1, x2, y2] = coords || []
+  const x = Math.min(x1, x2)
+  const y = Math.min(y1, y2)
+  const width = Math.abs(x2 - x1)
+  const height = Math.abs(y2 - y1)
+  if (![x, y, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return null
+  return { x, y, width, height }
+}
+
 function simplifyCoords(coords, epsilon = 1.4) {
   if (!coords || coords.length <= 4) return coords || []
   const points = []
@@ -140,7 +150,7 @@ function PreviewShape({ drawing, color }) {
   } else if (type === 'line' || type === 'arrow') {
     const [x1, y1, x2, y2] = coords
     return <line x1={x1} y1={y1} x2={x2} y2={y2} {...s} />
-  } else if (type === 'rect') {
+  } else if (type === 'rect' || type === 'analysis-roi') {
     const [x1, y1, x2, y2] = coords
     return <rect x={Math.min(x1,x2)} y={Math.min(y1,y2)} width={Math.abs(x2-x1)} height={Math.abs(y2-y1)} {...s} />
   } else if (type === 'ellipse') {
@@ -157,7 +167,8 @@ export default function AnnotationLayer({
   imgMeta, annotations, setAnnotations,
   activeTool, annotatorName, annotationColor,
   fontSize, onEditAnnotation, panActive = false,
-  selectedId, setSelectedId, svgRef
+  selectedId, setSelectedId, svgRef,
+  analysisRoi, setAnalysisRoi,
 }) {
   const [drawing, setDrawing] = useState(null)
   const lastFreehandRef = useRef({ time: 0, x: null, y: null })
@@ -214,11 +225,16 @@ export default function AnnotationLayer({
     const coords = drawing.type === 'freehand'
       ? simplifyCoords(drawing.coords)
       : drawing.coords
+    if (drawing.type === 'analysis-roi') {
+      setAnalysisRoi?.(normalizeRect(coords))
+      setDrawing(null)
+      return
+    }
     const ann = makeAnn(drawing.type, coords)
     setAnnotations(prev => [...prev, ann])
     setSelectedId(ann.id)
     setDrawing(null)
-  }, [drawing, makeAnn, setAnnotations, setSelectedId])
+  }, [drawing, makeAnn, setAnnotations, setSelectedId, setAnalysisRoi])
 
   const handleClick = useCallback((e) => {
     if (activeTool === 'select') setSelectedId(null)
@@ -241,6 +257,30 @@ export default function AnnotationLayer({
       onMouseUp={handleMouseUp}
       onClick={handleClick}
     >
+      {analysisRoi && (
+        <g style={{ pointerEvents: 'none' }}>
+          <rect
+            x={analysisRoi.x}
+            y={analysisRoi.y}
+            width={analysisRoi.width}
+            height={analysisRoi.height}
+            fill="#63a4d8"
+            fillOpacity={0.08}
+            stroke="#63a4d8"
+            strokeWidth={2}
+            strokeDasharray="8 5"
+          />
+          <text
+            x={analysisRoi.x + 8}
+            y={analysisRoi.y + 18}
+            fill="#b9dcf6"
+            fontSize={13}
+            fontFamily="sans-serif"
+          >
+            Analysis ROI
+          </text>
+        </g>
+      )}
       {annotations.map(ann => (
         <g key={ann.id} style={{ pointerEvents: 'all' }}>
           <AnnShape
@@ -255,3 +295,4 @@ export default function AnnotationLayer({
     </svg>
   )
 }
+

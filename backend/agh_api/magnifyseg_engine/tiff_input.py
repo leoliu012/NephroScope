@@ -9,8 +9,6 @@ def load_model_input(image_path, model_name, request_payload):
 
     if model_name == "ACTN4":
         return load_raw_plane(image_path, channels["actn4"], z_index)
-    if model_name == "DAPI":
-        return load_raw_plane(image_path, channels["dapi"], z_index)
     if model_name == "NHS_SINGLE_CHANNEL":
         return load_raw_plane(image_path, channels["nhs"], z_index)
     if model_name == "NHS_COMBINED_ACTN4":

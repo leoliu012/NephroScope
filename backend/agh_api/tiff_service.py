@@ -233,17 +233,54 @@ class ImageCacheService:
             _atomic_write_json(metadata_path, metadata)
             return metadata
 
-    def get_channel_path(self, image_path: Path, channel_index: int) -> Path:
+    def get_channel_path(
+        self,
+        image_path: Path,
+        channel_index: int,
+        z_index: int | None = None,
+        projection: str = "mip",
+    ) -> Path:
         if channel_index < 0:
             raise BadRequest("Channel index must be non-negative")
         metadata = self.get_metadata(image_path)
         if channel_index >= metadata["numChannels"]:
             raise BadRequest("Channel index out of range")
+
+        projection = (projection or "mip").lower()
+        if projection not in {"mip", "slice"}:
+            raise BadRequest("projection must be either 'mip' or 'slice'")
+
         ctx = self._context(image_path)
-        png_path = ctx.directory / f"channel_{channel_index}.png"
+        if projection == "mip":
+            png_path = ctx.directory / f"channel_{channel_index}.png"
+            if not png_path.exists():
+                self._ensure_rendered(image_path, ctx)
+            return png_path
+
+        z_index = 0 if z_index is None else int(z_index)
+        if z_index < 0 or z_index >= metadata["numZSlices"]:
+            raise BadRequest("Z-slice index out of range")
+        png_path = ctx.directory / f"channel_{channel_index}_z_{z_index}.png"
         if not png_path.exists():
-            self._ensure_rendered(image_path, ctx)
+            self._ensure_slice_rendered(image_path, ctx, channel_index, z_index, png_path)
         return png_path
+
+    def _ensure_slice_rendered(
+        self,
+        image_path: Path,
+        ctx: CacheContext,
+        channel_index: int,
+        z_index: int,
+        png_path: Path,
+    ):
+        if png_path.exists():
+            return
+        with file_lock(self._lock_path(ctx)):
+            if png_path.exists():
+                return
+            ctx.directory.mkdir(parents=True, exist_ok=True)
+            plane = load_raw_plane(image_path, channel_index=channel_index, z_index=z_index)
+            _atomic_write_png(png_path, auto_scale(plane))
 
     def get_thumbnail_path(self, image_path: Path) -> Path:
         ctx = self._context(image_path)
@@ -447,3 +484,4 @@ def _read_ome_physical_size_x(tf: tifffile.TiffFile):
 def _normalize_unit(unit):
     value = str(unit or "um").strip() or "um"
     return value.replace("\u00b5", "u")
+

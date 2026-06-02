@@ -109,6 +109,25 @@ class AnalysisStore:
             ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def list_metric_runs(self, segmentation_run_id: str, limit: int | None = 50) -> list[dict]:
+        limit = None if limit is None else max(1, min(int(limit or 50), 100))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM analysis_runs
+                WHERE operation IN ('gbm-thickness', 'process-nnd')
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        runs = []
+        for row in rows:
+            run = _row_to_dict(row)
+            if (run.get("request") or {}).get("segmentationRunId") == segmentation_run_id:
+                runs.append(run)
+                if limit is not None and len(runs) >= limit:
+                    break
+        return runs
+
     def delete_run(self, run_id: str) -> dict:
         run = self.get_run(run_id)
         child_run_ids = self._metric_run_ids_for_segmentation(run_id)
@@ -273,19 +292,7 @@ class AnalysisStore:
                 conn.execute(f"ALTER TABLE analysis_runs ADD COLUMN {name} {definition}")
 
     def _metric_run_ids_for_segmentation(self, segmentation_run_id: str) -> list[str]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT run_id, request_json FROM analysis_runs
-                WHERE operation IN ('gbm-thickness', 'process-nnd')
-                """
-            ).fetchall()
-        run_ids = []
-        for row in rows:
-            request_payload = _json_load(row["request_json"], {})
-            if request_payload.get("segmentationRunId") == segmentation_run_id:
-                run_ids.append(row["run_id"])
-        return run_ids
+        return [run["runId"] for run in self.list_metric_runs(segmentation_run_id, limit=None)]
 
 
 def _json_load(value, fallback):

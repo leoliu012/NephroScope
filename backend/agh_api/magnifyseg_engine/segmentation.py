@@ -52,6 +52,7 @@ def run_segmentation(*, image_path: Path, workspace: Path, model_root: Path, mod
         PATCH_SIZE,
         PATCH_SIZE,
     )
+    segmentation = _postprocess_segmentation_labels(model_name, segmentation)
     output_path = workspace / model_info["segmentationName"]
     tifffile.imwrite(output_path, segmentation.astype(np.uint8))
     return output_path
@@ -75,3 +76,10 @@ def _prepare_model_input(plane, preprocessing_mode):
     if preprocessing_mode in {"percentile-stretch", "magnifyseg-enhanced"}:
         return preprocess_stack(plane)
     raise ValueError(f"Unknown preprocessing mode: {preprocessing_mode}")
+
+
+def _postprocess_segmentation_labels(model_name, segmentation):
+    labels = np.asarray(segmentation)
+    if model_name in {"NHS_SINGLE_CHANNEL", "NHS_COMBINED_ACTN4"}:
+        return np.where(labels == 1, 1, 0).astype(np.uint8)
+    return labels.astype(np.uint8)

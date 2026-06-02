@@ -6,6 +6,7 @@ import numpy as np
 import tifffile
 
 from agh_api.magnifyseg_engine.patch_segmentation import run_patches
+from agh_api.magnifyseg_engine.segmentation import _postprocess_segmentation_labels
 
 
 class FakeModel:
@@ -47,6 +48,13 @@ class PatchSegmentationTests(unittest.TestCase):
         self.assertEqual(model.seen_shape, (1, 576, 576, 2))
         self.assertEqual(result.shape, (400, 500))
         self.assertTrue(np.all(result == 1))
+
+    def test_nhs_postprocessing_removes_nuclei_label(self):
+        labels = np.array([[0, 1, 2], [2, 1, 0]], dtype=np.uint8)
+
+        result = _postprocess_segmentation_labels("NHS_SINGLE_CHANNEL", labels)
+
+        np.testing.assert_array_equal(result, np.array([[0, 1, 0], [0, 1, 0]], dtype=np.uint8))
 
 
 if __name__ == "__main__":

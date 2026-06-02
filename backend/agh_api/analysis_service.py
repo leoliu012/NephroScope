@@ -4,11 +4,13 @@ from pathlib import Path
 import tifffile
 
 from .analysis_artifacts import metric_artifact_name, metric_directory, run_directory
+from .analysis_profiles import resolve_process_watershed
 from .errors import BadRequest, Conflict
 from .magnifyseg_engine.metrics import compute_gbm_thickness, compute_process_nnd
 from .magnifyseg_engine.overlays import write_binary_overlay, write_segmentation_overlays
 from .magnifyseg_engine.segmentation import run_segmentation
 from .path_guard import image_path
+from .analysis_validation import normalize_calibration
 from .tiff_service import ImageCacheService
 
 
@@ -38,11 +40,7 @@ def execute_analysis(config, store, job, segmentation_runner=run_segmentation):
         completed.append(model_name)
         store.update_progress(job["runId"], None, completed)
 
-    overlays = write_segmentation_overlays(
-        segmentation_paths,
-        run_dir,
-        hide_nhs_nuclei="DAPI" in completed,
-    )
+    overlays = write_segmentation_overlays(segmentation_paths, run_dir)
     result = {
         "runId": job["runId"],
         "completed": completed,
@@ -60,7 +58,7 @@ def create_metric_run(store, segmentation_run_id, operation, payload):
     if operation not in {"gbm-thickness", "process-nnd"}:
         raise BadRequest("Invalid metric operation")
     segmentation_run = _require_succeeded(store.get_run(segmentation_run_id))
-    _effective_pixel_size(segmentation_run)
+    pixel_size, pixel_unit, calibration = _effective_pixel_size(segmentation_run, payload)
     if operation == "gbm-thickness":
         _nhs_segmentation_name(segmentation_run)
     else:
@@ -68,9 +66,14 @@ def create_metric_run(store, segmentation_run_id, operation, payload):
     request_payload = {
         "segmentationRunId": segmentation_run_id,
         "roi": (payload or {}).get("roi"),
+        "calibration": calibration,
     }
     if operation == "process-nnd":
-        request_payload["watershed"] = (payload or {}).get("watershed") or {}
+        request_payload["watershed"] = resolve_process_watershed(
+            (payload or {}).get("watershed"),
+            effective_pixel_size=pixel_size,
+            pixel_unit=pixel_unit,
+        )
     return store.create_run(segmentation_run["case"], segmentation_run["filename"], operation, request_payload)
 
 
@@ -83,7 +86,7 @@ def execute_gbm_thickness(config, store, job):
     metric_dir.mkdir(parents=True, exist_ok=True)
     _write_json(metric_dir / "request.json", payload)
 
-    pixel_size, unit = _effective_pixel_size(segmentation_run)
+    pixel_size, unit, calibration = _effective_pixel_size(segmentation_run, payload)
     nhs_name = _nhs_segmentation_name(segmentation_run)
     labels = tifffile.imread(run_dir / nhs_name)
     mask = labels == 1
@@ -93,6 +96,7 @@ def execute_gbm_thickness(config, store, job):
         "segmentationRunId": segmentation_run_id,
         "metricRunId": job["runId"],
         "unit": unit,
+        "calibration": calibration,
         "artifacts": {
             "request": metric_artifact_name(job["runId"], "request.json"),
             "result": metric_artifact_name(job["runId"], "result.json"),
@@ -112,11 +116,15 @@ def execute_process_nnd(config, store, job):
     metric_dir.mkdir(parents=True, exist_ok=True)
     _write_json(metric_dir / "request.json", payload)
 
-    pixel_size, unit = _effective_pixel_size(segmentation_run)
+    pixel_size, unit, calibration = _effective_pixel_size(segmentation_run, payload)
     seg_name = _actn4_segmentation_name(segmentation_run)
     labels = tifffile.imread(run_dir / seg_name)
     mask = labels > 0
-    watershed = payload.get("watershed") or {}
+    watershed = resolve_process_watershed(
+        payload.get("watershed"),
+        effective_pixel_size=pixel_size,
+        pixel_unit=unit,
+    )
     result = compute_process_nnd(
         mask,
         pixel_size,
@@ -132,14 +140,29 @@ def execute_process_nnd(config, store, job):
         "segmentationRunId": segmentation_run_id,
         "metricRunId": job["runId"],
         "unit": unit,
+        "calibration": calibration,
+        "watershed": watershed,
     })
     contour_artifacts = []
-    for key, filename in (("contours", "proc_contours.png"), ("outerContours", "proc_outer_contours.png")):
+    contour_layers = []
+    for key, filename, color, label in (
+        ("outerContours", "proc_outer_contours.png", (255, 214, 10), "Original process boundary"),
+        ("contours", "proc_contours.png", (0, 224, 255), "Watershed split boundary"),
+    ):
         source = result.get(key)
         if source:
-            write_binary_overlay(tifffile.imread(metric_dir / source) > 0, metric_dir / filename, (255, 240, 6), alpha=220)
-            contour_artifacts.append(metric_artifact_name(job["runId"], filename))
+            artifact = metric_artifact_name(job["runId"], filename)
+            write_binary_overlay(tifffile.imread(metric_dir / source) > 0, metric_dir / filename, color, alpha=220)
+            contour_artifacts.append(artifact)
+            contour_layers.append({
+                "id": key,
+                "label": label,
+                "group": "Process separation",
+                "artifact": artifact,
+                "defaultOpacity": 0.90 if key == "contours" else 0.75,
+            })
     result["contourOverlays"] = contour_artifacts
+    result["contourLayers"] = contour_layers
     artifacts = {
         "request": metric_artifact_name(job["runId"], "request.json"),
         "result": metric_artifact_name(job["runId"], "result.json"),
@@ -161,12 +184,28 @@ def _require_succeeded(run):
     return run
 
 
-def _effective_pixel_size(run):
-    calibration = (run.get("request") or {}).get("calibration") or {}
+def _effective_pixel_size(run, metric_payload=None):
+    base = (run.get("request") or {}).get("calibration") or {}
+    override = (metric_payload or {}).get("calibration") or {}
+    if not isinstance(override, dict):
+        raise BadRequest("Invalid calibration")
+
+    merged = dict(base)
+    if override:
+        # Metric controls are allowed to override calibration without rerunning
+        # segmentation. Drop previously derived values so they are recomputed
+        # from the current raw size / EF or from the direct effective override.
+        merged.update(override)
+        merged.pop("effectivePixelSize", None)
+        merged.pop("effectivePixelSizeSource", None)
+    calibration = normalize_calibration(merged)
     pixel_size = calibration.get("effectivePixelSize")
     if pixel_size is None:
-        raise BadRequest("Pixel size is required for this metric")
-    return float(pixel_size), calibration.get("pixelUnit") or "um"
+        raise BadRequest(
+            "Physical pixel size is required for this metric. Expansion factor alone is not enough; "
+            "enter the raw XY pixel size or an effective pixel size override."
+        )
+    return float(pixel_size), calibration.get("pixelUnit") or "um", calibration
 
 
 def _nhs_segmentation_name(run):
@@ -226,3 +265,4 @@ def _write_json(path, payload):
     with Path(path).open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+

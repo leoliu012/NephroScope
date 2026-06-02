@@ -6,7 +6,7 @@ import numpy as np
 import tifffile
 
 from agh_api.errors import UnsupportedTiff
-from agh_api.tiff_service import _read_pixel_calibration, load_raw_plane, normalise_array_to_channels, normalise_shape_to_czyx
+from agh_api.tiff_service import ImageCacheService, _read_pixel_calibration, load_raw_plane, normalise_array_to_channels, normalise_shape_to_czyx
 
 
 class _FakePage:
@@ -71,6 +71,30 @@ class TiffServiceTests(unittest.TestCase):
         self.assertEqual(len(channels), 2)
         np.testing.assert_array_equal(channels[1], arr[:, 1].max(axis=0))
 
+    def test_slice_channel_cache_is_distinct_from_mip_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            data_root = base / "data"
+            cache_root = base / "cache"
+            data_root.mkdir()
+            path = data_root / "stack.tif"
+            arr = np.zeros((1, 2, 3, 4), dtype=np.uint16)
+            arr[0, 0, 0, 0] = 10
+            arr[0, 1, 2, 3] = 50
+            tifffile.imwrite(path, arr, metadata={"axes": "CZYX"})
+
+            cache = ImageCacheService(data_root, cache_root)
+            mip = cache.get_channel_path(path, 0)
+            z0 = cache.get_channel_path(path, 0, z_index=0, projection="slice")
+            z1 = cache.get_channel_path(path, 0, z_index=1, projection="slice")
+
+            self.assertEqual(mip.name, "channel_0.png")
+            self.assertEqual(z0.name, "channel_0_z_0.png")
+            self.assertEqual(z1.name, "channel_0_z_1.png")
+            self.assertTrue(mip.exists())
+            self.assertTrue(z0.exists())
+            self.assertTrue(z1.exists())
+
     def test_tc_zyx_singleton_time(self):
         arr = np.arange(48, dtype=np.uint16).reshape(1, 2, 2, 3, 4)
         channels = normalise_array_to_channels(arr, "TCZYX")
@@ -104,3 +128,4 @@ class TiffServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -2,24 +2,35 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Loader2 } from 'lucide-react'
 
 const API = '/agh/api'
-const MAX_CACHE_ENTRIES = 48
+const MAX_CACHE_ENTRIES = 72
 const CHANNEL_CACHE = new Map()
 
-// Ch0=Blue, Ch1=EM-inverted (handled specially), Ch2=Red, Ch3=Magenta
-const RGB_FN = [
-  (v) => [0, 0, v],
-  null,
-  (v) => [v, 0, 0],
-  (v) => [v, 0, v],
-]
 
 function remap(v, minVal, maxVal) {
   if (maxVal <= minVal) return 0
   return Math.max(0, Math.min(255, Math.round((v - minVal) / (maxVal - minVal) * 255)))
 }
 
-function channelCacheKey(caseId, filename, imgMeta, channelIndex) {
-  return `${caseId}|${filename}|${imgMeta?.cacheKey || 'no-cache-key'}|${channelIndex}`
+function hexToRgb(hex) {
+  const match = /^#([0-9a-f]{6})$/i.exec(String(hex || ''))
+  if (!match) return [255, 255, 255]
+  const value = Number.parseInt(match[1], 16)
+  return [(value >> 16) & 255, (value >> 8) & 255, value & 255]
+}
+
+function displayRgb(setting, value) {
+  if (setting?.displayMode !== 'color') return [value, value, value]
+  const [r, g, b] = hexToRgb(setting.displayColor)
+  return [
+    Math.round(value * r / 255),
+    Math.round(value * g / 255),
+    Math.round(value * b / 255),
+  ]
+}
+
+function channelCacheKey(caseId, filename, imgMeta, channelIndex, projection, zIndex) {
+  const plane = projection === 'mip' ? 'mip' : `z-${zIndex}`
+  return `${caseId}|${filename}|${imgMeta?.cacheKey || 'no-cache-key'}|${plane}|${channelIndex}`
 }
 
 function getCachedChannel(key) {
@@ -46,34 +57,24 @@ function makeScratchCanvas(width, height) {
   return canvas
 }
 
-function composeChannels(channelData, settings, width, height, stride = 1) {
+function composeChannels(channelData, settings, mapping, width, height, stride = 1) {
   const outWidth = Math.ceil(width / stride)
   const outHeight = Math.ceil(height / stride)
   const out = new Uint8ClampedArray(outWidth * outHeight * 4)
-  const hasEM = settings[1]?.enabled && channelData[1]
 
   for (let y = 0; y < outHeight; y++) {
     const sourceY = Math.min(height - 1, y * stride)
     for (let x = 0; x < outWidth; x++) {
       const sourceX = Math.min(width - 1, x * stride)
       const sourceIndex = sourceY * width + sourceX
-      let r = hasEM ? 255 : 0
-      let g = hasEM ? 255 : 0
-      let b = hasEM ? 255 : 0
-
-      if (hasEM) {
-        const v = remap(channelData[1][sourceIndex], settings[1].minVal, settings[1].maxVal)
-        const inv = 255 - v
-        r = (r * inv) >> 8
-        g = (g * inv) >> 8
-        b = (b * inv) >> 8
-      }
+      let r = 0
+      let g = 0
+      let b = 0
 
       for (let c = 0; c < settings.length; c++) {
-        if (c === 1 || !settings[c]?.enabled || !channelData[c]) continue
+        if (!settings[c]?.enabled || !channelData[c]) continue
         const v = remap(channelData[c][sourceIndex], settings[c].minVal, settings[c].maxVal)
-        const fn = RGB_FN[c] ?? ((value) => [value, value, value])
-        const [cr, cg, cb] = fn(v)
+        const [cr, cg, cb] = displayRgb(settings[c], v)
         r = Math.min(255, r + cr)
         g = Math.min(255, g + cg)
         b = Math.min(255, b + cb)
@@ -135,7 +136,17 @@ function scheduleIdle(fn) {
   return () => window.clearTimeout(id)
 }
 
-export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta, canvasRef, onReady }) {
+export default function MultiChannelCanvas({
+  caseId,
+  filename,
+  settings,
+  channelMapping,
+  imgMeta,
+  canvasRef,
+  zIndex = 0,
+  projection = 'slice',
+  onReady,
+}) {
   const [channelData, setChannelData] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -149,6 +160,8 @@ export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta
       .filter(index => index != null)
   ), [settings])
   const enabledKey = enabledIndexes.join(',')
+  const mappingKey = (channelMapping || []).map(item => `${item.channel}:${item.role}`).join('|')
+  const planeKey = projection === 'mip' ? 'mip' : `z-${zIndex}`
 
   useEffect(() => { channelDataRef.current = channelData }, [channelData])
 
@@ -156,13 +169,13 @@ export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta
     if (!imgMeta || !caseId || !filename) return
     const numChannels = imgMeta.numChannels || 0
     const cached = Array.from({ length: numChannels }, (_, index) =>
-      getCachedChannel(channelCacheKey(caseId, filename, imgMeta, index))
+      getCachedChannel(channelCacheKey(caseId, filename, imgMeta, index, projection, zIndex))
     )
     channelDataRef.current = cached
     setChannelData(cached)
     setLoading(enabledIndexes.some(index => !cached[index]))
     setError(null)
-  }, [caseId, filename, imgMeta?.cacheKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [caseId, filename, imgMeta?.cacheKey, planeKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!imgMeta || !caseId || !filename) return
@@ -172,10 +185,13 @@ export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta
     const numChannels = imgMeta.numChannels || 0
 
     const loadChannel = async (channelIndex) => {
-      const key = channelCacheKey(caseId, filename, imgMeta, channelIndex)
+      const key = channelCacheKey(caseId, filename, imgMeta, channelIndex, projection, zIndex)
       const cached = getCachedChannel(key)
       if (cached) return cached
-      const url = `${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}/channel/${channelIndex}`
+      const query = projection === 'mip'
+        ? '?projection=mip'
+        : `?projection=slice&z=${encodeURIComponent(zIndex)}`
+      const url = `${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}/channel/${channelIndex}${query}`
       const data = await loadGrayChannel(url, controller.signal)
       setCachedChannel(key, data)
       return data
@@ -230,7 +246,7 @@ export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta
       controller.abort()
       cancelIdle?.()
     }
-  }, [caseId, filename, imgMeta?.cacheKey, enabledKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [caseId, filename, imgMeta?.cacheKey, enabledKey, planeKey]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!canvasRef?.current || !imgMeta) return
@@ -249,13 +265,13 @@ export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta
     }
 
     renderRafRef.current = window.requestAnimationFrame(() => {
-      const preview = composeChannels(channelData, settings, width, height, 4)
+      const preview = composeChannels(channelData, settings, channelMapping, width, height, 4)
       drawImageData(canvas, preview, width, height)
       renderRafRef.current = null
     })
 
     fullRenderTimerRef.current = window.setTimeout(() => {
-      const full = composeChannels(channelData, settings, width, height, 1)
+      const full = composeChannels(channelData, settings, channelMapping, width, height, 1)
       drawImageData(canvas, full, width, height)
       fullRenderTimerRef.current = null
     }, 140)
@@ -264,16 +280,16 @@ export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta
       if (renderRafRef.current) window.cancelAnimationFrame(renderRafRef.current)
       if (fullRenderTimerRef.current) window.clearTimeout(fullRenderTimerRef.current)
     }
-  }, [channelData, settings, imgMeta, canvasRef])
+  }, [channelData, settings, mappingKey, imgMeta, canvasRef]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (error) return (
-    <div className="flex items-center justify-center w-full h-full text-red-400 text-sm">{error}</div>
+    <div className="flex h-full w-full items-center justify-center text-sm text-red-400">{error}</div>
   )
 
   return (
     <>
       {loading && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center z-20 bg-black/60">
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-black/60">
           <Loader2 size={32} className="mb-2 animate-spin text-[var(--accent)]" />
           <span className="text-xs text-gray-400">Loading active channels...</span>
         </div>
@@ -282,5 +298,3 @@ export default function MultiChannelCanvas({ caseId, filename, settings, imgMeta
     </>
   )
 }
-
-

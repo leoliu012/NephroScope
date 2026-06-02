@@ -5,7 +5,6 @@ import {
   Eye,
   FileImage,
   FolderOpen,
-  Layers3,
   Loader2,
   Microscope,
   Search,
@@ -46,6 +45,30 @@ function SearchField({ value, onChange, placeholder }) {
   )
 }
 
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return null
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unit = units[0]
+  for (let i = 1; i < units.length && value >= 1024; i += 1) {
+    value /= 1024
+    unit = units[i]
+  }
+  const digits = value >= 10 || unit === 'B' ? 0 : 1
+  return `${value.toFixed(digits)} ${unit}`
+}
+
+function formatImageMeta(meta) {
+  if (!meta) return 'TIFF image'
+  const parts = []
+  if (meta.width && meta.height) parts.push(`${meta.width} x ${meta.height}`)
+  if (meta.numChannels) parts.push(`${meta.numChannels} channel${meta.numChannels === 1 ? '' : 's'}`)
+  if (meta.numZSlices) parts.push(`${meta.numZSlices} Z-slice${meta.numZSlices === 1 ? '' : 's'}`)
+  const size = formatBytes(meta.sourceSize)
+  if (size) parts.push(size)
+  return parts.join(' | ') || 'TIFF image'
+}
+
 export default function App() {
   const [cases, setCases] = useState([])
   const [selectedCase, setCase] = useState(null)
@@ -60,6 +83,8 @@ export default function App() {
   const [fileQuery, setFileQuery] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
   const [previewError, setPreviewError] = useState(null)
+  const [previewMeta, setPreviewMeta] = useState(null)
+  const [previewMetaLoading, setPreviewMetaLoading] = useState(false)
   const [openFile, setOpenFile] = useState(null)
 
   useEffect(() => {
@@ -111,6 +136,26 @@ export default function App() {
     }
   }, [selectedCase, loadingFiles, filteredFiles, selectedFile])
 
+  useEffect(() => {
+    if (!selectedCase || !selectedFile) {
+      setPreviewMeta(null)
+      setPreviewMetaLoading(false)
+      return
+    }
+    const controller = new AbortController()
+    setPreviewMeta(null)
+    setPreviewMetaLoading(true)
+    fetchJson(`${API}/cases/${encodeURIComponent(selectedCase)}/files/${encodeURIComponent(selectedFile)}/meta`, { signal: controller.signal })
+      .then(meta => setPreviewMeta(meta))
+      .catch(error => {
+        if (error.name !== 'AbortError') setPreviewMeta(null)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPreviewMetaLoading(false)
+      })
+    return () => controller.abort()
+  }, [selectedCase, selectedFile])
+
   const openViewer = useCallback((filename = selectedFile) => {
     if (!selectedCase || !filename) return
     setSelectedFile(filename)
@@ -154,22 +199,18 @@ export default function App() {
           <span className="app-brand-mark"><Microscope size={15} /></span>
           <div>
             <h1 className="text-sm font-semibold leading-tight text-[var(--text)]">AGH Viewer</h1>
-            <p className="text-[10px] leading-tight text-[var(--text-subtle)]">Microscopy review workspace</p>
+            <p className="text-[11px] leading-tight text-[var(--text-subtle)]">Microscopy image review</p>
           </div>
         </div>
-        <div className="flex items-center gap-2 text-[10px] text-[var(--text-subtle)]">
-          <Layers3 size={12} />
-          <span>{cases.length} cases indexed</span>
+        <div className="text-[11px] text-[var(--text-subtle)]">
+          <span>{cases.length} cases</span>
         </div>
       </header>
 
       <div className="flex min-h-0 flex-1">
         <aside className="app-pane flex w-60 flex-shrink-0 flex-col border-r">
           <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
-            <div className="flex items-center gap-2">
-              <FolderOpen size={15} className="text-[var(--accent)]" />
-              <span className="text-xs font-semibold text-[var(--text)]">Cases</span>
-            </div>
+            <span className="text-xs font-semibold text-[var(--text)]">Cases</span>
             <span className="ux-meta">{filteredCases.length}</span>
           </div>
           <div className="border-b border-[var(--border)] px-3 py-3">
@@ -193,9 +234,9 @@ export default function App() {
                       <button
                         key={item}
                         onClick={() => { setCase(item); setFiles([]); setSelectedFile(null); setFileQuery(''); setPreviewError(null) }}
-                        className={`ux-list-item flex w-full items-center gap-2 px-4 py-2.5 text-left text-xs ${selectedCase === item ? 'ux-list-item-selected text-[var(--text)]' : 'text-[var(--text-muted)]'}`}
+                        className={`ux-list-item flex h-9 w-full items-center gap-2 px-4 text-left text-xs ${selectedCase === item ? 'ux-list-item-selected text-[var(--text)]' : 'text-[var(--text-muted)]'}`}
                       >
-                        <ChevronRight size={12} className={selectedCase === item ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'} />
+                        <ChevronRight size={12} className="text-[var(--text-subtle)]" />
                         <span className="truncate">{item}</span>
                       </button>
                     ))}
@@ -205,11 +246,8 @@ export default function App() {
         <aside className="app-pane app-pane-secondary flex w-80 flex-shrink-0 flex-col border-r">
           <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
             <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <FileImage size={15} className="flex-shrink-0 text-[var(--accent)]" />
-                <span className="truncate text-xs font-semibold text-[var(--text)]">Images</span>
-              </div>
-              {selectedCase && <p className="mt-1 truncate text-[10px] text-[var(--text-subtle)]">{selectedCase}</p>}
+              <span className="truncate text-xs font-semibold text-[var(--text)]">Images</span>
+              {selectedCase && <p className="mt-1 truncate text-[11px] text-[var(--text-subtle)]">{selectedCase}</p>}
             </div>
             {selectedCase && <span className="ux-meta">{filteredFiles.length} TIFF</span>}
           </div>
@@ -244,7 +282,11 @@ export default function App() {
                           <FileImage size={14} className={`mt-0.5 flex-shrink-0 ${selectedFile === item ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`} />
                           <div className="min-w-0 flex-1">
                             <p className="break-all text-xs leading-snug text-[var(--text)]">{item}</p>
-                            <p className="mt-1 text-[10px] text-[var(--text-subtle)]">TIFF image</p>
+                            <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
+                              {selectedFile === item
+                                ? previewMetaLoading ? 'Loading metadata' : formatImageMeta(previewMeta)
+                                : 'TIFF image'}
+                            </p>
                           </div>
                           <button
                             onClick={event => { event.stopPropagation(); openViewer(item) }}
@@ -263,9 +305,11 @@ export default function App() {
             <div className="flex h-full w-full flex-col p-6">
               <div className="mb-4 flex items-center justify-between gap-4">
                 <div className="min-w-0">
-                  <p className="ux-section-label">Selected image</p>
                   <h2 className="mt-1 truncate text-sm font-medium text-[var(--text)]">{selectedFile}</h2>
-                  <p className="mt-1 text-[10px] text-[var(--text-subtle)]">{selectedCase}</p>
+                  <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
+                    {selectedCase}
+                    {previewMetaLoading ? ' | Loading metadata' : previewMeta ? ` | ${formatImageMeta(previewMeta)}` : ''}
+                  </p>
                 </div>
                 <button onClick={() => openViewer(selectedFile)} className="ux-button ux-button-primary flex-shrink-0">
                   Open viewer <ArrowRight size={13} />
@@ -283,13 +327,11 @@ export default function App() {
                 </div>
               </div>
               {previewError && <p className="mt-3 text-xs text-[var(--danger)]">{previewError}</p>}
-              <p className="mt-3 text-[10px] text-[var(--text-subtle)]">Double-click an image or press Enter to open it. Use ↑ and ↓ to browse.</p>
             </div>
           ) : (
             <div className="max-w-sm text-center text-[var(--text-subtle)]">
-              <span className="app-brand-mark mx-auto mb-4 h-12 w-12 rounded-xl"><Microscope size={24} /></span>
-              <h2 className="text-sm font-semibold text-[var(--text-muted)]">Choose an image to begin</h2>
-              <p className="mt-2 text-xs leading-relaxed">Browse a case and select a TIFF image to inspect channels, run MagnifySeg analysis, or add annotations.</p>
+              <h2 className="text-sm font-semibold text-[var(--text-muted)]">Select an image to preview</h2>
+              <p className="mt-2 text-xs leading-relaxed">Choose a case from the left sidebar.</p>
             </div>
           )}
         </main>

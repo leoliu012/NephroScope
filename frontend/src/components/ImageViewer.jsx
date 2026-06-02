@@ -11,6 +11,7 @@ import {
   PenLine,
   Type,
   ArrowRight,
+  Hand,
   Trash2,
   User,
   ChevronDown,
@@ -20,12 +21,9 @@ import {
   Pencil,
   List,
   Info,
-  Eye,
-  Activity,
-  MessageSquare,
-  Upload,
   PanelRightClose,
   PanelRightOpen,
+  Plus,
   RotateCcw,
   ZoomIn,
   ZoomOut,
@@ -38,12 +36,22 @@ import ChannelControls from './ChannelControls.jsx'
 import AnalysisPanel from './AnalysisPanel.jsx'
 import AnalysisMaskCanvas from './AnalysisMaskCanvas.jsx'
 import AnalysisVectorOverlay from './AnalysisVectorOverlay.jsx'
-import { defaultChannelMapping, normalizeChannelMapping, roleInfo } from '../channelMapping.js'
+import AnalysisLegend from './analysis/AnalysisLegend.jsx'
+import {
+  defaultChannelMapping,
+  defaultDisplaySettingForRole,
+  displaySwatchStyle,
+  normalizeChannelDisplaySetting,
+  normalizeChannelMapping,
+  roleInfo,
+} from '../channelMapping.js'
 
 const API = '/agh/api'
 
 const TOOLS = [
   { id: 'select',   icon: MousePointer, label: 'Select' },
+  { id: 'pan',      icon: Hand,         label: 'Pan - Hold Space' },
+  { id: 'analysis-roi', icon: Square,      label: 'Analysis ROI' },
   { id: 'point',    icon: Circle,       label: 'Point' },
   { id: 'line',     icon: Minus,        label: 'Line' },
   { id: 'arrow',    icon: ArrowRight,   label: 'Arrow' },
@@ -56,14 +64,26 @@ const TOOLS = [
 const COLORS = ['#ffee55','#ff4444','#44ff88','#44aaff','#ff44ff','#ffffff','#ff8800']
 
 const SIDEBAR_TABS = [
-  { id: 'view', label: 'View', icon: Eye },
-  { id: 'analyze', label: 'Analyze', icon: Activity },
-  { id: 'annotate', label: 'Annotate', icon: MessageSquare },
-  { id: 'export', label: 'Export', icon: Upload },
+  { id: 'view', label: 'Display' },
+  { id: 'analyze', label: 'Analysis' },
+  { id: 'annotate', label: 'Annotations' },
+  { id: 'export', label: 'Export' },
 ]
 
-function defaultChSettings(n) {
-  return Array.from({ length: n }, () => ({ enabled: true, minVal: 0, maxVal: 255 }))
+function defaultChSettings(n, mapping = defaultChannelMapping(n)) {
+  return Array.from({ length: n }, (_, index) => ({
+    enabled: true,
+    minVal: 0,
+    maxVal: 255,
+    ...defaultDisplaySettingForRole(mapping[index]?.role),
+  }))
+}
+
+function normalizeChSettings(value, n, mapping) {
+  const saved = Array.isArray(value) ? value : []
+  return Array.from({ length: n }, (_, index) => (
+    normalizeChannelDisplaySetting(saved[index], mapping[index]?.role)
+  ))
 }
 
 function rectAnnotationToRoi(annotation) {
@@ -90,6 +110,8 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
   // Channel display settings [{enabled, minVal, maxVal}]
   const [chSettings, setChSettings]     = useState([])
   const [channelMapping, setChannelMapping] = useState([])
+  const [viewerZIndex, setViewerZIndex] = useState(0)
+  const [displayProjection, setDisplayProjection] = useState('slice')
   // Pan/zoom
   const [tx, setTx]                     = useState(0)
   const [ty, setTy]                     = useState(0)
@@ -123,6 +145,7 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
   const [visibleAnalysisVectors, setVisibleAnalysisVectors] = useState({ thickness: true, process: true })
   const [thicknessMetric, setThicknessMetric] = useState(null)
   const [processMetric, setProcessMetric] = useState(null)
+  const [analysisRoi, setAnalysisRoi] = useState(null)
 
   const canvasRef   = useRef(null)
   const svgRef      = useRef(null)
@@ -167,16 +190,21 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
     fetchJson(`${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}/meta`, { signal: controller.signal })
       .then(meta => {
         setImgMeta(meta)
-        const _saved = localStorage.getItem(`agh-ch-${caseId}-${filename}`)
-        let _ch = defaultChSettings(meta.numChannels)
-        if (_saved) { try { const p = JSON.parse(_saved); if (p.length === meta.numChannels) _ch = p } catch {} }
-        setChSettings(_ch)
+        setViewerZIndex(0)
+        setDisplayProjection('slice')
+        setAnalysisRoi(null)
         const savedMapping = localStorage.getItem(`agh-channel-map-${caseId}`)
         let mapping = defaultChannelMapping(meta.numChannels)
         if (savedMapping) {
           try { mapping = normalizeChannelMapping(JSON.parse(savedMapping), meta.numChannels) } catch {}
         }
         setChannelMapping(mapping)
+        const savedDisplay = localStorage.getItem(`agh-ch-${caseId}-${filename}`)
+        let display = defaultChSettings(meta.numChannels, mapping)
+        if (savedDisplay) {
+          try { display = normalizeChSettings(JSON.parse(savedDisplay), meta.numChannels, mapping) } catch {}
+        }
+        setChSettings(display)
         window.requestAnimationFrame(() => fitToViewport(meta))
       })
       .catch(err => { if (err.name !== 'AbortError') setLoadError(err.message) })
@@ -392,7 +420,7 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
   }, [])
 
   const handleMouseDown = useCallback(e => {
-    if (activeTool !== 'select' && !spacePan) return
+    if (activeTool !== 'select' && activeTool !== 'pan' && !spacePan) return
     if (e.button !== 0) return
     dragRef.current = { startX: e.clientX - tx, startY: e.clientY - ty }
   }, [activeTool, spacePan, tx, ty])
@@ -421,21 +449,49 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
     setChSettings(prev => prev.map((s, idx) => idx === i ? { ...s, ...patch } : s))
   }, [])
 
-  const updateChannelRole = useCallback((channelIndex, role) => {
-    setChannelMapping(prev => prev.map(item => {
-      if (item.channel === channelIndex) return { ...item, role }
-      if (role !== 'unassigned' && item.role === role) return { ...item, role: 'unassigned' }
-      return item
+  const applyRoleDisplayDefaults = useCallback((changes) => {
+    setChSettings(prev => prev.map((setting, index) => {
+      const nextRole = changes.get(index)
+      return nextRole == null ? setting : { ...setting, ...defaultDisplaySettingForRole(nextRole) }
     }))
   }, [])
 
-  const setRoleChannel = useCallback((role, channelIndex) => {
-    setChannelMapping(prev => prev.map(item => {
+  const updateChannelRole = useCallback((channelIndex, role) => {
+    const changes = new Map([[channelIndex, role]])
+    const nextMapping = channelMapping.map(item => {
       if (item.channel === channelIndex) return { ...item, role }
-      if (item.role === role) return { ...item, role: 'unassigned' }
+      if (role !== 'unassigned' && item.role === role) {
+        changes.set(item.channel, 'unassigned')
+        return { ...item, role: 'unassigned' }
+      }
       return item
-    }))
-  }, [])
+    })
+    setChannelMapping(nextMapping)
+    applyRoleDisplayDefaults(changes)
+  }, [applyRoleDisplayDefaults, channelMapping])
+
+  const setRoleChannel = useCallback((role, channelIndex) => {
+    const changes = new Map([[channelIndex, role]])
+    const nextMapping = channelMapping.map(item => {
+      if (item.channel === channelIndex) return { ...item, role }
+      if (item.role === role) {
+        changes.set(item.channel, 'unassigned')
+        return { ...item, role: 'unassigned' }
+      }
+      return item
+    })
+    setChannelMapping(nextMapping)
+    applyRoleDisplayDefaults(changes)
+  }, [applyRoleDisplayDefaults, channelMapping])
+
+  const resetChannelMapping = useCallback(() => {
+    const mapping = defaultChannelMapping(imgMeta?.numChannels || 0)
+    setChannelMapping(mapping)
+    setChSettings(prev => prev.map((setting, index) => ({
+      ...setting,
+      ...defaultDisplaySettingForRole(mapping[index]?.role),
+    })))
+  }, [imgMeta?.numChannels])
 
   const updateSelectedAnnotation = useCallback((patch) => {
     if (!selectedId) return
@@ -472,9 +528,10 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
   }, [filename, annotations])
 
   const selectedAnn = annotations.find(a => a.id === selectedId)
-  const analysisRoi = rectAnnotationToRoi(selectedAnn)
+  const selectedAnnotationRoi = rectAnnotationToRoi(selectedAnn)
   const displayFontSize = selectedAnn?.type === 'text' ? (selectedAnn.fontSize || fontSize) : fontSize
-  const isDrawTool = activeTool !== 'select' && !spacePan
+  const panActive = spacePan || activeTool === 'pan'
+  const isDrawTool = activeTool !== 'select' && activeTool !== 'pan' && !spacePan
   const transform = `translate(${tx}px, ${ty}px) scale(${scale})`
   const zoomLabel = `${Math.round(scale * 100)}%`
   const saveLabel = saving
@@ -485,6 +542,13 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
         ? 'Saved just now'
         : 'Saved'
   const activeMappedChannels = channelMapping.filter(item => item.role !== 'unassigned')
+  const analysisZIndex = Number(analysisRun?.request?.zIndex)
+  const analysisPlaneAligned = !analysisRun?.runId || (
+    displayProjection === 'slice'
+    && (!Number.isFinite(analysisZIndex) || analysisZIndex === viewerZIndex)
+  )
+  const exportSegmentationEntries = Object.entries(analysisRun?.result?.segmentations || {})
+    .filter(([model]) => model !== 'DAPI')
   const requestClose = () => {
     if (dirty && !window.confirm('Discard unsaved annotations?')) return
     onClose()
@@ -493,158 +557,157 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
   return (
     <div className="viewer-shell fixed inset-0 z-50 flex">
       <div className="viewer-tool-rail w-12 flex-shrink-0 flex flex-col items-center gap-1 border-r py-3">
-        {TOOLS.map(({ id, icon: Icon, label }) => (
+        {TOOLS.slice(0, 3).map(({ id, icon: Icon, label }) => (
           <button key={id} title={label} onClick={() => setActiveTool(id)}
             className={`ux-tool-button ${activeTool === id ? 'ux-tool-button-active' : ''}`}>
             <Icon size={16} />
           </button>
         ))}
         <div className="ux-divider mt-2 h-px w-8" />
-        {COLORS.map(c => (
-          <button key={c} title={c} onClick={() => {
-            setAnnColor(c)
-            if (selectedId) setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, color: c } : a))
-          }}
-            className={`w-6 h-6 rounded-full border-2 transition-all ${annColor === c ? 'border-white scale-110' : 'border-transparent'}`}
-            style={{ background: c }} />
+        {TOOLS.slice(3).map(({ id, icon: Icon, label }) => (
+          <button key={id} title={label} onClick={() => setActiveTool(id)}
+            className={`ux-tool-button ${activeTool === id ? 'ux-tool-button-active' : ''}`}>
+            <Icon size={16} />
+          </button>
         ))}
-        <div className="ux-divider mt-2 h-px w-8" />
-        <div className="flex flex-col items-center gap-0.5">
-          <span className="text-[9px] text-gray-500 uppercase tracking-wide">Size</span>
-          <span className="text-[11px] font-mono text-gray-200 w-8 text-center">{displayFontSize}</span>
-          <button onClick={() => {
-            if (selectedAnn?.type === 'text') setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, fontSize: Math.min(200, (a.fontSize || fontSize) + 2) } : a))
-            else setFontSize(s => Math.min(200, s + 2))
-          }} className="ux-icon-button h-5 w-7 text-[10px] font-bold">+</button>
-          <button onClick={() => {
-            if (selectedAnn?.type === 'text') setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, fontSize: Math.max(8, (a.fontSize || fontSize) - 2) } : a))
-            else setFontSize(s => Math.max(8, s - 2))
-          }} className="ux-icon-button h-5 w-7 text-[10px] font-bold">-</button>
-        </div>
-        {selectedId && (
-          <>
-            <div className="ux-divider mt-2 h-px w-8" />
-            <button title="Delete selected (Del)" onClick={deleteSelected}
-              className="ux-tool-button text-[var(--danger)] hover:bg-[var(--danger-soft)]">
-              <Trash2 size={16} />
-            </button>
-          </>
-        )}
       </div>
 
-      <div ref={viewportRef}
-        className={`flex-1 overflow-hidden relative ${isDrawTool ? 'tool-draw' : ''} ${spacePan ? 'tool-pan' : ''}`}
-        onWheel={handleWheel}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-      >
-        <div className="absolute top-3 left-3 right-3 z-20 pointer-events-none">
-          <div className="viewer-commandbar pointer-events-auto flex items-center gap-1.5 px-2 py-2">
-            <button onClick={requestClose}
-              className="ux-button ux-button-ghost">
-              <ChevronLeft size={14} />
-              Back
-            </button>
-            <div className="min-w-0 flex-1 px-2">
-              <p className="truncate text-xs text-gray-200">{caseId} / {filename}</p>
-            </div>
-            <button onClick={() => navigateFile(previousFile)} disabled={!previousFile}
-              className="ux-button ux-button-ghost">
-              <ChevronLeft size={14} />
-              Previous
-            </button>
-            <button onClick={() => navigateFile(nextFile)} disabled={!nextFile}
-              className="ux-button ux-button-ghost">
-              Next
-              <ChevronRight size={14} />
-            </button>
-            <div className="ux-divider mx-1 h-5 w-px" />
-            <button onClick={() => fitToViewport(imgMeta)}
-              className="ux-button ux-button-ghost">
-              <RotateCcw size={13} />
-              Fit
-            </button>
-            <button onClick={setActualSize}
-              className="ux-button ux-button-ghost font-mono">
-              {zoomLabel}
-            </button>
-            <button onClick={() => zoomAroundCenter(1 / 1.18)}
-              className="ux-icon-button"
-              title="Zoom out">
-              <ZoomOut size={13} />
-            </button>
-            <button onClick={() => zoomAroundCenter(1.18)}
-              className="ux-icon-button"
-              title="Zoom in">
-              <ZoomIn size={13} />
-            </button>
-            <div className="ux-divider mx-1 h-5 w-px" />
-            <span className={`ux-badge ${dirty ? 'ux-badge-warning' : 'ux-badge-success'}`}>
-              {saveLabel}
-            </span>
-            <button
-              onClick={() => {
-                setSidebarCollapsed(value => !value)
-                window.requestAnimationFrame(() => fitToViewport(imgMeta))
-              }}
-              className="ux-icon-button"
-              title={sidebarCollapsed ? 'Show sidebar' : 'Collapse sidebar'}
-            >
-              {sidebarCollapsed ? <PanelRightOpen size={14} /> : <PanelRightClose size={14} />}
-            </button>
+      <div className="flex min-w-0 flex-1 flex-col">
+        <div className="viewer-commandbar flex flex-shrink-0 items-center gap-1.5 px-2">
+          <button onClick={requestClose}
+            className="ux-button ux-button-ghost">
+            <ChevronLeft size={14} />
+            Back
+          </button>
+          <div className="min-w-0 flex-1 px-2">
+            <p className="truncate text-xs text-gray-200">{caseId} / {filename}</p>
           </div>
+          <button onClick={() => navigateFile(previousFile)} disabled={!previousFile}
+            className="ux-button ux-button-ghost">
+            <ChevronLeft size={14} />
+            Previous
+          </button>
+          <button onClick={() => navigateFile(nextFile)} disabled={!nextFile}
+            className="ux-button ux-button-ghost">
+            Next
+            <ChevronRight size={14} />
+          </button>
+          <div className="ux-divider mx-1 h-5 w-px" />
+          <button onClick={() => fitToViewport(imgMeta)}
+            className="ux-button ux-button-ghost">
+            <RotateCcw size={13} />
+            Fit
+          </button>
+          <button onClick={setActualSize}
+            className="ux-button ux-button-ghost font-mono">
+            {zoomLabel}
+          </button>
+          <button onClick={() => zoomAroundCenter(1 / 1.18)}
+            className="ux-icon-button"
+            title="Zoom out">
+            <ZoomOut size={13} />
+          </button>
+          <button onClick={() => zoomAroundCenter(1.18)}
+            className="ux-icon-button"
+            title="Zoom in">
+            <ZoomIn size={13} />
+          </button>
+          <div className="ux-divider mx-1 h-5 w-px" />
+          <span className={`ux-badge ${dirty ? 'ux-badge-warning' : 'ux-badge-success'}`}>
+            {saveLabel}
+          </span>
+          <button
+            onClick={() => {
+              setSidebarCollapsed(value => !value)
+              window.requestAnimationFrame(() => fitToViewport(imgMeta))
+            }}
+            className="ux-icon-button"
+            title={sidebarCollapsed ? 'Show sidebar' : 'Collapse sidebar'}
+          >
+            {sidebarCollapsed ? <PanelRightOpen size={14} /> : <PanelRightClose size={14} />}
+          </button>
         </div>
 
-        <div ref={innerRef} className="inner-content" style={{ position: 'absolute', transform, transformOrigin: '0 0' }}>
-          <div style={{ position: 'relative' }} className="viewer-canvas-container">
-            {loadError && (
-              <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 text-sm text-red-300 px-6 text-center">
-                {loadError}
-              </div>
-            )}
-            <MultiChannelCanvas
-              caseId={caseId} filename={filename}
-              settings={chSettings} imgMeta={imgMeta}
-              canvasRef={canvasRef}
-            />
-            <AnalysisMaskCanvas
-              run={analysisRun}
-              visibleOverlays={visibleAnalysisOverlays}
-              processMetric={processMetric}
-              imgMeta={imgMeta}
-            />
-            <AnalysisVectorOverlay
-              imgMeta={imgMeta}
+        <div ref={viewportRef}
+          className={`relative min-h-0 flex-1 overflow-hidden ${isDrawTool ? 'tool-draw' : ''} ${panActive ? 'tool-pan' : ''}`}
+          onWheel={handleWheel}
+          onMouseDown={handleMouseDown}
+          onMouseMove={handleMouseMove}
+          onMouseUp={handleMouseUp}
+        >
+
+          <div ref={innerRef} className="inner-content" style={{ position: 'absolute', transform, transformOrigin: '0 0' }}>
+            <div style={{ position: 'relative' }} className="viewer-canvas-container">
+              {loadError && (
+                <div className="absolute inset-0 z-30 flex items-center justify-center bg-black/70 text-sm text-red-300 px-6 text-center">
+                  {loadError}
+                </div>
+              )}
+              <MultiChannelCanvas
+                caseId={caseId} filename={filename}
+                settings={chSettings}
+                channelMapping={channelMapping}
+                imgMeta={imgMeta}
+                canvasRef={canvasRef}
+                zIndex={viewerZIndex}
+                projection={displayProjection}
+              />
+              {analysisPlaneAligned && (
+                <AnalysisMaskCanvas
+                  run={analysisRun}
+                  visibleOverlays={visibleAnalysisOverlays}
+                  processMetric={processMetric}
+                  imgMeta={imgMeta}
+                />
+              )}
+              {analysisPlaneAligned && (
+                <AnalysisVectorOverlay
+                  imgMeta={imgMeta}
+                  thickness={thicknessMetric}
+                  processMetric={processMetric}
+                  showThickness={visibleAnalysisVectors.thickness !== false}
+                  showProcess={visibleAnalysisVectors.process !== false}
+                />
+              )}
+              {imgMeta && (
+                <AnnotationLayer
+                  svgRef={svgRef} imgMeta={imgMeta}
+                  annotations={annotations} setAnnotations={setAnnsAndDirty}
+                  activeTool={activeTool}
+                  panActive={panActive}
+                  annotatorName={annotator}
+                  annotationColor={annColor}
+                  fontSize={fontSize}
+                  selectedId={selectedId} setSelectedId={setSelectedId}
+                  onEditAnnotation={handleEditAnnotation}
+                  analysisRoi={analysisRoi}
+                  setAnalysisRoi={setAnalysisRoi}
+                />
+              )}
+            </div>
+          </div>
+          {analysisPlaneAligned && (
+            <AnalysisLegend
               thickness={thicknessMetric}
               processMetric={processMetric}
               showThickness={visibleAnalysisVectors.thickness !== false}
               showProcess={visibleAnalysisVectors.process !== false}
             />
-            {imgMeta && (
-              <AnnotationLayer
-                svgRef={svgRef} imgMeta={imgMeta}
-                annotations={annotations} setAnnotations={setAnnsAndDirty}
-                activeTool={activeTool}
-                panActive={spacePan}
-                annotatorName={annotator}
-                annotationColor={annColor}
-                fontSize={fontSize}
-                selectedId={selectedId} setSelectedId={setSelectedId}
-                onEditAnnotation={handleEditAnnotation}
-              />
-            )}
-          </div>
+          )}
+          {!analysisPlaneAligned && analysisRun?.runId && (
+            <div className="pointer-events-none absolute left-1/2 top-4 z-30 -translate-x-1/2 rounded border border-amber-400/30 bg-black/75 px-3 py-2 text-[11px] text-amber-200 shadow-xl">
+              Analysis overlays are hidden. Show Z-slice {Number.isFinite(analysisZIndex) ? analysisZIndex + 1 : 1} to align them with the model input.
+            </div>
+          )}
         </div>
       </div>
 
       {!sidebarCollapsed && (
         <aside className="viewer-inspector w-80 flex-shrink-0 border-l flex flex-col min-h-0">
           <div className="viewer-inspector-tabs px-3 py-2 border-b flex items-center gap-1">
-            {SIDEBAR_TABS.map(({ id, label, icon: Icon }) => (
+            {SIDEBAR_TABS.map(({ id, label }) => (
               <button key={id} onClick={() => setSidebarTab(id)}
                 className={`ux-tab flex-1 min-w-0 ${sidebarTab === id ? 'ux-tab-active' : ''}`}>
-                <Icon size={12} />
                 <span className="truncate">{label}</span>
               </button>
             ))}
@@ -653,10 +716,43 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
           <div className="flex-1 min-h-0 overflow-y-auto">
             {sidebarTab === 'view' && (
               <div className="px-3 py-3 space-y-4">
+                {imgMeta?.numZSlices > 1 && (
+                  <div className="ux-card space-y-2 p-3">
+                    <div className="flex items-center justify-between">
+                      <p className="ux-section-label">Image plane</p>
+                      <span className="font-mono text-[10px] text-gray-300">{viewerZIndex + 1} / {imgMeta.numZSlices}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={imgMeta.numZSlices - 1}
+                      step={1}
+                      value={viewerZIndex}
+                      onChange={e => setViewerZIndex(Math.max(0, Math.min(imgMeta.numZSlices - 1, Number(e.target.value) || 0)))}
+                      className="w-full"
+                    />
+                    <div className="grid grid-cols-2 gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setDisplayProjection('slice')}
+                        className={`rounded border px-2 py-1 text-[9px] ${displayProjection === 'slice' ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]' : 'border-[var(--border)] text-gray-500'}`}
+                      >
+                        Current slice
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDisplayProjection('mip')}
+                        className={`rounded border px-2 py-1 text-[9px] ${displayProjection === 'mip' ? 'border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]' : 'border-[var(--border)] text-gray-500'}`}
+                      >
+                        MIP preview
+                      </button>
+                    </div>
+                  </div>
+                )}
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <p className="ux-section-label">Channel mapping</p>
-                    <button onClick={() => setChannelMapping(defaultChannelMapping(imgMeta?.numChannels || 0))}
+                    <button onClick={resetChannelMapping}
                       className="ux-button ux-button-ghost min-h-0 px-1 py-0 text-[10px]">
                       Reset
                     </button>
@@ -667,7 +763,7 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                         const info = roleInfo(item.role)
                         return (
                           <div key={item.channel} className="flex items-center gap-2 text-[11px] text-gray-300">
-                            <span className="w-2.5 h-2.5 rounded-full" style={{ background: info.color }} />
+                            <span className="w-2.5 h-2.5 rounded-full" style={displaySwatchStyle(chSettings[item.channel], item.role)} />
                             <span className="flex-1">{info.label}</span>
                             <span className="font-mono text-gray-500">Ch {item.channel}</span>
                           </div>
@@ -682,10 +778,10 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <p className="ux-section-label">Display</p>
-                    <button onClick={() => setChSettings(defaultChSettings(imgMeta?.numChannels || 0))}
+                    <button onClick={() => setChSettings(defaultChSettings(imgMeta?.numChannels || 0, channelMapping))}
                       className="ux-button ux-button-ghost min-h-0 px-1 py-0 text-[10px]">
                       <RotateCcw size={10} />
-                      Reset contrast
+                      Reset display
                     </button>
                   </div>
                   <ChannelControls
@@ -706,7 +802,15 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                 imgMeta={imgMeta}
                 channelMapping={channelMapping}
                 onSetRoleChannel={setRoleChannel}
+                zIndex={viewerZIndex}
+                onZIndexChange={setViewerZIndex}
+                displayProjection={displayProjection}
+                onDisplayProjectionChange={setDisplayProjection}
                 analysisRoi={analysisRoi}
+                onClearAnalysisRoi={() => setAnalysisRoi(null)}
+                selectedAnnotationRoi={selectedAnnotationRoi}
+                onUseSelectedAnnotationRoi={() => selectedAnnotationRoi && setAnalysisRoi(selectedAnnotationRoi)}
+                onActivateAnalysisRoiTool={() => setActiveTool('analysis-roi')}
                 run={analysisRun}
                 setRun={setAnalysisRun}
                 visibleOverlays={visibleAnalysisOverlays}
@@ -730,6 +834,52 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                   <input value={annotator} onChange={e => setAnnotator(e.target.value)}
                     placeholder="Your name..."
                     className="ux-input" />
+                </div>
+
+                <div className="ux-card p-3 space-y-3">
+                  <p className="ux-section-label">Drawing style</p>
+                  <div className="flex flex-wrap gap-2">
+                    {COLORS.map(c => (
+                      <button
+                        key={c}
+                        title={c}
+                        onClick={() => {
+                          setAnnColor(c)
+                          if (selectedId) setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, color: c } : a))
+                        }}
+                        className={`annotation-swatch ${annColor === c ? 'annotation-swatch-active' : ''}`}
+                        style={{ '--annotation-color': c }}
+                      />
+                    ))}
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] text-[var(--text-subtle)]">
+                      {selectedAnn?.type === 'text' ? 'Selected text size' : 'Text size'}
+                    </span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => {
+                          if (selectedAnn?.type === 'text') setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, fontSize: Math.max(8, (a.fontSize || fontSize) - 2) } : a))
+                          else setFontSize(s => Math.max(8, s - 2))
+                        }}
+                        className="ux-icon-button h-7 w-7"
+                        title="Decrease text size"
+                      >
+                        <Minus size={13} />
+                      </button>
+                      <span className="w-8 text-center font-mono text-[11px] text-[var(--text)]">{displayFontSize}</span>
+                      <button
+                        onClick={() => {
+                          if (selectedAnn?.type === 'text') setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, fontSize: Math.min(200, (a.fontSize || fontSize) + 2) } : a))
+                          else setFontSize(s => Math.min(200, s + 2))
+                        }}
+                        className="ux-icon-button h-7 w-7"
+                        title="Increase text size"
+                      >
+                        <Plus size={13} />
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
                 <div className="ux-card p-3 space-y-2">
@@ -765,7 +915,7 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
 
                 <div className="ux-card">
                   <button onClick={() => setShowAnnPanel(p => !p)}
-                    className="w-full flex items-center justify-between px-3 py-2 text-[10px] uppercase text-gray-500 tracking-wide hover:text-gray-300 transition-colors">
+                    className="w-full flex items-center justify-between px-3 py-2 text-[11px] text-gray-500 hover:text-gray-300 transition-colors">
                     <span className="flex items-center gap-1.5">
                       <List size={10} />
                       Annotations ({annotations.length})
@@ -803,7 +953,6 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                     <Save size={13} /> {saving ? 'Saving...' : dirty ? 'Save Annotations' : 'Saved'}
                   </button>
                   {saveError && <p className="text-[10px] text-red-300 leading-snug">{saveError}</p>}
-                  <p className="text-[9px] text-gray-600 text-center">Ctrl/Cmd+S save. Ctrl/Cmd+Z undo.</p>
                 </div>
               </div>
             )}
@@ -818,10 +967,10 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                   className="ux-button ux-button-secondary w-full">
                   <Download size={13} /> Export image only
                 </button>
-                {analysisRun?.result?.segmentations && (
+                {exportSegmentationEntries.length > 0 && (
                   <div className="ux-card p-3 space-y-2">
                     <p className="ux-section-label">Segmentation TIFF</p>
-                    {Object.entries(analysisRun.result.segmentations).map(([model, artifact]) => (
+                    {exportSegmentationEntries.map(([model, artifact]) => (
                       <a key={model}
                         href={`${API}/analysis-runs/${encodeURIComponent(analysisRun.runId)}/artifacts/${encodeURIComponent(artifact)}`}
                         className="ux-button ux-button-secondary flex w-full justify-between text-[10px]">
@@ -884,5 +1033,4 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
     </div>
   )
 }
-
 

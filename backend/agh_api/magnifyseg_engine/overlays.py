@@ -8,7 +8,7 @@ from PIL import Image
 OVERLAY_ALPHA = 112
 
 
-def write_segmentation_overlays(segmentation_paths, output_dir: Path, hide_nhs_nuclei=False):
+def write_segmentation_overlays(segmentation_paths, output_dir: Path):
     output_dir = Path(output_dir)
     artifacts = []
     for model_name, seg_path in segmentation_paths.items():
@@ -19,12 +19,8 @@ def write_segmentation_overlays(segmentation_paths, output_dir: Path, hide_nhs_n
 
         if model_name == "ACTN4":
             artifacts.append(_write_label_overlay(labels > 0, output_dir / "overlay_ACTN4.png", (0, 255, 0)))
-        elif model_name == "DAPI":
-            artifacts.append(_write_label_overlay(labels > 0, output_dir / "overlay_DAPI.png", (0, 80, 255)))
         elif model_name in {"NHS_SINGLE_CHANNEL", "NHS_COMBINED_ACTN4"}:
             artifacts.append(_write_label_overlay(labels == 1, output_dir / "overlay_NHS_GBM.png", (255, 0, 255)))
-            if not hide_nhs_nuclei:
-                artifacts.append(_write_label_overlay(labels == 2, output_dir / "overlay_NHS_NUCLEI.png", (255, 0, 0)))
     return [artifact for artifact in artifacts if artifact is not None]
 
 

@@ -7,8 +7,10 @@ import tifffile
 
 from agh_api import create_app
 from agh_api.analysis_artifacts import artifact_path
+from agh_api.analysis_profiles import resolve_process_watershed
+from agh_api.magnifyseg_engine.metrics import compute_process_nnd
 from agh_api.analysis_store import AnalysisStore
-from agh_api.analysis_validation import validate_analysis_request
+from agh_api.analysis_validation import normalize_calibration, validate_analysis_request
 from agh_api.config import Config
 from agh_api.errors import BadRequest, NotFound
 
@@ -63,6 +65,92 @@ class AnalysisTests(unittest.TestCase):
 
         self.assertEqual(request["preprocessingMode"], "percentile-stretch")
 
+    def test_calibration_uses_raw_pixel_size_and_expansion_factor(self):
+        calibration = normalize_calibration({
+            "pixelSize": 0.014,
+            "pixelUnit": "um",
+            "expanded": True,
+            "expansionFactor": 7.0,
+        })
+        self.assertAlmostEqual(calibration["effectivePixelSize"], 0.002)
+        self.assertEqual(calibration["effectivePixelSizeSource"], "raw-pixel-size/expansion-factor")
+
+    def test_calibration_effective_override_works_without_raw_pixel_size(self):
+        calibration = normalize_calibration({
+            "pixelSize": None,
+            "pixelUnit": "um",
+            "expanded": True,
+            "expansionFactor": 7.0,
+            "effectivePixelSizeOverride": 0.002,
+        })
+        self.assertIsNone(calibration["pixelSize"])
+        self.assertAlmostEqual(calibration["effectivePixelSize"], 0.002)
+        self.assertEqual(calibration["effectivePixelSizeSource"], "override")
+
+    def test_expansion_factor_alone_does_not_invent_pixel_size(self):
+        calibration = normalize_calibration({
+            "pixelSize": None,
+            "expanded": True,
+            "expansionFactor": 7.0,
+        })
+        self.assertIsNone(calibration["effectivePixelSize"])
+
+    def test_watershed_presets_resolve_physical_units_to_pixels(self):
+        resolved = resolve_process_watershed({"preset": "balanced"}, effective_pixel_size=0.002)
+        self.assertEqual(resolved["label"], "Balanced")
+        self.assertAlmostEqual(resolved["minDistanceUm"], 0.08)
+        self.assertAlmostEqual(resolved["minDistance"], 40.0)
+        self.assertAlmostEqual(resolved["maxPairDistanceUm"], 1.5)
+        self.assertAlmostEqual(resolved["maxPairDistance"], 750.0)
+
+    def test_watershed_legacy_pixel_values_remain_supported(self):
+        resolved = resolve_process_watershed(
+            {"minDistance": 25, "maxPairDistance": 500, "thresholdRelative": 0.3, "sigma": 0},
+            effective_pixel_size=0.002,
+        )
+        self.assertAlmostEqual(resolved["minDistanceUm"], 0.05)
+        self.assertAlmostEqual(resolved["maxPairDistanceUm"], 1.0)
+        self.assertAlmostEqual(resolved["minDistance"], 25.0)
+        self.assertAlmostEqual(resolved["maxPairDistance"], 500.0)
+
+
+    def test_watershed_custom_max_pair_um_is_not_overwritten_by_preset(self):
+        resolved = resolve_process_watershed(
+            {"preset": "balanced", "maxPairDistanceUm": 0.25},
+            effective_pixel_size=0.002,
+        )
+        self.assertAlmostEqual(resolved["maxPairDistanceUm"], 0.25)
+        self.assertAlmostEqual(resolved["maxPairDistance"], 125.0)
+
+    def test_process_nnd_max_pair_distance_filters_links_and_mean(self):
+        mask = np.zeros((50, 80), dtype=bool)
+        mask[15:25, 10:20] = True
+        mask[15:25, 40:50] = True
+        with tempfile.TemporaryDirectory() as wide_dir, tempfile.TemporaryDirectory() as narrow_dir:
+            wide = compute_process_nnd(
+                mask, 1.0, Path(wide_dir),
+                max_pair_px=40, ws_min_dist=3, ws_thresh_rel=0.1, ws_sigma=0,
+            )
+            narrow = compute_process_nnd(
+                mask, 1.0, Path(narrow_dir),
+                max_pair_px=20, ws_min_dist=3, ws_thresh_rel=0.1, ws_sigma=0,
+            )
+        self.assertEqual(wide["processCount"], 2)
+        self.assertEqual(wide["pairCount"], 2)
+        self.assertAlmostEqual(wide["meanDistance"], 30.0)
+        self.assertEqual(narrow["processCount"], 2)
+        self.assertEqual(narrow["pairCount"], 0)
+        self.assertIsNone(narrow["meanDistance"])
+
+    def test_watershed_presets_convert_nanometer_calibration(self):
+        resolved = resolve_process_watershed(
+            {"preset": "balanced"},
+            effective_pixel_size=2.0,
+            pixel_unit="nm",
+        )
+        self.assertAlmostEqual(resolved["effectivePixelSizeUm"], 0.002)
+        self.assertAlmostEqual(resolved["minDistance"], 40.0)
+
     def test_create_analysis_run(self):
         response = self.client.post("/agh/api/cases/case1/files/image.tif/analysis-runs", json={
             "zIndex": 1,
@@ -84,8 +172,9 @@ class AnalysisTests(unittest.TestCase):
         })
         second = self.client.post("/agh/api/cases/case1/files/image.tif/analysis-runs", json={
             "zIndex": 0,
-            "channels": {"dapi": 1},
-            "models": {"actn4": False, "dapi": True, "nhs": False},
+            "channels": {"nhs": 1},
+            "models": {"actn4": False, "dapi": False, "nhs": True},
+            "nhsMode": "single-channel",
         })
         self.assertEqual(first.status_code, 202)
         self.assertEqual(second.status_code, 202)
@@ -98,10 +187,19 @@ class AnalysisTests(unittest.TestCase):
         self.assertIn(first.get_json()["runId"], run_ids)
         self.assertIn(second.get_json()["runId"], run_ids)
 
+    def test_create_analysis_run_rejects_dapi_segmentation(self):
+        response = self.client.post("/agh/api/cases/case1/files/image.tif/analysis-runs", json={
+            "zIndex": 0,
+            "channels": {"dapi": 1},
+            "models": {"actn4": False, "dapi": True, "nhs": False},
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("DAPI segmentation", response.get_json()["error"])
+
     def test_store_claims_one_job(self):
         store = AnalysisStore(self.analysis_root / "unit.sqlite3")
         first = store.create_run("case1", "image.tif", "test", {"modelNames": ["ACTN4"]})
-        second = store.create_run("case1", "image.tif", "test", {"modelNames": ["DAPI"]})
+        second = store.create_run("case1", "image.tif", "test", {"modelNames": ["NHS_SINGLE_CHANNEL"]})
         claimed = store.claim_next_run(worker_id="worker-a")
         self.assertEqual(claimed["runId"], first["runId"])
         self.assertEqual(store.get_run(first["runId"])["status"], "RUNNING")
@@ -145,6 +243,99 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(metric["request"]["segmentationRunId"], segmentation["runId"])
         self.assertEqual(metric["status"], "QUEUED")
 
+    def test_metric_calibration_can_be_added_after_segmentation_without_rerun(self):
+        store = AnalysisStore(self.config.analysis_db)
+        segmentation = store.create_run("case1", "image.tif", "magnifyseg-segmentation", {
+            "calibration": {
+                "pixelSize": None,
+                "pixelUnit": "um",
+                "expanded": True,
+                "expansionFactor": 7.0,
+                "effectivePixelSize": None,
+            },
+        })
+        store.mark_succeeded(segmentation["runId"], {
+            "segmentations": {"ACTN4": "seg_ACTN4.tif"},
+        })
+
+        response = self.client.post(
+            f"/agh/api/analysis-runs/{segmentation['runId']}/metrics/process-nnd",
+            json={
+                "calibration": {
+                    "pixelSize": None,
+                    "pixelUnit": "um",
+                    "expanded": True,
+                    "expansionFactor": 7.0,
+                    "effectivePixelSizeOverride": 0.002,
+                },
+                "watershed": {"preset": "balanced"},
+            },
+        )
+        self.assertEqual(response.status_code, 202)
+        metric = store.get_run(response.get_json()["runId"])
+        self.assertAlmostEqual(metric["request"]["calibration"]["effectivePixelSize"], 0.002)
+        self.assertEqual(metric["request"]["calibration"]["effectivePixelSizeSource"], "override")
+        self.assertAlmostEqual(metric["request"]["watershed"]["minDistance"], 40.0)
+
+    def test_metric_error_explains_that_expansion_factor_alone_is_insufficient(self):
+        store = AnalysisStore(self.config.analysis_db)
+        segmentation = store.create_run("case1", "image.tif", "magnifyseg-segmentation", {
+            "calibration": {
+                "pixelSize": None,
+                "pixelUnit": "um",
+                "expanded": True,
+                "expansionFactor": 7.0,
+                "effectivePixelSize": None,
+            },
+        })
+        store.mark_succeeded(segmentation["runId"], {
+            "segmentations": {"ACTN4": "seg_ACTN4.tif"},
+        })
+
+        response = self.client.post(
+            f"/agh/api/analysis-runs/{segmentation['runId']}/metrics/process-nnd",
+            json={"calibration": {"expanded": True, "expansionFactor": 7.0}},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Expansion factor alone is not enough", response.get_json()["error"])
+
+    def test_list_metric_runs_for_segmentation(self):
+        store = AnalysisStore(self.config.analysis_db)
+        segmentation = store.create_run("case1", "image.tif", "magnifyseg-segmentation", {
+            "calibration": {"effectivePixelSize": 0.002, "pixelUnit": "um"},
+        })
+        other_segmentation = store.create_run("case1", "image.tif", "magnifyseg-segmentation", {
+            "calibration": {"effectivePixelSize": 0.002, "pixelUnit": "um"},
+        })
+        metric = store.create_run("case1", "image.tif", "gbm-thickness", {
+            "segmentationRunId": segmentation["runId"],
+            "roi": None,
+        })
+        other_metric = store.create_run("case1", "image.tif", "process-nnd", {
+            "segmentationRunId": other_segmentation["runId"],
+            "roi": None,
+        })
+        store.mark_succeeded(metric["runId"], {
+            "kind": "gbm-thickness",
+            "meanThickness": 0.231,
+            "unit": "um",
+            "points": [],
+        })
+        store.mark_succeeded(other_metric["runId"], {
+            "kind": "process-nnd",
+            "meanDistance": 0.842,
+            "unit": "um",
+            "pairs": [],
+        })
+
+        response = self.client.get(f"/agh/api/analysis-runs/{segmentation['runId']}/metrics")
+        self.assertEqual(response.status_code, 200)
+        runs = response.get_json()["runs"]
+        self.assertEqual([run["runId"] for run in runs], [metric["runId"]])
+        self.assertEqual(runs[0]["operation"], "gbm-thickness")
+        self.assertEqual(runs[0]["result"]["meanThickness"], 0.231)
+        self.assertEqual(runs[0]["request"]["segmentationRunId"], segmentation["runId"])
+
     def test_delete_segmentation_run_removes_child_metric_runs(self):
         store = AnalysisStore(self.config.analysis_db)
         segmentation = store.create_run("case1", "image.tif", "magnifyseg-segmentation", {
@@ -181,3 +372,4 @@ class AnalysisTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -5,6 +5,7 @@ from flask import jsonify, request, send_file
 from .analysis_artifacts import artifact_mimetype, artifact_path, run_directory
 from .analysis_service import create_metric_run
 from .analysis_validation import validate_analysis_request
+from .errors import BadRequest
 from .path_guard import image_path
 
 
@@ -39,6 +40,14 @@ def register_analysis_routes(app, config, cache, store):
     def get_analysis_artifact(run_id, artifact):
         path = artifact_path(config.analysis_root, run_id, artifact)
         return send_file(path, mimetype=artifact_mimetype(path), conditional=True, max_age=0)
+
+    @app.route("/agh/api/analysis-runs/<run_id>/metrics", methods=["GET"])
+    def list_analysis_metrics(run_id):
+        run = store.get_run(run_id)
+        if run["operation"] != "magnifyseg-segmentation":
+            raise BadRequest("Metric children can only be listed for a segmentation run")
+        limit = request.args.get("limit", 50)
+        return jsonify({"runs": store.list_metric_runs(run_id, limit=limit)})
 
     @app.route("/agh/api/analysis-runs/<run_id>/metrics/gbm-thickness", methods=["POST"])
     def compute_gbm_thickness(run_id):

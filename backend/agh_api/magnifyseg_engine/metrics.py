@@ -62,7 +62,13 @@ def compute_process_nnd(
     outer_path = output_dir / "proc_outer_contours.tif"
 
     if not np.any(m):
-        result = {"meanDistance": None, "pairs": [], "csv": out_csv.name}
+        result = {
+            "meanDistance": None,
+            "processCount": 0,
+            "pairCount": 0,
+            "pairs": [],
+            "csv": out_csv.name,
+        }
         _write_csv(out_csv, [])
         _write_json(out_json, result)
         return result
@@ -119,6 +125,8 @@ def compute_process_nnd(
     _write_csv(out_csv, ((p["x0"], p["y0"], p["x1"], p["y1"], f"{p['distance']:.6f}") for p in pairs))
     result = {
         "meanDistance": mean_val,
+        "processCount": len(centroids),
+        "pairCount": len(pairs),
         "pairs": pairs,
         "csv": out_csv.name,
         "labels": labels_path.name,
@@ -177,3 +185,4 @@ def _write_json(path, payload):
     with Path(path).open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+

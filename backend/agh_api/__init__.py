@@ -63,7 +63,15 @@ def create_app(config: Optional[Config] = None):
     @app.route("/agh/api/cases/<path:case>/files/<path:filename>/channel/<int:ch>")
     def get_channel(case, filename, ch):
         path = image_path(cfg.data_root, case, filename)
-        png_path = cache.get_channel_path(path, ch)
+        projection = (request.args.get("projection") or "mip").lower()
+        z_raw = request.args.get("z")
+        z_index = None
+        if z_raw not in (None, ""):
+            try:
+                z_index = int(z_raw)
+            except ValueError:
+                raise APIError("Invalid Z-slice index", status_code=400)
+        png_path = cache.get_channel_path(path, ch, z_index=z_index, projection=projection)
         return send_file(png_path, mimetype="image/png", conditional=True, max_age=86400)
 
     @app.route("/agh/api/cases/<path:case>/files/<path:filename>/thumbnail")
@@ -93,3 +101,4 @@ def create_app(config: Optional[Config] = None):
     register_analysis_routes(app, cfg, cache, analysis_store)
 
     return app
+

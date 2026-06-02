@@ -18,6 +18,8 @@ def validate_analysis_request(payload, metadata):
     models = payload.get("models") or {}
     if not isinstance(channels, dict) or not isinstance(models, dict):
         raise BadRequest("Invalid analysis request")
+    if bool(models.get("dapi", False)):
+        raise BadRequest("DAPI segmentation is no longer supported")
 
     normalized_channels = {}
     num_channels = int(metadata.get("numChannels", 0))
@@ -45,8 +47,6 @@ def validate_analysis_request(payload, metadata):
 
     if normalized_models["actn4"] and normalized_channels["actn4"] is None:
         raise BadRequest("ACTN4 model requires an ACTN4 channel")
-    if normalized_models["dapi"] and normalized_channels["dapi"] is None:
-        raise BadRequest("DAPI model requires a DAPI channel")
     if normalized_models["nhs"] and normalized_channels["nhs"] is None:
         raise BadRequest("NHS model requires an NHS Ester channel")
     if normalized_models["nhs"] and nhs_mode == "combined-actn4" and normalized_channels["actn4"] is None:
@@ -58,7 +58,7 @@ def validate_analysis_request(payload, metadata):
     if preprocessing_mode == "magnifyseg-enhanced":
         preprocessing_mode = "percentile-stretch"
 
-    calibration = _normalize_calibration(payload.get("calibration") or {}, metadata)
+    calibration = normalize_calibration(payload.get("calibration") or {}, metadata)
     normalized = {
         "zIndex": z_index,
         "channels": normalized_channels,
@@ -71,33 +71,66 @@ def validate_analysis_request(payload, metadata):
     return normalized
 
 
-def _normalize_calibration(payload, metadata):
+def normalize_calibration(payload, metadata=None):
+    """Normalize raw and effective XY pixel calibration.
+
+    Expansion factor is a scale ratio, not a pixel size. Physical metrics can
+    use either a raw XY pixel size (optionally divided by EF) or a direct
+    effective-pixel-size override when TIFF metadata is unavailable.
+    """
+    metadata = metadata or {}
     if not isinstance(payload, dict):
         raise BadRequest("Invalid calibration")
-    pixel_size = payload.get("pixelSize", metadata.get("pixelSize"))
-    if pixel_size in ("", None):
-        pixel_size = None
-    else:
-        pixel_size = float(pixel_size)
-        if pixel_size <= 0:
-            raise BadRequest("Pixel size must be positive")
 
+    pixel_size = _optional_positive_float(payload.get("pixelSize", metadata.get("pixelSize")), "pixel size")
     pixel_unit = str(payload.get("pixelUnit") or metadata.get("pixelUnit") or "um").strip() or "um"
     expanded = bool(payload.get("expanded", True))
-    expansion_factor = float(payload.get("expansionFactor", 7.0))
-    if expansion_factor <= 0:
-        raise BadRequest("Expansion factor must be positive")
+    expansion_factor = _positive_float(payload.get("expansionFactor", 7.0), "expansion factor")
 
-    effective_pixel_size = None
-    if pixel_size is not None:
+    effective_override = _optional_positive_float(
+        payload.get("effectivePixelSizeOverride"),
+        "effective pixel size override",
+    )
+    # Backwards compatibility for stored metric calibration records that only
+    # contain an effective size and no raw pixel size.
+    if effective_override is None and pixel_size is None and payload.get("effectivePixelSize") not in (None, ""):
+        effective_override = _optional_positive_float(payload.get("effectivePixelSize"), "effective pixel size")
+
+    if effective_override is not None:
+        effective_pixel_size = effective_override
+        source = "override"
+    elif pixel_size is not None:
         effective_pixel_size = pixel_size / expansion_factor if expanded else pixel_size
+        source = "raw-pixel-size/expansion-factor" if expanded else "raw-pixel-size"
+    else:
+        effective_pixel_size = None
+        source = None
+
     return {
         "pixelSize": pixel_size,
+        "effectivePixelSizeOverride": effective_override,
         "effectivePixelSize": effective_pixel_size,
+        "effectivePixelSizeSource": source,
         "pixelUnit": pixel_unit,
         "expanded": expanded,
         "expansionFactor": expansion_factor,
     }
+
+
+def _optional_positive_float(value, label):
+    if value in (None, ""):
+        return None
+    return _positive_float(value, label)
+
+
+def _positive_float(value, label):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BadRequest(f"Invalid {label}") from exc
+    if parsed <= 0:
+        raise BadRequest(f"{label.capitalize()} must be positive")
+    return parsed
 
 
 def _int_value(value, label):
@@ -107,3 +140,5 @@ def _int_value(value, label):
         return int(value)
     except (TypeError, ValueError) as exc:
         raise BadRequest(f"Invalid {label}") from exc
+
+

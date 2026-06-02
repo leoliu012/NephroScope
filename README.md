@@ -153,6 +153,7 @@ POST /agh/api/cases/:case/files/:filename/annotations
 POST /agh/api/cases/:case/files/:filename/analysis-runs
 GET  /agh/api/analysis-runs/:runId
 GET  /agh/api/analysis-runs/:runId/artifacts/:artifact
+GET  /agh/api/analysis-runs/:runId/metrics
 POST /agh/api/analysis-runs/:runId/metrics/gbm-thickness
 POST /agh/api/analysis-runs/:runId/metrics/process-nnd
 ```
@@ -164,7 +165,9 @@ Annotation writes are locked, atomic, and revisioned. A stale save returns `409 
 MagnifySeg analysis runs are queued in SQLite and processed by `backend/worker.py`.
 The queue currently uses `magnifyseg-segmentation`, `gbm-thickness`, and `process-nnd`
 operations. Metric POST endpoints return a queued run id; poll
-`GET /agh/api/analysis-runs/:runId` for completion.
+`GET /agh/api/analysis-runs/:runId` for completion. Use
+`GET /agh/api/analysis-runs/:runId/metrics` to list the metric child runs for a
+completed segmentation run and restore prior metric results.
 Segmentation defaults to `preprocessingMode: percentile-stretch`: TIFF planes are
 stretched with 1.0-99.7 percentiles, written as uint8 model inputs, and
 `run_patches()` scales them by `1/255`. This matches the MagnifySeg
