@@ -25,8 +25,8 @@ import { metricFingerprint, stableJson } from './analysis/metricFingerprint.js'
 const TASKS = [
   {
     id: 'full',
-    title: 'Full Kidney Analysis',
-    description: 'Run ACTN4 and NHS segmentation once, then calculate GBM thickness and process NND from the same result.',
+    title: 'Complete Kidney Analysis',
+    description: 'Measure basement membrane thickness and foot process spacing in one analysis.',
     modelLabel: 'ACTN4 + NHS Ester',
     models: { actn4: true, dapi: false, nhs: true },
     roles: ['nhs', 'actn4'],
@@ -34,16 +34,16 @@ const TASKS = [
   },
   {
     id: 'gbm',
-    title: 'GBM Thickness',
-    description: 'Segment NHS Ester and calculate glomerular basement membrane thickness.',
+    title: 'Membrane Thickness Only',
+    description: 'Measure glomerular basement membrane (GBM) thickness using NHS Ester channel.',
     modelLabel: 'NHS Ester',
     models: { actn4: false, dapi: false, nhs: true },
     roles: ['nhs'],
   },
   {
     id: 'process',
-    title: 'Process NND',
-    description: 'Segment ACTN4, separate touching processes, and calculate nearest-neighbor distance.',
+    title: 'Foot Process Spacing Only',
+    description: 'Measure nearest-neighbor distance between podocyte foot processes using ACTN4 channel.',
     modelLabel: 'ACTN4',
     models: { actn4: true, dapi: false, nhs: false },
     roles: ['actn4'],
@@ -220,7 +220,7 @@ function formatDate(value) {
 }
 
 function MetricSourceLine({ kind, source, busy, metric }) {
-  const title = kind === 'thickness' ? 'GBM thickness' : 'Process NND'
+  const title = kind === 'thickness' ? 'Membrane Thickness' : 'Foot Process Spacing'
   const value = kind === 'thickness' ? metric?.meanThickness : metric?.meanDistance
   const hasValue = Number.isFinite(Number(value))
   return (
@@ -232,15 +232,15 @@ function MetricSourceLine({ kind, source, busy, metric }) {
       </div>
       <p className={`mt-1 text-[10px] leading-snug ${source ? 'text-gray-500' : 'text-amber-300'}`}>
         {busy && source
-          ? `Calculating from ${sourceModelLabel(source, kind)} · ${formatDate(source.createdAt)}`
+          ? `Analyzing ${sourceModelLabel(source, kind)}...`
           : source
-            ? `Using newest result · ${sourceModelLabel(source, kind)} · ${formatDate(source.createdAt)}`
+            ? `Latest result from ${formatDate(source.createdAt)}`
             : kind === 'thickness'
-              ? 'No NHS Ester segmentation available'
-              : 'No ACTN4 segmentation available'}
+              ? 'Need NHS Ester channel analysis first'
+              : 'Need ACTN4 channel analysis first'}
       </p>
       {source && Number.isFinite(Number(source.request?.zIndex)) && (
-        <p className="mt-0.5 text-[9px] text-gray-600">Z-slice {Number(source.request.zIndex) + 1}</p>
+        <p className="mt-0.5 text-[9px] text-gray-600">Z-plane {Number(source.request.zIndex) + 1}</p>
       )}
     </div>
   )
@@ -381,15 +381,15 @@ function MeasurementCalibrationCard({
 
       <p className={`text-[10px] leading-snug ${calibrationReady ? 'text-gray-500' : 'text-amber-300'}`}>
         {calibrationReady
-          ? <>Effective size: <span className="font-mono text-gray-200">{fmt(effectivePixelSize)} {pixelUnit} / px</span> · {effectivePixelSizeSource}</>
-          : 'Required before measurements can be calculated.'}
+          ? <>Effective: <span className="font-mono text-gray-200">{fmt(effectivePixelSize)} {pixelUnit}/px</span> · {effectivePixelSizeSource}</>
+          : 'Set pixel size for accurate measurements in micrometers.'}
       </p>
 
       {open && (
         <div className="space-y-3 pt-1">
           <div className="grid grid-cols-[1fr_3.5rem] gap-2">
             <label>
-              <span className="text-[10px] text-gray-500">Raw XY pixel size</span>
+              <span className="text-[10px] text-gray-500">Physical pixel size (from microscope)</span>
               <input
                 ref={inputRef}
                 type="number"
@@ -397,10 +397,11 @@ function MeasurementCalibrationCard({
                 step="any"
                 value={pixelSize}
                 onChange={e => setPixelSize(e.target.value)}
+                placeholder="e.g., 0.065"
                 className={`ux-input mt-1 ${attention && !calibrationReady ? 'border-amber-400/80' : ''}`}
               />
               {attention && !calibrationReady && (
-                <span className="mt-1 block text-[9px] leading-snug text-amber-300">Required before calculating {pendingLabel}.</span>
+                <span className="mt-1 block text-[9px] leading-snug text-amber-300">Required for accurate measurements.</span>
               )}
             </label>
             <label>
@@ -416,7 +417,7 @@ function MeasurementCalibrationCard({
           <div className="grid grid-cols-[1fr_4.5rem] items-end gap-2">
             <label className="flex items-center gap-1.5 pb-1 text-[11px] text-gray-300">
               <input type="checkbox" checked={expanded} onChange={e => setExpanded(e.target.checked)} />
-              <span>Apply expansion factor</span>
+              <span>Tissue expansion applied</span>
             </label>
             <label>
               <span className="text-[10px] text-gray-500">Factor</span>
@@ -425,24 +426,24 @@ function MeasurementCalibrationCard({
           </div>
 
           <label className="block">
-            <span className="text-[10px] text-gray-500">Effective size after correction</span>
+            <span className="text-[10px] text-gray-500">Or enter effective size directly</span>
             <input
               type="number"
               min="0"
               step="any"
               value={effectivePixelSizeOverride}
               onChange={e => setEffectivePixelSizeOverride(e.target.value)}
-              placeholder="Optional direct effective size"
+              placeholder="Leave blank to auto-calculate"
               className="ux-input mt-1"
             />
             <span className="mt-1 block text-[9px] leading-snug text-gray-600">
-              Leave blank to calculate from raw XY size and expansion factor.
+              Override auto-calculation if you know the exact effective pixel size.
             </span>
           </label>
 
           {pendingMetricIntent && (
             <button type="button" onClick={onContinue} className="ux-button ux-button-primary w-full text-[11px]">
-              Continue with {pendingLabel}
+              Continue Analysis
             </button>
           )}
         </div>
@@ -1247,7 +1248,7 @@ export default function AnalysisPanel({
   return (
     <div className="space-y-3 px-3 py-3">
       <div className="flex items-center gap-2">
-        <p className="ux-section-label">Measurements</p>
+        <p className="ux-section-label">Kidney Analysis</p>
         {busy || metricBusy ? <Loader2 size={12} className="ml-auto animate-spin text-[var(--accent)]" /> : null}
         {!busy && !metricBusy && hasAnyMeasurement && <CheckCircle2 size={12} className="ml-auto text-[var(--success)]" />}
         {!busy && !metricBusy && failed && <XCircle size={12} className="ml-auto text-red-400" />}
@@ -1256,19 +1257,19 @@ export default function AnalysisPanel({
       {!hasAnyMeasurement && (
         <div className="ux-card space-y-3 p-3">
           <div>
-            <p className="text-sm font-semibold text-[var(--text)]">No measurements available for this image.</p>
+            <p className="text-sm font-semibold text-[var(--text)]">Start Analysis</p>
             <p className="mt-1 text-[12px] leading-snug text-[var(--text-muted)]">
-              Calculate GBM thickness and process nearest-neighbor distance from the available channels.
+              Analyze this image to measure basement membrane thickness and foot process spacing.
             </p>
           </div>
           {missingRoles.length > 0 && (
             <p className="rounded border border-amber-400/30 bg-amber-400/5 p-2 text-[12px] leading-snug text-amber-200">
-              Assign {missingRoles.map(role => roleInfo(role).label).join(', ')} channels in Display before calculating measurements.
+              First assign {missingRoles.map(role => roleInfo(role).label).join(' and ')} in the Display tab.
             </p>
           )}
           <button onClick={startRun} disabled={!canRun} className={`ux-button w-full ${canRun ? 'ux-button-primary' : 'ux-button-secondary cursor-not-allowed opacity-50'}`}>
             {busy ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
-            {busy ? 'Calculating measurements...' : 'Calculate kidney measurements'}
+            {busy ? 'Analyzing image...' : 'Analyze Image'}
           </button>
         </div>
       )}
@@ -1276,23 +1277,23 @@ export default function AnalysisPanel({
       {hasAnyMeasurement && (
         <div className="ux-card space-y-3 p-3">
           <div className="flex items-center justify-between gap-2">
-            <p className="text-sm font-semibold text-[var(--text)]">Kidney measurements</p>
+            <p className="text-sm font-semibold text-[var(--text)]">Results</p>
             {latestMeasurementDate && <span className="text-[11px] text-[var(--text-subtle)]">{formatDate(latestMeasurementDate)}</span>}
           </div>
 
           <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-[12px] font-semibold text-[var(--text)]">GBM thickness</p>
-                <p className="mt-1 font-mono text-2xl font-semibold text-[var(--text)]">{fmt(thickness?.meanThickness)} {thickness?.unit || 'um'}</p>
-                <p className="mt-1 text-[12px] text-[var(--text-subtle)]">Measured across {fmtCount(thickness?.points?.length)} points</p>
+              <div className="min-w-0 flex-1">
+                <p className="text-[12px] font-medium text-[var(--text-subtle)]">Basement Membrane Thickness</p>
+                <p className="mt-1 font-mono text-2xl font-semibold text-[var(--text)]">{fmt(thickness?.meanThickness)} <span className="text-lg">{thickness?.unit || 'μm'}</span></p>
+                <p className="mt-1 text-[11px] text-[var(--text-subtle)]">{fmtCount(thickness?.points?.length)} measurement points</p>
               </div>
-              <div className="flex flex-col gap-2">
-                <button type="button" onClick={() => setVisibleVectors?.(prev => ({ ...prev, thickness: prev.thickness === false }))} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
-                  {visibleVectors?.thickness === false ? 'Show overlay' : 'Hide overlay'}
+              <div className="flex flex-shrink-0 flex-col gap-1">
+                <button type="button" onClick={() => setVisibleVectors?.(prev => ({ ...prev, thickness: prev.thickness === false }))} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[10px]">
+                  {visibleVectors?.thickness === false ? 'Show' : 'Hide'}
                 </button>
-                <button type="button" onClick={() => requestMetric('thickness')} disabled={metricBusy || !thicknessAvailable} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
-                  Recalculate
+                <button type="button" onClick={() => requestMetric('thickness')} disabled={metricBusy || !thicknessAvailable} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[10px]">
+                  Update
                 </button>
               </div>
             </div>
@@ -1300,65 +1301,65 @@ export default function AnalysisPanel({
 
           <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
             <div className="flex items-start justify-between gap-3">
-              <div>
-                <p className="text-[12px] font-semibold text-[var(--text)]">Process nearest-neighbor distance</p>
-                <p className="mt-1 font-mono text-2xl font-semibold text-[var(--text)]">{fmt(processMetric?.meanDistance)} {processMetric?.unit || 'um'}</p>
-                <p className="mt-1 text-[12px] text-[var(--text-subtle)]">
-                  Calculated from {fmtCount(processMetric?.areaFilter?.includedProcessCount ?? processMetric?.nndIncludedProcessCount ?? processMetric?.processCount)} included processes
+              <div className="min-w-0 flex-1">
+                <p className="text-[12px] font-medium text-[var(--text-subtle)]">Foot Process Spacing</p>
+                <p className="mt-1 font-mono text-2xl font-semibold text-[var(--text)]">{fmt(processMetric?.meanDistance)} <span className="text-lg">{processMetric?.unit || 'μm'}</span></p>
+                <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
+                  {fmtCount(processMetric?.areaFilter?.includedProcessCount ?? processMetric?.nndIncludedProcessCount ?? processMetric?.processCount)} processes analyzed
                 </p>
               </div>
-              <div className="flex flex-col gap-2">
-                <button type="button" onClick={() => setVisibleVectors?.(prev => ({ ...prev, process: prev.process === false }))} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
-                  {visibleVectors?.process === false ? 'Show overlay' : 'Hide overlay'}
+              <div className="flex flex-shrink-0 flex-col gap-1">
+                <button type="button" onClick={() => setVisibleVectors?.(prev => ({ ...prev, process: prev.process === false }))} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[10px]">
+                  {visibleVectors?.process === false ? 'Show' : 'Hide'}
                 </button>
-                <button type="button" onClick={() => requestMetric('process')} disabled={metricBusy || !processAvailable} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
-                  Recalculate
+                <button type="button" onClick={() => requestMetric('process')} disabled={metricBusy || !processAvailable} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[10px]">
+                  Update
                 </button>
               </div>
             </div>
           </div>
 
-          <p className="text-[12px] text-[var(--text-subtle)]">
-            Scope: {scopeLabel}
-            {calibrationReady && <> · Calibration: <span className="font-mono text-[var(--text-muted)]">{fmt(effectivePixelSize)} {pixelUnit} / px</span></>}
+          <p className="text-[11px] text-[var(--text-subtle)]">
+            {scopeLabel}
+            {calibrationReady && <> · <span className="font-mono">{fmt(effectivePixelSize)} {pixelUnit}/px</span></>}
           </p>
         </div>
       )}
 
       <div className="ux-card space-y-2 p-3">
         <div className="flex items-center justify-between gap-2">
-          <p className="text-[12px] font-semibold text-[var(--text)]">Scope</p>
-          {analysisRoi && <span className="font-mono text-[11px] text-[var(--accent)]">{Math.round(analysisRoi.width)} x {Math.round(analysisRoi.height)} px</span>}
+          <p className="text-[12px] font-semibold text-[var(--text)]">Analysis Region</p>
+          {analysisRoi && <span className="font-mono text-[11px] text-[var(--accent)]">{Math.round(analysisRoi.width)} × {Math.round(analysisRoi.height)} px</span>}
         </div>
         <div className="grid grid-cols-2 gap-1 rounded-md border border-[var(--border)] bg-[var(--canvas-bg)] p-1">
-          <button onClick={() => setMetricScope('whole')} className={`rounded px-2 py-1 text-[12px] ${metricScope === 'whole' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}>Whole image</button>
+          <button onClick={() => setMetricScope('whole')} className={`rounded px-2 py-1 text-[11px] ${metricScope === 'whole' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}>Full image</button>
           <button
             onClick={() => {
               setMetricScope('selected')
               if (!analysisRoi) onActivateAnalysisRoiTool?.()
             }}
-            className={`rounded px-2 py-1 text-[12px] ${metricScope === 'selected' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}
+            className={`rounded px-2 py-1 text-[11px] ${metricScope === 'selected' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}
           >
-            Selected region
+            Custom region
           </button>
         </div>
         {metricScope === 'selected' && (
           !analysisRoi ? (
-            <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary w-full text-[12px]"><ScanLine size={12} />Draw measurement region</button>
+            <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary w-full text-[11px]"><ScanLine size={12} />Draw Region on Image</button>
           ) : (
             <div className="grid grid-cols-2 gap-2">
-              <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary text-[12px]"><ScanLine size={12} />Redraw region</button>
-              <button onClick={onClearAnalysisRoi} className="ux-button ux-button-ghost text-[12px]">Clear region</button>
+              <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary text-[11px]"><ScanLine size={12} />Redraw</button>
+              <button onClick={onClearAnalysisRoi} className="ux-button ux-button-ghost text-[11px]">Clear</button>
             </div>
           )
         )}
         {selectedAnnotationRoi && (
-          <button onClick={onUseSelectedAnnotationRoi} className="ux-button ux-button-ghost w-full min-h-0 py-1 text-[12px]">Use selected annotation as measurement region</button>
+          <button onClick={onUseSelectedAnnotationRoi} className="ux-button ux-button-ghost w-full min-h-0 py-1 text-[11px]">Use selected annotation as region</button>
         )}
       </div>
 
       <details className="ux-card p-3" open={measurementSetupOpen || calibrationAttention}>
-        <summary className="cursor-pointer text-[12px] font-semibold text-[var(--text-muted)]">Measurement settings</summary>
+        <summary className="cursor-pointer text-[12px] font-semibold text-[var(--text-muted)]">Advanced Settings</summary>
         <div className="mt-3 space-y-3">
           {selectedTask?.models.nhs && (
             <label className="block">
@@ -1371,8 +1372,8 @@ export default function AnalysisPanel({
           )}
           <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-2 text-[12px]">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-[var(--text-muted)]">Channels</span>
-              <button type="button" onClick={onEditMapping} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[11px]">Edit in Display</button>
+              <span className="text-[var(--text-muted)]">Channel Assignment</span>
+              <button type="button" onClick={onEditMapping} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[10px]">Edit</button>
             </div>
             <div className="mt-2 space-y-1">
               {rolesForTask.map(role => {
@@ -1389,8 +1390,8 @@ export default function AnalysisPanel({
           {imgMeta.numZSlices > 1 && (
             <div className="space-y-1">
               <div className="flex items-center justify-between text-[12px] text-[var(--text-subtle)]">
-                <span>Measurement Z-slice</span>
-                <span className="font-mono text-[var(--text)]">{zIndex + 1} / {imgMeta.numZSlices}</span>
+                <span>Z-plane for Analysis</span>
+                <span className="font-mono text-[var(--text)]">{zIndex + 1} of {imgMeta.numZSlices}</span>
               </div>
               <input
                 type="range"

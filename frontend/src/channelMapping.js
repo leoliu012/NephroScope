@@ -1,7 +1,7 @@
 export const CHANNEL_ROLES = [
-  { id: 'dapi', label: 'DAPI', color: '#4488ff', defaultDisplayColor: '#4488ff' },
-  { id: 'nhs', label: 'NHS Ester', color: '#d8d8d8', defaultDisplayColor: '#ffffff' },
-  { id: 'actn4', label: 'ACTN4', color: '#44ff88', defaultDisplayColor: '#44ff88' },
+  { id: 'dapi', label: 'DAPI (Nuclei)', color: '#4488ff', defaultDisplayColor: '#4488ff' },
+  { id: 'nhs', label: 'NHS Ester (Membrane)', color: '#d8d8d8', defaultDisplayColor: '#ffffff' },
+  { id: 'actn4', label: 'ACTN4 (Foot Process)', color: '#44ff88', defaultDisplayColor: '#44ff88' },
   { id: 'unassigned', label: 'Unassigned', color: '#8b90a0', defaultDisplayColor: '#ffffff' },
 ]
 

@@ -64,9 +64,8 @@ const ANNOTATION_TOOL_IDS = ['point', 'line', 'arrow', 'rect', 'ellipse', 'freeh
 const COLORS = ['#ffee55','#ff4444','#44ff88','#44aaff','#ff44ff','#ffffff','#ff8800']
 
 const SIDEBAR_TABS = [
-  { id: 'display', label: 'Display' },
-  { id: 'measurements', label: 'Measurements' },
-  { id: 'report', label: 'Report' },
+  { id: 'display', label: 'Display', icon: 'eye' },
+  { id: 'measurements', label: 'Analysis', icon: 'ruler' },
 ]
 
 function defaultChSettings(n, mapping = defaultChannelMapping(n)) {
@@ -421,9 +420,9 @@ export default function ImageViewer({
 
   useEffect(() => {
     if (!onMeasurementStatusChange || !analysisRun?.status) return
-    if (analysisRun.status === 'QUEUED' || analysisRun.status === 'RUNNING') onMeasurementStatusChange('Measurements processing')
-    else if (analysisRun.status === 'SUCCEEDED') onMeasurementStatusChange('Measurements available')
-    else if (analysisRun.status === 'FAILED') onMeasurementStatusChange('Measurements need attention')
+    if (analysisRun.status === 'QUEUED' || analysisRun.status === 'RUNNING') onMeasurementStatusChange('Processing')
+    else if (analysisRun.status === 'SUCCEEDED') onMeasurementStatusChange('Measured')
+    else if (analysisRun.status === 'FAILED') onMeasurementStatusChange('Needs review')
   }, [analysisRun?.status, onMeasurementStatusChange])
 
   useEffect(() => {
@@ -577,17 +576,17 @@ export default function ImageViewer({
   const activeMappedChannels = channelMapping.filter(item => item.role !== 'unassigned')
   const analysisBusy = ['QUEUED', 'RUNNING'].includes(analysisRun?.status)
   const measurementStatusLabel = analysisBusy
-    ? 'Measurements processing...'
+    ? 'Analysis in progress'
     : analysisRun?.status === 'SUCCEEDED'
-      ? 'Measurements available'
+      ? 'Analysis complete'
       : analysisRun?.status === 'FAILED'
-        ? 'Measurements need attention'
-        : 'Measurements not calculated'
+        ? 'Needs review'
+        : 'Not analyzed'
   const measurementTabLabel = analysisBusy
-    ? 'Measurements processing...'
+    ? 'Analysis'
     : analysisRun?.status === 'SUCCEEDED'
-      ? 'Measurements available'
-      : 'Measurements'
+      ? 'Analysis'
+      : 'Analysis'
   const filePositionLabel = currentFileIndex >= 0 && files.length
     ? `Image ${currentFileIndex + 1} of ${files.length}`
     : 'Image'
@@ -595,8 +594,8 @@ export default function ImageViewer({
     ? `Z ${viewerZIndex + 1}/${imgMeta.numZSlices}`
     : 'Single Z'
   const roiBadgeLabel = analysisRoi
-    ? `Measurement region ${Math.round(analysisRoi.width)} x ${Math.round(analysisRoi.height)} px`
-    : 'Scope: whole image'
+    ? `Region: ${Math.round(analysisRoi.width)} × ${Math.round(analysisRoi.height)} px`
+    : 'Region: Full image'
   const analysisZIndex = Number(analysisRun?.request?.zIndex)
   const analysisPlaneAligned = !analysisRun?.runId || (
     displayProjection === 'slice'
@@ -662,7 +661,7 @@ export default function ImageViewer({
             setSidebarTab('measurements')
           }}
           className={`ux-tool-button ${activeTool === 'analysis-roi' ? 'ux-tool-button-active' : ''}`}
-          title="Select measurement region"
+          title="Draw analysis region"
         >
           <ScanLine size={16} />
         </button>
@@ -686,23 +685,26 @@ export default function ImageViewer({
           </span>
           <span className="ux-badge ux-badge-neutral hidden xl:inline-flex">{roiBadgeLabel}</span>
           <div className="flex items-center gap-1">
-            {[
-              ['display', 'Display'],
-              ['measurements', measurementTabLabel],
-              ['report', 'Report'],
-            ].map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                onClick={() => {
-                  setSidebarCollapsed(false)
-                  setSidebarTab(id)
-                }}
-                className={`ux-button ${sidebarTab === id ? 'ux-button-secondary' : 'ux-button-ghost'}`}
-              >
-                {label}
-              </button>
-            ))}
+            <button
+              type="button"
+              onClick={() => {
+                setSidebarCollapsed(false)
+                setSidebarTab('display')
+              }}
+              className={`ux-button ${sidebarTab === 'display' ? 'ux-button-secondary' : 'ux-button-ghost'}`}
+            >
+              Display
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setSidebarCollapsed(false)
+                setSidebarTab('measurements')
+              }}
+              className={`ux-button ${sidebarTab === 'measurements' ? 'ux-button-secondary' : 'ux-button-ghost'}`}
+            >
+              {measurementTabLabel}
+            </button>
           </div>
           <div className="ux-divider mx-1 h-5 w-px" />
           <button onClick={() => navigateFile(previousFile)} disabled={!previousFile}
@@ -807,36 +809,37 @@ export default function ImageViewer({
           )}
           {!analysisPlaneAligned && analysisRun?.runId && (
             <div className="pointer-events-none absolute left-1/2 top-4 z-30 -translate-x-1/2 rounded border border-amber-400/30 bg-black/75 px-3 py-2 text-[11px] text-amber-200 shadow-xl">
-              Analysis overlays are hidden. Show Z-slice {Number.isFinite(analysisZIndex) ? analysisZIndex + 1 : 1} to align them with the model input.
+              Analysis overlay hidden. Switch to Z-slice {Number.isFinite(analysisZIndex) ? analysisZIndex + 1 : 1} to view results.
             </div>
           )}
         </div>
         <div className="viewer-job-tray flex flex-shrink-0 items-center justify-between gap-3 px-4 py-2">
           <div className="min-w-0 flex items-center gap-3 text-[12px] text-[var(--text-muted)]">
-            <span className="font-semibold text-[var(--text)]">Measurements</span>
             {analysisBusy ? (
-              <span className="flex items-center gap-2"><Loader2 size={13} className="animate-spin text-[var(--accent)]" />Processing...</span>
+              <span className="flex items-center gap-2"><Loader2 size={13} className="animate-spin text-[var(--accent)]" />Analyzing image...</span>
             ) : analysisRun?.status === 'SUCCEEDED' ? (
-              <span className="text-[var(--success)]">Updated</span>
+              <span className="text-[var(--success)]">Analysis complete</span>
             ) : analysisRun?.status === 'FAILED' ? (
-              <span className="text-[var(--danger)]">Needs attention</span>
+              <span className="text-[var(--danger)]">Analysis needs review</span>
             ) : (
-              <span>Not calculated</span>
+              <span>Ready to analyze</span>
             )}
           </div>
-          <span className="text-[12px] text-[var(--text-subtle)]">Annotation changes {dirty ? 'saving' : 'saved'}</span>
+          <span className="text-[12px] text-[var(--text-subtle)]">{dirty ? 'Auto-saving annotations...' : 'Annotations saved'}</span>
         </div>
       </div>
 
       {!sidebarCollapsed && (
         <aside className="viewer-inspector w-80 flex-shrink-0 border-l flex flex-col min-h-0">
           <div className="viewer-inspector-tabs px-3 py-2 border-b flex items-center gap-1">
-            {SIDEBAR_TABS.map(({ id, label }) => (
-              <button key={id} onClick={() => setSidebarTab(id)}
-                className={`ux-tab flex-1 min-w-0 ${sidebarTab === id ? 'ux-tab-active' : ''}`}>
-                <span className="truncate">{label}</span>
-              </button>
-            ))}
+            <button onClick={() => setSidebarTab('display')}
+              className={`ux-tab flex-1 min-w-0 ${sidebarTab === 'display' ? 'ux-tab-active' : ''}`}>
+              <span className="truncate">Display</span>
+            </button>
+            <button onClick={() => setSidebarTab('measurements')}
+              className={`ux-tab flex-1 min-w-0 ${sidebarTab === 'measurements' ? 'ux-tab-active' : ''}`}>
+              <span className="truncate">Analysis</span>
+            </button>
           </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto">
@@ -928,16 +931,16 @@ export default function ImageViewer({
                       className={`ux-button min-h-0 px-2 py-1 text-[11px] ${annotationModeActive ? 'ux-button-secondary' : 'ux-button-ghost'}`}
                     >
                       <PenLine size={12} />
-                      Annotate
+                      {annotationModeActive ? 'Drawing' : 'Draw'}
                     </button>
                   </div>
                   <div>
                     <div className="mb-1 flex items-center gap-2">
                       <User size={12} className="text-gray-500" />
-                      <span className="text-[12px] text-[var(--text-subtle)]">Reviewer name</span>
+                      <span className="text-[12px] text-[var(--text-subtle)]">Your name</span>
                     </div>
                     <input value={annotator} onChange={e => setAnnotator(e.target.value)}
-                      placeholder="Your name..."
+                      placeholder="Enter your name"
                       className="ux-input" />
                   </div>
                   <div className="flex flex-wrap gap-2">

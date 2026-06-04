@@ -591,6 +591,62 @@ input[type=checkbox] {
 .analysis-scale-viridis {
   background: linear-gradient(90deg, rgb(68, 1, 84), rgb(59, 82, 139), rgb(33, 145, 140), rgb(94, 201, 98), rgb(253, 231, 37));
 }
-.analysis-scale-hot {
-  background: linear-gradient(90deg, rgb(0, 0, 0), rgb(255, 0, 0), rgb(255, 255, 0), rgb(255, 255, 255));
+/* Tooltip utilities for improved UX */
+.ux-tooltip {
+  position: relative;
 }
+
+.ux-tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%) translateY(-4px);
+  padding: 6px 10px;
+  background: var(--surface-3);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+  z-index: 1000;
+}
+
+.ux-tooltip:hover::after {
+  opacity: 1;
+}
+
+/* Improved button states */
+.ux-button-primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.ux-button-secondary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Better focus indicators for accessibility */
+.ux-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-color: var(--accent);
+}
+
+/* Improved status badge spacing */
+.ux-badge + .ux-badge {
+  margin-left: 8px;
+}
+
+/* Better visual separation in cards */
+.ux-card + .ux-card {
+  margin-top: 12px;
+}
+

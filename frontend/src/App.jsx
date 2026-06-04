@@ -14,17 +14,17 @@ import ImageViewer from './components/ImageViewer.jsx'
 const API = '/agh/api'
 
 const MEASUREMENT_STATUS_META = {
-  'Measurements not calculated': { className: 'ux-status-neutral' },
-  'Measurements processing': { className: 'ux-status-running' },
-  'Measurements available': { className: 'ux-status-success' },
-  'Measurements need attention': { className: 'ux-status-warning' },
+  'Not measured': { className: 'ux-status-neutral' },
+  'Processing': { className: 'ux-status-running' },
+  'Measured': { className: 'ux-status-success' },
+  'Needs review': { className: 'ux-status-warning' },
 }
 
 const MEASUREMENT_STATUS_ORDER = [
-  'Measurements not calculated',
-  'Measurements processing',
-  'Measurements available',
-  'Measurements need attention',
+  'Not measured',
+  'Processing',
+  'Measured',
+  'Needs review',
 ]
 
 function measurementStatusKey(caseId, filename) {
@@ -33,14 +33,14 @@ function measurementStatusKey(caseId, filename) {
 
 function normalizeMeasurementStatus(status) {
   if (MEASUREMENT_STATUS_META[status]) return status
-  if (status === 'Analysis running') return 'Measurements processing'
-  if (status === 'Ready for QC' || status === 'Reviewed' || status === 'Signed off') return 'Measurements available'
-  if (status === 'Needs attention') return 'Measurements need attention'
-  return 'Measurements not calculated'
+  if (status === 'Analysis running' || status === 'Measurements processing') return 'Processing'
+  if (status === 'Ready for QC' || status === 'Reviewed' || status === 'Signed off' || status === 'Measurements available') return 'Measured'
+  if (status === 'Needs attention' || status === 'Measurements need attention') return 'Needs review'
+  return 'Not measured'
 }
 
 function readStoredMeasurementStatus(caseId, filename) {
-  if (!caseId || !filename) return 'Measurements not calculated'
+  if (!caseId || !filename) return 'Not measured'
   const saved = localStorage.getItem(measurementStatusKey(caseId, filename))
     || localStorage.getItem(`agh-review-status-${caseId}-${filename}`)
   return normalizeMeasurementStatus(saved)
@@ -117,9 +117,9 @@ function formatDate(value) {
 
 function statusFromAnalysis(run) {
   if (!run) return null
-  if (run.status === 'QUEUED' || run.status === 'RUNNING') return 'Measurements processing'
-  if (run.status === 'SUCCEEDED') return 'Measurements available'
-  if (run.status === 'FAILED') return 'Measurements need attention'
+  if (run.status === 'QUEUED' || run.status === 'RUNNING') return 'Processing'
+  if (run.status === 'SUCCEEDED') return 'Measured'
+  if (run.status === 'FAILED') return 'Needs review'
   return null
 }
 
@@ -437,10 +437,10 @@ export default function App() {
                   </div>
                   <p className="mt-2 text-[12px] text-[var(--text-muted)]">
                     {previewAnalysisLoading
-                      ? 'Checking latest analysis result...'
+                      ? 'Loading measurement history...'
                       : previewAnalysis
-                        ? `Latest measurements: ${analysisSummary(previewAnalysis)}`
-                        : 'No measurements have been calculated for this image'}
+                        ? `Last analysis: ${analysisSummary(previewAnalysis)}`
+                        : 'This image has not been analyzed yet'}
                   </p>
                 </div>
                 <div className="flex flex-shrink-0 items-center gap-2">
@@ -454,10 +454,22 @@ export default function App() {
               </div>
               <div className="mb-4 rounded border border-[var(--border)] bg-[var(--surface-1)] px-3 py-2 text-[12px] text-[var(--text-muted)]">
                 <span className="font-semibold text-[var(--text)]">{selectedCase}</span>
-                <span className="ml-2">{files.length} images</span>
-                <span className="ml-2">{caseSummary['Measurements available']} measured</span>
-                <span className="ml-2">{caseSummary['Measurements processing']} processing</span>
-                <span className="ml-2">{caseSummary['Measurements need attention']} needs attention</span>
+                <span className="mx-3 text-[var(--border)]">·</span>
+                <span>{files.length} images</span>
+                <span className="mx-3 text-[var(--border)]">·</span>
+                <span>{caseSummary['Measured']} measured</span>
+                {caseSummary['Processing'] > 0 && (
+                  <>
+                    <span className="mx-3 text-[var(--border)]">·</span>
+                    <span>{caseSummary['Processing']} processing</span>
+                  </>
+                )}
+                {caseSummary['Needs review'] > 0 && (
+                  <>
+                    <span className="mx-3 text-[var(--border)]">·</span>
+                    <span className="text-amber-300">{caseSummary['Needs review']} needs review</span>
+                  </>
+                )}
               </div>
               {metadataExpanded && previewMeta && (
                 <div className="mb-4 grid grid-cols-2 gap-x-6 gap-y-1 rounded border border-[var(--border)] bg-[var(--surface-1)] p-3 text-[12px]">

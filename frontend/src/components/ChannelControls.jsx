@@ -44,41 +44,43 @@ export default function ChannelControls({
             {ch.enabled && (
               <div className="mt-2 flex flex-col gap-1.5 pl-5">
                 <div className="grid grid-cols-[3.2rem_auto_1fr] items-center gap-2">
-                  <span className="text-[11px] text-[var(--text-subtle)]">Color</span>
+                  <span className="text-[11px] text-[var(--text-subtle)]">Tint</span>
                   <input
                     type="color"
                     value={ch.displayColor}
                     onChange={e => onChange(i, { displayColor: e.target.value })}
                     className="h-7 w-8 cursor-pointer rounded border border-[var(--border)] bg-transparent p-0.5"
-                    title="Custom channel color"
+                    title="Channel color tint"
                   />
                   <button
                     type="button"
                     onClick={() => onChange(i, { displayColor: '#ffffff' })}
                     className={`ux-button min-h-0 justify-self-start px-2 py-1 text-[10px] ${isBlackAndWhite ? 'ux-button-secondary' : 'ux-button-ghost'}`}
                     aria-pressed={isBlackAndWhite}
-                    title="Switch this channel to black and white"
+                    title="Grayscale mode"
                   >
-                    Black &amp; white
+                    Grayscale
                   </button>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="w-8 text-[11px] text-[var(--text-subtle)]">Min</span>
+                  <span className="w-8 text-[11px] text-[var(--text-subtle)]">Dark</span>
                   <input
                     type="range" min={0} max={254} step={1}
                     value={ch.minVal}
                     onChange={e => onChange(i, { minVal: +e.target.value })}
                     className="flex-1"
+                    title="Minimum brightness threshold"
                   />
                   <span className="w-8 text-right font-mono text-[11px] text-[var(--text-subtle)]">{ch.minVal}</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <span className="w-8 text-[11px] text-[var(--text-subtle)]">Max</span>
+                  <span className="w-8 text-[11px] text-[var(--text-subtle)]">Bright</span>
                   <input
                     type="range" min={1} max={255} step={1}
                     value={ch.maxVal}
                     onChange={e => onChange(i, { maxVal: +e.target.value })}
                     className="flex-1"
+                    title="Maximum brightness threshold"
                   />
                   <span className="w-8 text-right font-mono text-[11px] text-[var(--text-subtle)]">{ch.maxVal}</span>
                 </div>
