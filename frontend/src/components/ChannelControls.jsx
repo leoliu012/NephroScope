@@ -1,5 +1,5 @@
 import { Eye, EyeOff } from 'lucide-react'
-import { CHANNEL_ROLES, displaySwatchStyle, normalizeChannelDisplaySetting, roleInfo } from '../channelMapping.js'
+import { CHANNEL_ROLES, displaySwatchStyle, normalizeChannelDisplaySetting } from '../channelMapping.js'
 
 export default function ChannelControls({
   settings,
@@ -14,8 +14,8 @@ export default function ChannelControls({
     <div className="w-full">
       {settings.slice(0, numChannels).map((rawSetting, i) => {
         const mapping = channelMapping?.[i] || { channel: i, role: 'unassigned' }
-        const def = roleInfo(mapping.role)
         const ch = normalizeChannelDisplaySetting(rawSetting, mapping.role)
+        const isBlackAndWhite = ch.displayColor.toLowerCase() === '#ffffff'
         return (
           <div key={i} className={`channel-row ${ch.enabled ? '' : 'opacity-50'}`}>
             <div className="flex items-center gap-2">
@@ -36,34 +36,31 @@ export default function ChannelControls({
                 title={ch.enabled ? 'Hide channel' : 'Show channel'}
               >
                 {ch.enabled
-                  ? <Eye size={15} style={{ color: ch.displayMode === 'color' ? ch.displayColor : def.color }} />
+                  ? <Eye size={15} style={{ color: ch.displayColor }} />
                   : <EyeOff size={15} className="text-gray-600" />}
               </button>
             </div>
 
             {ch.enabled && (
               <div className="mt-2 flex flex-col gap-1.5 pl-5">
-                <div className="grid grid-cols-[3.2rem_1fr_auto] items-center gap-2">
-                  <span className="text-[11px] text-[var(--text-subtle)]">Display</span>
-                  <select
-                    value={ch.displayMode}
-                    onChange={e => onChange(i, { displayMode: e.target.value })}
-                    className="ux-select h-7 py-0 text-[11px]"
+                <div className="grid grid-cols-[3.2rem_auto_1fr] items-center gap-2">
+                  <span className="text-[11px] text-[var(--text-subtle)]">Color</span>
+                  <input
+                    type="color"
+                    value={ch.displayColor}
+                    onChange={e => onChange(i, { displayColor: e.target.value })}
+                    className="h-7 w-8 cursor-pointer rounded border border-[var(--border)] bg-transparent p-0.5"
+                    title="Custom channel color"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => onChange(i, { displayColor: '#ffffff' })}
+                    className={`ux-button min-h-0 justify-self-start px-2 py-1 text-[10px] ${isBlackAndWhite ? 'ux-button-secondary' : 'ux-button-ghost'}`}
+                    aria-pressed={isBlackAndWhite}
+                    title="Switch this channel to black and white"
                   >
-                    <option value="grayscale">Black &amp; white</option>
-                    <option value="color">Color tint</option>
-                  </select>
-                  {ch.displayMode === 'color' ? (
-                    <input
-                      type="color"
-                      value={ch.displayColor}
-                      onChange={e => onChange(i, { displayColor: e.target.value })}
-                      className="h-7 w-8 cursor-pointer rounded border border-[var(--border)] bg-transparent p-0.5"
-                      title="Custom channel color"
-                    />
-                  ) : (
-                    <span className="h-6 w-8 rounded border border-[var(--border)]" style={displaySwatchStyle(ch, mapping.role)} />
-                  )}
+                    Black &amp; white
+                  </button>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="w-8 text-[11px] text-[var(--text-subtle)]">Min</span>

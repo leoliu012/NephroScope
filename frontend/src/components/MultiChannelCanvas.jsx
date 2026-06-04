@@ -19,8 +19,8 @@ function hexToRgb(hex) {
 }
 
 function displayRgb(setting, value) {
-  if (setting?.displayMode !== 'color') return [value, value, value]
-  const [r, g, b] = hexToRgb(setting.displayColor)
+  // White is the black-and-white tint, so every channel follows one rendering path.
+  const [r, g, b] = hexToRgb(setting?.displayColor)
   return [
     Math.round(value * r / 255),
     Math.round(value * g / 255),

@@ -51,7 +51,11 @@ export default function AnalysisVectorOverlay({ imgMeta, thickness, processMetri
   if (!imgMeta || (!thickness && !processMetric)) return null
 
   const points = showThickness ? sample(thickness?.points, 5000) : []
-  const pairs = showProcess ? sample(processMetric?.pairs, 2000) : []
+  const processPairs = processMetric?.areaPreview?.displayPairs
+    || processMetric?.areaPreview?.pairs
+    || processMetric?.displayPairs
+    || processMetric?.pairs
+  const pairs = showProcess ? sample(processPairs, 2000) : []
   const [tMin, tMax] = extent(points.map(p => p.value))
   const [pMin, pMax] = extent(pairs.map(p => p.distance))
 

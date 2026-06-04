@@ -36,7 +36,11 @@ export default function AnalysisLegend({
   if ((!thickness || !showThickness) && (!processMetric || !showProcess)) return null
 
   const thicknessExtent = extent(thickness?.points?.map(point => point.value))
-  const processExtent = extent(processMetric?.pairs?.map(pair => pair.distance))
+  const processPairs = processMetric?.areaPreview?.displayPairs
+    || processMetric?.areaPreview?.pairs
+    || processMetric?.displayPairs
+    || processMetric?.pairs
+  const processExtent = extent(processPairs?.map(pair => pair.distance))
   const unit = thickness?.unit || processMetric?.unit || 'um'
 
   return (
@@ -46,8 +50,8 @@ export default function AnalysisLegend({
       {showProcess && <Scale label="Process NND" unit={unit} range={processExtent} className="analysis-scale-hot" />}
       {processMetric && showProcess && (
         <div className="space-y-1 border-t border-white/10 pt-2 text-[9px] text-gray-300">
-          <p><span className="mr-2 inline-block h-0.5 w-4 bg-yellow-300 align-middle" />Original boundary</p>
-          <p><span className="mr-2 inline-block h-0.5 w-4 bg-cyan-300 align-middle" />Watershed split boundary</p>
+          <p><span className="mr-2 inline-block h-0.5 w-4 bg-yellow-300 align-middle" />Included process boundary</p>
+          <p><span className="mr-2 inline-block h-0.5 w-4 bg-cyan-300 align-middle" />Included process labels</p>
         </div>
       )}
     </div>

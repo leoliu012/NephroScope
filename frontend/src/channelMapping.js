@@ -1,8 +1,8 @@
 export const CHANNEL_ROLES = [
-  { id: 'dapi', label: 'DAPI', color: '#4488ff', defaultDisplayMode: 'color', defaultDisplayColor: '#4488ff' },
-  { id: 'nhs', label: 'NHS Ester', color: '#d8d8d8', defaultDisplayMode: 'grayscale', defaultDisplayColor: '#ffffff' },
-  { id: 'actn4', label: 'ACTN4', color: '#44ff88', defaultDisplayMode: 'color', defaultDisplayColor: '#44ff88' },
-  { id: 'unassigned', label: 'Unassigned', color: '#8b90a0', defaultDisplayMode: 'grayscale', defaultDisplayColor: '#ffffff' },
+  { id: 'dapi', label: 'DAPI', color: '#4488ff', defaultDisplayColor: '#4488ff' },
+  { id: 'nhs', label: 'NHS Ester', color: '#d8d8d8', defaultDisplayColor: '#ffffff' },
+  { id: 'actn4', label: 'ACTN4', color: '#44ff88', defaultDisplayColor: '#44ff88' },
+  { id: 'unassigned', label: 'Unassigned', color: '#8b90a0', defaultDisplayColor: '#ffffff' },
 ]
 
 const DEFAULT_ROLE_ORDER = ['dapi', 'nhs', 'actn4']
@@ -15,31 +15,31 @@ export function roleInfo(role) {
 export function defaultDisplaySettingForRole(role) {
   const info = roleInfo(role)
   return {
-    displayMode: info.defaultDisplayMode || 'grayscale',
     displayColor: info.defaultDisplayColor || '#ffffff',
   }
 }
 
 export function normalizeChannelDisplaySetting(value, role = 'unassigned') {
   const fallback = defaultDisplaySettingForRole(role)
-  const displayMode = value?.displayMode === 'color' || value?.displayMode === 'grayscale'
-    ? value.displayMode
-    : fallback.displayMode
-  const displayColor = typeof value?.displayColor === 'string' && HEX_COLOR.test(value.displayColor)
-    ? value.displayColor
-    : fallback.displayColor
+  // Migrate settings saved by the older two-mode UI. A white tint is the
+  // black-and-white representation, so a separate displayMode is unnecessary.
+  const legacyGrayscale = value?.displayMode === 'grayscale'
+  const displayColor = legacyGrayscale
+    ? '#ffffff'
+    : (typeof value?.displayColor === 'string' && HEX_COLOR.test(value.displayColor)
+      ? value.displayColor
+      : fallback.displayColor)
   return {
     enabled: value?.enabled !== false,
     minVal: Number.isFinite(Number(value?.minVal)) ? Number(value.minVal) : 0,
     maxVal: Number.isFinite(Number(value?.maxVal)) ? Number(value.maxVal) : 255,
-    displayMode,
     displayColor,
   }
 }
 
 export function displaySwatchStyle(setting, role = 'unassigned') {
   const normalized = normalizeChannelDisplaySetting(setting, role)
-  if (normalized.displayMode === 'grayscale') {
+  if (normalized.displayColor.toLowerCase() === '#ffffff') {
     return { background: 'linear-gradient(90deg, #111827 0%, #ffffff 100%)' }
   }
   return { background: normalized.displayColor }

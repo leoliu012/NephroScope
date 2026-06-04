@@ -13,6 +13,39 @@ import ImageViewer from './components/ImageViewer.jsx'
 
 const API = '/agh/api'
 
+const MEASUREMENT_STATUS_META = {
+  'Measurements not calculated': { className: 'ux-status-neutral' },
+  'Measurements processing': { className: 'ux-status-running' },
+  'Measurements available': { className: 'ux-status-success' },
+  'Measurements need attention': { className: 'ux-status-warning' },
+}
+
+const MEASUREMENT_STATUS_ORDER = [
+  'Measurements not calculated',
+  'Measurements processing',
+  'Measurements available',
+  'Measurements need attention',
+]
+
+function measurementStatusKey(caseId, filename) {
+  return `agh-measurement-status-${caseId}-${filename}`
+}
+
+function normalizeMeasurementStatus(status) {
+  if (MEASUREMENT_STATUS_META[status]) return status
+  if (status === 'Analysis running') return 'Measurements processing'
+  if (status === 'Ready for QC' || status === 'Reviewed' || status === 'Signed off') return 'Measurements available'
+  if (status === 'Needs attention') return 'Measurements need attention'
+  return 'Measurements not calculated'
+}
+
+function readStoredMeasurementStatus(caseId, filename) {
+  if (!caseId || !filename) return 'Measurements not calculated'
+  const saved = localStorage.getItem(measurementStatusKey(caseId, filename))
+    || localStorage.getItem(`agh-review-status-${caseId}-${filename}`)
+  return normalizeMeasurementStatus(saved)
+}
+
 async function fetchJson(url, options = {}) {
   const res = await fetch(url, options)
   if (!res.ok) {
@@ -69,6 +102,49 @@ function formatImageMeta(meta) {
   return parts.join(' | ') || 'TIFF image'
 }
 
+function formatDate(value) {
+  if (!value) return 'Not recorded'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return 'Not recorded'
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
+}
+
+function statusFromAnalysis(run) {
+  if (!run) return null
+  if (run.status === 'QUEUED' || run.status === 'RUNNING') return 'Measurements processing'
+  if (run.status === 'SUCCEEDED') return 'Measurements available'
+  if (run.status === 'FAILED') return 'Measurements need attention'
+  return null
+}
+
+function analysisSummary(run) {
+  if (!run) return null
+  const names = run.request?.modelNames || []
+  const labels = []
+  if (names.includes('ACTN4')) labels.push('ACTN4')
+  if (names.some(name => String(name).startsWith('NHS_'))) labels.push('NHS')
+  const modelText = labels.length ? labels.join(' + ') : (run.operation || 'Analysis')
+  const zText = Number.isFinite(Number(run.request?.zIndex)) ? `Z-slice ${Number(run.request.zIndex) + 1}` : 'Z-slice not recorded'
+  return `${modelText} | ${zText} | ${formatDate(run.finishedAt || run.createdAt)}`
+}
+
+function StatusChip({ status }) {
+  const normalized = normalizeMeasurementStatus(status)
+  const meta = MEASUREMENT_STATUS_META[normalized]
+  return (
+    <span className={`ux-status-chip ${meta.className}`}>
+      <span className="ux-status-dot" />
+      {normalized}
+    </span>
+  )
+}
+
 export default function App() {
   const [cases, setCases] = useState([])
   const [selectedCase, setCase] = useState(null)
@@ -85,7 +161,11 @@ export default function App() {
   const [previewError, setPreviewError] = useState(null)
   const [previewMeta, setPreviewMeta] = useState(null)
   const [previewMetaLoading, setPreviewMetaLoading] = useState(false)
+  const [previewAnalysis, setPreviewAnalysis] = useState(null)
+  const [previewAnalysisLoading, setPreviewAnalysisLoading] = useState(false)
+  const [metadataExpanded, setMetadataExpanded] = useState(false)
   const [openFile, setOpenFile] = useState(null)
+  const [statusVersion, setStatusVersion] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -140,6 +220,8 @@ export default function App() {
     if (!selectedCase || !selectedFile) {
       setPreviewMeta(null)
       setPreviewMetaLoading(false)
+      setPreviewAnalysis(null)
+      setPreviewAnalysisLoading(false)
       return
     }
     const controller = new AbortController()
@@ -156,11 +238,47 @@ export default function App() {
     return () => controller.abort()
   }, [selectedCase, selectedFile])
 
-  const openViewer = useCallback((filename = selectedFile) => {
+  useEffect(() => {
+    if (!selectedCase || !selectedFile) return
+    const controller = new AbortController()
+    setPreviewAnalysis(null)
+    setPreviewAnalysisLoading(true)
+    fetchJson(`${API}/cases/${encodeURIComponent(selectedCase)}/files/${encodeURIComponent(selectedFile)}/analysis-runs?operation=magnifyseg-segmentation&limit=1`, { signal: controller.signal })
+      .then(data => setPreviewAnalysis((data.runs || [])[0] || null))
+      .catch(error => {
+        if (error.name !== 'AbortError') setPreviewAnalysis(null)
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setPreviewAnalysisLoading(false)
+      })
+    return () => controller.abort()
+  }, [selectedCase, selectedFile])
+
+  const markMeasurementStatus = useCallback((filename, status) => {
+    if (!selectedCase || !filename) return
+    localStorage.setItem(measurementStatusKey(selectedCase, filename), normalizeMeasurementStatus(status))
+    setStatusVersion(value => value + 1)
+  }, [selectedCase])
+
+  const imageMeasurementStatus = useCallback((filename) => {
+    const analysisStatus = filename === selectedFile ? statusFromAnalysis(previewAnalysis) : null
+    return analysisStatus || readStoredMeasurementStatus(selectedCase, filename)
+  }, [previewAnalysis, selectedCase, selectedFile, statusVersion]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  const caseSummary = useMemo(() => {
+    const counts = Object.fromEntries(MEASUREMENT_STATUS_ORDER.map(status => [status, 0]))
+    files.forEach(item => {
+      const status = imageMeasurementStatus(item)
+      counts[status] = (counts[status] || 0) + 1
+    })
+    return counts
+  }, [files, imageMeasurementStatus])
+
+  const openViewer = useCallback((filename = selectedFile, initialTab = 'display') => {
     if (!selectedCase || !filename) return
     setSelectedFile(filename)
     setPreviewError(null)
-    setOpenFile({ case: selectedCase, filename })
+    setOpenFile({ case: selectedCase, filename, initialTab })
   }, [selectedCase, selectedFile])
 
   const moveSelection = useCallback((delta) => {
@@ -275,25 +393,29 @@ export default function App() {
                       : filteredFiles.map(item => (
                         <div
                           key={item}
-                          onDoubleClick={() => openViewer(item)}
+                          onDoubleClick={() => openViewer(item, 'display')}
                           onClick={() => { setSelectedFile(item); setPreviewError(null) }}
                           className={`ux-list-item group mx-2 my-0.5 flex cursor-pointer items-start gap-2 rounded-r-md px-3 py-2.5 ${selectedFile === item ? 'ux-list-item-selected' : ''}`}
                         >
                           <FileImage size={14} className={`mt-0.5 flex-shrink-0 ${selectedFile === item ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`} />
                           <div className="min-w-0 flex-1">
                             <p className="break-all text-xs leading-snug text-[var(--text)]">{item}</p>
-                            <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
-                              {selectedFile === item
-                                ? previewMetaLoading ? 'Loading metadata' : formatImageMeta(previewMeta)
-                                : 'TIFF image'}
-                            </p>
+                            <div className="mt-2 flex flex-wrap items-center gap-2">
+                              <StatusChip status={imageMeasurementStatus(item)} />
+                              <span className="text-[11px] text-[var(--text-subtle)]">
+                                {selectedFile === item
+                                  ? previewMetaLoading ? 'Loading metadata' : formatImageMeta(previewMeta)
+                                  : 'TIFF image'}
+                              </span>
+                            </div>
                           </div>
                           <button
-                            onClick={event => { event.stopPropagation(); openViewer(item) }}
-                            className="ux-icon-button h-6 w-6 flex-shrink-0 opacity-0 group-hover:opacity-100"
-                            title="Open in viewer"
+                            onClick={event => { event.stopPropagation(); openViewer(item, 'display') }}
+                            className="ux-button ux-button-ghost min-h-0 flex-shrink-0 px-2 py-1 text-[11px]"
+                            title="Open image"
                           >
                             <Eye size={13} />
+                            Open
                           </button>
                         </div>
                       ))}
@@ -306,15 +428,47 @@ export default function App() {
               <div className="mb-4 flex items-center justify-between gap-4">
                 <div className="min-w-0">
                   <h2 className="mt-1 truncate text-sm font-medium text-[var(--text)]">{selectedFile}</h2>
-                  <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
-                    {selectedCase}
-                    {previewMetaLoading ? ' | Loading metadata' : previewMeta ? ` | ${formatImageMeta(previewMeta)}` : ''}
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <StatusChip status={statusFromAnalysis(previewAnalysis) || imageMeasurementStatus(selectedFile)} />
+                    <span className="text-[12px] text-[var(--text-subtle)]">{selectedCase}</span>
+                    <span className="text-[12px] text-[var(--text-subtle)]">
+                      {previewMetaLoading ? 'Loading metadata' : previewMeta ? formatImageMeta(previewMeta) : ''}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-[12px] text-[var(--text-muted)]">
+                    {previewAnalysisLoading
+                      ? 'Checking latest analysis result...'
+                      : previewAnalysis
+                        ? `Latest measurements: ${analysisSummary(previewAnalysis)}`
+                        : 'No measurements have been calculated for this image'}
                   </p>
                 </div>
-                <button onClick={() => openViewer(selectedFile)} className="ux-button ux-button-primary flex-shrink-0">
-                  Open viewer <ArrowRight size={13} />
-                </button>
+                <div className="flex flex-shrink-0 items-center gap-2">
+                  <button onClick={() => openViewer(selectedFile, 'display')} className="ux-button ux-button-primary">
+                    Open image <ArrowRight size={13} />
+                  </button>
+                  <button onClick={() => setMetadataExpanded(value => !value)} className="ux-button ux-button-ghost">
+                    View technical metadata
+                  </button>
+                </div>
               </div>
+              <div className="mb-4 rounded border border-[var(--border)] bg-[var(--surface-1)] px-3 py-2 text-[12px] text-[var(--text-muted)]">
+                <span className="font-semibold text-[var(--text)]">{selectedCase}</span>
+                <span className="ml-2">{files.length} images</span>
+                <span className="ml-2">{caseSummary['Measurements available']} measured</span>
+                <span className="ml-2">{caseSummary['Measurements processing']} processing</span>
+                <span className="ml-2">{caseSummary['Measurements need attention']} needs attention</span>
+              </div>
+              {metadataExpanded && previewMeta && (
+                <div className="mb-4 grid grid-cols-2 gap-x-6 gap-y-1 rounded border border-[var(--border)] bg-[var(--surface-1)] p-3 text-[12px]">
+                  {Object.entries(previewMeta).slice(0, 12).map(([key, value]) => (
+                    <div key={key} className="flex min-w-0 items-center justify-between gap-3">
+                      <span className="truncate text-[var(--text-subtle)]">{key}</span>
+                      <span className="truncate text-right font-mono text-[var(--text)]">{String(value)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
               <div className="flex min-h-0 flex-1 items-center justify-center">
                 <div className="app-preview-frame flex h-full w-full items-center justify-center overflow-hidden p-3">
                   <img
@@ -342,10 +496,12 @@ export default function App() {
           caseId={openFile.case}
           filename={openFile.filename}
           files={filteredFiles}
+          initialTab={openFile.initialTab}
+          onMeasurementStatusChange={status => markMeasurementStatus(openFile.filename, status)}
           onNavigateFile={filename => {
             setSelectedFile(filename)
             setPreviewError(null)
-            setOpenFile(current => current ? { ...current, filename } : { case: selectedCase, filename })
+            setOpenFile(current => current ? { ...current, filename, initialTab: 'display' } : { case: selectedCase, filename, initialTab: 'display' })
           }}
           onClose={() => setOpenFile(null)}
         />

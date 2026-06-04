@@ -7,6 +7,8 @@ export const WATERSHED_PRESETS = {
     maxPairDistanceUm: 1.50,
     thresholdRelative: 0.34,
     sigma: 1.0,
+    minAreaPercentile: 0,
+    maxAreaPercentile: 100,
   },
   balanced: {
     preset: 'balanced',
@@ -16,6 +18,8 @@ export const WATERSHED_PRESETS = {
     maxPairDistanceUm: 1.50,
     thresholdRelative: 0.26,
     sigma: 0.0,
+    minAreaPercentile: 0,
+    maxAreaPercentile: 100,
   },
   aggressive: {
     preset: 'aggressive',
@@ -25,6 +29,8 @@ export const WATERSHED_PRESETS = {
     maxPairDistanceUm: 1.50,
     thresholdRelative: 0.18,
     sigma: 0.8,
+    minAreaPercentile: 0,
+    maxAreaPercentile: 100,
   },
 }
 

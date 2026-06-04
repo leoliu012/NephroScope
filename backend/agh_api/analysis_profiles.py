@@ -45,6 +45,10 @@ def resolve_process_watershed(payload=None, effective_pixel_size=None, pixel_uni
 
     min_distance_um = _optional_positive_float(payload.get("minDistanceUm"), "minDistanceUm")
     max_pair_um = _optional_positive_float(payload.get("maxPairDistanceUm"), "maxPairDistanceUm")
+    min_area_percentile = _percentile_float(payload.get("minAreaPercentile", 0.0), "minAreaPercentile")
+    max_area_percentile = _percentile_float(payload.get("maxAreaPercentile", 100.0), "maxAreaPercentile")
+    if min_area_percentile >= max_area_percentile:
+        raise BadRequest("minAreaPercentile must be lower than maxAreaPercentile")
 
     # Backwards compatibility: older clients sent pixel-unit fields.
     legacy_min_px = _optional_positive_float(payload.get("minDistance"), "minDistance")
@@ -67,6 +71,8 @@ def resolve_process_watershed(payload=None, effective_pixel_size=None, pixel_uni
             "thresholdRelative",
         ),
         "sigma": _nonnegative_float(payload.get("sigma", preset["sigma"]), "sigma"),
+        "minAreaPercentile": min_area_percentile,
+        "maxAreaPercentile": max_area_percentile,
         "effectivePixelSize": pixel_size,
         "effectivePixelSizeUm": pixel_size_um,
         "pixelUnit": str(pixel_unit or "um"),
@@ -117,4 +123,14 @@ def _nonnegative_float(value, label):
         raise BadRequest(f"Invalid {label}") from exc
     if parsed < 0:
         raise BadRequest(f"{label} must be non-negative")
+    return parsed
+
+
+def _percentile_float(value, label):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise BadRequest(f"Invalid {label}") from exc
+    if parsed < 0 or parsed > 100:
+        raise BadRequest(f"{label} must be between 0 and 100")
     return parsed

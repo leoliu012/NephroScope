@@ -169,6 +169,7 @@ export default function AnnotationLayer({
   fontSize, onEditAnnotation, panActive = false,
   selectedId, setSelectedId, svgRef,
   analysisRoi, setAnalysisRoi,
+  onAnalysisRoiDrawn,
 }) {
   const [drawing, setDrawing] = useState(null)
   const lastFreehandRef = useRef({ time: 0, x: null, y: null })
@@ -228,13 +229,14 @@ export default function AnnotationLayer({
     if (drawing.type === 'analysis-roi') {
       setAnalysisRoi?.(normalizeRect(coords))
       setDrawing(null)
+      onAnalysisRoiDrawn?.()
       return
     }
     const ann = makeAnn(drawing.type, coords)
     setAnnotations(prev => [...prev, ann])
     setSelectedId(ann.id)
     setDrawing(null)
-  }, [drawing, makeAnn, setAnnotations, setSelectedId, setAnalysisRoi])
+  }, [drawing, makeAnn, setAnnotations, setSelectedId, setAnalysisRoi, onAnalysisRoiDrawn])
 
   const handleClick = useCallback((e) => {
     if (activeTool === 'select') setSelectedId(null)
@@ -259,6 +261,10 @@ export default function AnnotationLayer({
     >
       {analysisRoi && (
         <g style={{ pointerEvents: 'none' }}>
+          <rect x={0} y={0} width={width} height={analysisRoi.y} fill="#000" fillOpacity={0.22} />
+          <rect x={0} y={analysisRoi.y + analysisRoi.height} width={width} height={Math.max(0, height - analysisRoi.y - analysisRoi.height)} fill="#000" fillOpacity={0.22} />
+          <rect x={0} y={analysisRoi.y} width={analysisRoi.x} height={analysisRoi.height} fill="#000" fillOpacity={0.22} />
+          <rect x={analysisRoi.x + analysisRoi.width} y={analysisRoi.y} width={Math.max(0, width - analysisRoi.x - analysisRoi.width)} height={analysisRoi.height} fill="#000" fillOpacity={0.22} />
           <rect
             x={analysisRoi.x}
             y={analysisRoi.y}
@@ -291,8 +297,7 @@ export default function AnnotationLayer({
           />
         </g>
       ))}
-      <PreviewShape drawing={drawing} color={annotationColor} />
+      <PreviewShape drawing={drawing} color={drawing?.type === 'analysis-roi' ? '#63a4d8' : annotationColor} />
     </svg>
   )
 }
-

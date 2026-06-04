@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  AlertTriangle,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -19,6 +20,7 @@ import MetricResultCard from './analysis/MetricResultCard.jsx'
 import ProcessDegroupingPanel from './analysis/ProcessDegroupingPanel.jsx'
 import { API, fetchJson } from './analysis/analysisApi.js'
 import { defaultWatershedPayload } from './analysis/analysisPresets.js'
+import { metricFingerprint, stableJson } from './analysis/metricFingerprint.js'
 
 const TASKS = [
   {
@@ -63,6 +65,9 @@ function defaultOverlayOpacity(name) {
   if (basename === 'overlay_NHS_GBM.png') return 0.55
   if (basename === 'proc_outer_contours.png') return 0.75
   if (basename === 'proc_contours.png') return 0.90
+  if (basename === 'proc_included_contours.png') return 0.90
+  if (basename === 'proc_excluded_contours.png') return false
+  if (basename === 'proc_all_contours.png') return false
   return 0.85
 }
 
@@ -126,17 +131,363 @@ function fmt(value) {
   return parsed.toFixed(4)
 }
 
-function TaskCard({ task, onClick }) {
+function fmtCount(value) {
+  if (value == null || Number.isNaN(Number(value))) return '0'
+  return new Intl.NumberFormat().format(Number(value))
+}
+
+function expectedModelNames(task, nhsMode) {
+  if (!task) return []
+  const names = []
+  if (task.models.actn4) names.push('ACTN4')
+  if (task.models.nhs) names.push(nhsMode === 'combined-actn4' ? 'NHS_COMBINED_ACTN4' : 'NHS_SINGLE_CHANNEL')
+  return names.sort()
+}
+
+function blockersFor(capabilities, kind) {
+  const key = kind === 'thickness' ? 'gbmThickness' : 'processNnd'
+  return capabilities?.measurements?.[key]?.blockers || []
+}
+
+function capabilityAvailable(capabilities, kind, fallback) {
+  const key = kind === 'thickness' ? 'gbmThickness' : 'processNnd'
+  const item = capabilities?.measurements?.[key]
+  return item ? Boolean(item.available) : fallback
+}
+
+function blockerMessage(blockers) {
+  return blockers[0]?.message || null
+}
+
+function statusDot(ready, busy = false) {
+  if (busy) return <Loader2 size={11} className="animate-spin text-[var(--accent)]" />
+  if (ready) return <CheckCircle2 size={11} className="text-[var(--success)]" />
+  return <AlertTriangle size={11} className="text-amber-300" />
+}
+
+function queryForCalibration(calibration) {
+  const params = new URLSearchParams()
+  Object.entries(calibration || {}).forEach(([key, value]) => {
+    if (value !== null && value !== undefined && value !== '') params.set(key, String(value))
+  })
+  const query = params.toString()
+  return query ? `?${query}` : ''
+}
+
+function savedRunMismatchSummary(savedRun, currentRequest) {
+  const request = savedRun?.request || {}
+  const differences = []
+  if (Number(request.zIndex ?? 0) !== Number(currentRequest.zIndex ?? 0)) {
+    differences.push(`Z-slice ${(request.zIndex ?? 0) + 1}`)
+  }
+  if (stableJson(request.channels || {}) !== stableJson(currentRequest.channels || {})) differences.push('a different channel mapping')
+  if (stableJson([...(request.modelNames || [])].sort()) !== stableJson([...(currentRequest.modelNames || [])].sort())) differences.push('a different model set')
+  if ((request.nhsMode || 'single-channel') !== (currentRequest.nhsMode || 'single-channel')) differences.push('a different NHS mode')
+  if ((request.preprocessingMode || 'percentile-stretch') !== (currentRequest.preprocessingMode || 'percentile-stretch')) differences.push('a different preprocessing mode')
+  return differences.length ? differences.join(' and ') : 'different analysis settings'
+}
+
+function latestSuccessfulSource(runs, kind) {
+  return (runs || []).find(item => {
+    if (item.status !== 'SUCCEEDED') return false
+    const segmentations = item.result?.segmentations || {}
+    if (kind === 'thickness') return Boolean(segmentations.NHS_SINGLE_CHANNEL || segmentations.NHS_COMBINED_ACTN4)
+    return Boolean(segmentations.ACTN4)
+  }) || null
+}
+
+function sourceModelLabel(source, kind) {
+  if (!source) return kind === 'thickness' ? 'NHS Ester segmentation' : 'ACTN4 segmentation'
+  const segmentations = source.result?.segmentations || {}
+  if (kind === 'thickness') {
+    if (segmentations.NHS_COMBINED_ACTN4) return 'NHS Ester + ACTN4 segmentation'
+    return 'NHS Ester segmentation'
+  }
+  return 'ACTN4 segmentation'
+}
+
+function formatDate(value) {
+  if (!value) return 'Not recorded'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return 'Not recorded'
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date)
+}
+
+function MetricSourceLine({ kind, source, busy, metric }) {
+  const title = kind === 'thickness' ? 'GBM thickness' : 'Process NND'
+  const value = kind === 'thickness' ? metric?.meanThickness : metric?.meanDistance
+  const hasValue = Number.isFinite(Number(value))
   return (
-    <button onClick={onClick} className="ux-card ux-card-action w-full px-3 py-3 text-left">
+    <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-2">
+      <div className="flex items-center gap-2">
+        {busy ? <Loader2 size={11} className="animate-spin text-[var(--accent)]" /> : source ? <CheckCircle2 size={11} className="text-[var(--success)]" /> : <AlertTriangle size={11} className="text-amber-300" />}
+        <p className="min-w-0 flex-1 text-[11px] font-semibold text-gray-200">{title}</p>
+        {hasValue && <span className="font-mono text-[10px] text-gray-100">{fmt(value)} {metric?.unit || ''}</span>}
+      </div>
+      <p className={`mt-1 text-[10px] leading-snug ${source ? 'text-gray-500' : 'text-amber-300'}`}>
+        {busy && source
+          ? `Calculating from ${sourceModelLabel(source, kind)} · ${formatDate(source.createdAt)}`
+          : source
+            ? `Using newest result · ${sourceModelLabel(source, kind)} · ${formatDate(source.createdAt)}`
+            : kind === 'thickness'
+              ? 'No NHS Ester segmentation available'
+              : 'No ACTN4 segmentation available'}
+      </p>
+      {source && Number.isFinite(Number(source.request?.zIndex)) && (
+        <p className="mt-0.5 text-[9px] text-gray-600">Z-slice {Number(source.request.zIndex) + 1}</p>
+      )}
+    </div>
+  )
+}
+
+function AnalysisProgressCard({ run, selectedTask }) {
+  const completed = new Set(run?.progress?.completed || [])
+  const current = run?.progress?.current
+  const modelSteps = []
+  if (selectedTask?.models.actn4 || runModelNames(run).includes('ACTN4')) modelSteps.push({ id: 'ACTN4', label: 'ACTN4 segmentation' })
+  if (selectedTask?.models.nhs || runModelNames(run).some(name => String(name).startsWith('NHS_'))) modelSteps.push({ id: 'NHS', label: 'NHS segmentation' })
+  const steps = [
+    { id: 'input', label: 'Input validation', complete: true },
+    ...modelSteps.map(step => ({
+      ...step,
+      complete: step.id === 'NHS'
+        ? [...completed].some(name => String(name).startsWith('NHS_'))
+        : completed.has(step.id),
+      active: step.id === 'NHS' ? String(current || '').startsWith('NHS_') : current === step.id,
+    })),
+    { id: 'gbm', label: 'GBM thickness', complete: false },
+    { id: 'process', label: 'Process NND', complete: false },
+    { id: 'qc', label: 'QC summary', complete: false },
+  ]
+  return (
+    <div className="ux-card space-y-2 p-3">
+      <p className="text-[11px] font-semibold text-gray-200">Analysis in progress</p>
+      <div className="space-y-1">
+        {steps.map(step => (
+          <div key={step.id} className="flex items-center gap-2 text-[10px] text-gray-400">
+            {step.complete ? <CheckCircle2 size={11} className="text-[var(--success)]" /> : step.active ? <Loader2 size={11} className="animate-spin text-[var(--accent)]" /> : <span className="h-2.5 w-2.5 rounded-full border border-gray-600" />}
+            <span>{step.label}</span>
+          </div>
+        ))}
+      </div>
+      <p className="text-[9px] text-gray-600">You may continue reviewing the image while queued work runs.</p>
+    </div>
+  )
+}
+
+function MeasurementReadinessCard({
+  capabilities,
+  calibrationReady,
+  busy,
+  hasNhs,
+  hasActn4,
+  missingRoles,
+  duplicatedChannels,
+  onFixCalibration,
+  onRunNhs,
+  onRunActn4,
+}) {
+  const gbmBlockers = blockersFor(capabilities, 'thickness')
+  const processBlockers = blockersFor(capabilities, 'process')
+  const blockers = [...gbmBlockers, ...processBlockers]
+  const uniqueBlockers = blockers.filter((blocker, index) =>
+    blockers.findIndex(item => item.code === blocker.code) === index
+  )
+  const channelReady = !missingRoles.length && !duplicatedChannels
+  const needsAttention = uniqueBlockers.length > 0 || !channelReady || !calibrationReady
+  if (!needsAttention) return null
+
+  const actionFor = blocker => {
+    if (blocker.fixAction === 'OPEN_CALIBRATION') return <button type="button" onClick={onFixCalibration} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[9px]">Fix calibration</button>
+    if (blocker.fixAction === 'RUN_NHS_SEGMENTATION') return <button type="button" onClick={onRunNhs} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[9px]">Run NHS segmentation</button>
+    if (blocker.fixAction === 'RUN_ACTN4_SEGMENTATION') return <button type="button" onClick={onRunActn4} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[9px]">Run ACTN4 segmentation</button>
+    return null
+  }
+
+  return (
+    <div className="ux-card space-y-2 border-amber-400/30 bg-amber-400/5 p-3">
+      <div className="flex items-center gap-2">
+        <AlertTriangle size={13} className="text-amber-300" />
+        <p className="text-[11px] font-semibold text-amber-100">Measurements need attention</p>
+      </div>
+      <div className="space-y-1 text-[10px] text-gray-300">
+        <div className="flex items-center gap-2">{statusDot(hasNhs || hasActn4, busy)}<span>Segmentation: {busy ? 'Running' : (hasNhs || hasActn4) ? 'Ready' : 'Missing'}</span></div>
+        <div className="flex items-center gap-2">{statusDot(channelReady)}<span>Channel mapping: {channelReady ? 'Ready' : 'Needs assignment'}</span></div>
+        <div className="flex items-center gap-2">{statusDot(calibrationReady)}<span>Physical calibration: {calibrationReady ? 'Ready' : 'Missing'}</span></div>
+      </div>
+      {!calibrationReady && !uniqueBlockers.some(blocker => blocker.fixAction === 'OPEN_CALIBRATION') && (
+        <div className="flex items-center gap-2 rounded border border-amber-400/20 bg-black/10 p-2">
+          <p className="min-w-0 flex-1 text-[10px] leading-snug text-amber-100">Enter the raw XY pixel size or provide the effective post-expansion size.</p>
+          <button type="button" onClick={onFixCalibration} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[9px]">Fix calibration</button>
+        </div>
+      )}
+      {uniqueBlockers.map(blocker => (
+        <div key={blocker.code} className="flex items-center gap-2 rounded border border-amber-400/20 bg-black/10 p-2">
+          <p className="min-w-0 flex-1 text-[10px] leading-snug text-amber-100">{blocker.message}</p>
+          {actionFor(blocker)}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function MeasurementCalibrationCard({
+  open,
+  onToggle,
+  calibrationReady,
+  attention,
+  pixelSize,
+  setPixelSize,
+  pixelUnit,
+  setPixelUnit,
+  expanded,
+  setExpanded,
+  expansionFactor,
+  setExpansionFactor,
+  effectivePixelSizeOverride,
+  setEffectivePixelSizeOverride,
+  effectivePixelSize,
+  effectivePixelSizeSource,
+  pendingMetricIntent,
+  onContinue,
+  inputRef,
+}) {
+  const pendingLabel = pendingMetricIntent === 'all'
+    ? 'all measurements'
+    : pendingMetricIntent === 'process'
+      ? 'Process NND'
+      : pendingMetricIntent === 'thickness'
+        ? 'GBM thickness'
+        : 'measurements'
+  return (
+    <div className={`ux-card space-y-2 p-3 ${attention ? 'border-amber-400/70 bg-amber-400/5' : ''}`}>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <span className="flex items-center gap-2">
+          {calibrationReady ? <CheckCircle2 size={12} className="text-[var(--success)]" /> : <AlertTriangle size={12} className="text-amber-300" />}
+          <span className="text-[11px] font-semibold text-gray-200">Calibration</span>
+        </span>
+        {open ? <ChevronDown size={12} className="text-gray-500" /> : <ChevronRight size={12} className="text-gray-500" />}
+      </button>
+
+      <p className={`text-[10px] leading-snug ${calibrationReady ? 'text-gray-500' : 'text-amber-300'}`}>
+        {calibrationReady
+          ? <>Effective size: <span className="font-mono text-gray-200">{fmt(effectivePixelSize)} {pixelUnit} / px</span> · {effectivePixelSizeSource}</>
+          : 'Required before measurements can be calculated.'}
+      </p>
+
+      {open && (
+        <div className="space-y-3 pt-1">
+          <div className="grid grid-cols-[1fr_3.5rem] gap-2">
+            <label>
+              <span className="text-[10px] text-gray-500">Raw XY pixel size</span>
+              <input
+                ref={inputRef}
+                type="number"
+                min="0"
+                step="any"
+                value={pixelSize}
+                onChange={e => setPixelSize(e.target.value)}
+                className={`ux-input mt-1 ${attention && !calibrationReady ? 'border-amber-400/80' : ''}`}
+              />
+              {attention && !calibrationReady && (
+                <span className="mt-1 block text-[9px] leading-snug text-amber-300">Required before calculating {pendingLabel}.</span>
+              )}
+            </label>
+            <label>
+              <span className="text-[10px] text-gray-500">Unit</span>
+              <select value={pixelUnit} onChange={e => setPixelUnit(e.target.value)} className="ux-select mt-1 h-8 py-1 text-[11px]">
+                <option value="nm">nm</option>
+                <option value="um">um</option>
+                <option value="mm">mm</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="grid grid-cols-[1fr_4.5rem] items-end gap-2">
+            <label className="flex items-center gap-1.5 pb-1 text-[11px] text-gray-300">
+              <input type="checkbox" checked={expanded} onChange={e => setExpanded(e.target.checked)} />
+              <span>Apply expansion factor</span>
+            </label>
+            <label>
+              <span className="text-[10px] text-gray-500">Factor</span>
+              <input type="number" min="0.001" step="any" value={expansionFactor} onChange={e => setExpansionFactor(e.target.value)} className="ux-input mt-1" />
+            </label>
+          </div>
+
+          <label className="block">
+            <span className="text-[10px] text-gray-500">Effective size after correction</span>
+            <input
+              type="number"
+              min="0"
+              step="any"
+              value={effectivePixelSizeOverride}
+              onChange={e => setEffectivePixelSizeOverride(e.target.value)}
+              placeholder="Optional direct effective size"
+              className="ux-input mt-1"
+            />
+            <span className="mt-1 block text-[9px] leading-snug text-gray-600">
+              Leave blank to calculate from raw XY size and expansion factor.
+            </span>
+          </label>
+
+          {pendingMetricIntent && (
+            <button type="button" onClick={onContinue} className="ux-button ux-button-primary w-full text-[11px]">
+              Continue with {pendingLabel}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function StepFrame({ step, title, status, children }) {
+  return (
+    <div className="analysis-step">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-[11px] font-semibold text-[var(--accent)]">Step {step}</p>
+          <h3 className="mt-0.5 text-sm font-semibold text-[var(--text)]">{title}</h3>
+        </div>
+        {status && <span className="ux-badge ux-badge-neutral flex-shrink-0">{status}</span>}
+      </div>
+      {children}
+    </div>
+  )
+}
+
+function PreflightRow({ ready, label, value, action }) {
+  return (
+    <div className="flex items-center gap-2 rounded border border-[var(--border)] bg-[var(--canvas-bg)] px-2 py-2 text-[12px]">
+      {ready ? <CheckCircle2 size={13} className="text-[var(--success)]" /> : <AlertTriangle size={13} className="text-amber-300" />}
+      <span className="min-w-0 flex-1 text-[var(--text-muted)]">{label}</span>
+      <span className={`max-w-[8.5rem] truncate text-right font-mono ${ready ? 'text-[var(--text)]' : 'text-amber-200'}`}>{value}</span>
+      {action}
+    </div>
+  )
+}
+
+function TaskCard({ task, onClick, compact = false }) {
+  return (
+    <button onClick={onClick} className={`ux-card ux-card-action w-full text-left ${compact ? 'px-3 py-2.5' : 'border-[var(--accent)]/50 bg-[var(--accent-soft)] px-3 py-4'}`}>
       <div className="flex items-start gap-2">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <p className="text-xs font-semibold text-gray-100">{task.title}</p>
-            {task.recommended && <span className="ux-badge ux-badge-neutral px-1.5 py-0.5 text-[8px]">Recommended</span>}
+            <p className={`${compact ? 'text-[12px]' : 'text-sm'} font-semibold text-gray-100`}>{task.title}</p>
+            {task.recommended && <span className="ux-badge ux-badge-neutral px-2 py-1 text-[10px]">Recommended</span>}
           </div>
-          <p className="mt-1 text-[11px] leading-snug text-gray-500">{task.description}</p>
-          <p className="mt-1 text-[10px] text-gray-600">Model: {task.modelLabel}</p>
+          {!compact && <p className="mt-2 text-[12px] leading-snug text-gray-300">{task.description}</p>}
+          <p className="mt-1 text-[12px] text-gray-500">Model: {task.modelLabel}</p>
         </div>
         <ChevronRight size={14} className="text-gray-500" />
       </div>
@@ -159,6 +510,8 @@ export default function AnalysisPanel({
   selectedAnnotationRoi,
   onUseSelectedAnnotationRoi,
   onActivateAnalysisRoiTool,
+  onEditMapping,
+  onReviewQc,
   run,
   setRun,
   visibleOverlays,
@@ -171,7 +524,7 @@ export default function AnalysisPanel({
   setProcessMetric,
 }) {
   const numChannels = imgMeta?.numChannels || 0
-  const [taskId, setTaskId] = useState(null)
+  const [taskId, setTaskId] = useState('full')
   const [nhsMode, setNhsMode] = useState('single-channel')
   const [pixelSize, setPixelSize] = useState('')
   const [pixelUnit, setPixelUnit] = useState('um')
@@ -189,6 +542,12 @@ export default function AnalysisPanel({
   const [deletingRunId, setDeletingRunId] = useState(null)
   const [error, setError] = useState(null)
   const [metricRuns, setMetricRuns] = useState({ thickness: null, process: null })
+  const [capabilities, setCapabilities] = useState(null)
+  const [autoMeasureRunId, setAutoMeasureRunId] = useState(null)
+  const [measurementSetupOpen, setMeasurementSetupOpen] = useState(false)
+  const [pendingMetricIntent, setPendingMetricIntent] = useState(null)
+  const [calibrationAttention, setCalibrationAttention] = useState(false)
+  const calibrationInputRef = useRef(null)
 
   const selectedTask = TASKS.find(task => task.id === taskId)
   const preprocessingMode = 'percentile-stretch'
@@ -199,7 +558,7 @@ export default function AnalysisPanel({
 
   useEffect(() => {
     if (!imgMeta) return
-    setTaskId(null)
+    setTaskId('full')
     setNhsMode('single-channel')
     setPixelSize(imgMeta.pixelSize ?? '')
     setPixelUnit(imgMeta.pixelUnit || 'um')
@@ -218,14 +577,15 @@ export default function AnalysisPanel({
     setThickness(null)
     setProcessMetric(null)
     setMetricRuns({ thickness: null, process: null })
+    setCapabilities(null)
+    setAutoMeasureRunId(null)
+    setMeasurementSetupOpen(false)
+    setPendingMetricIntent(null)
+    setCalibrationAttention(false)
     setVisibleOverlays({})
     setVisibleVectors?.({ thickness: true, process: true })
     setError(null)
   }, [imgMeta?.cacheKey, caseId, filename]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (!analysisRoi && metricScope === 'selected') setMetricScope('whole')
-  }, [analysisRoi, metricScope])
 
   const loadMetricRunsForSegmentation = useCallback(async (segmentationRun) => {
     if (!segmentationRun?.runId || segmentationRun.status !== 'SUCCEEDED') return []
@@ -245,6 +605,10 @@ export default function AnalysisPanel({
     setThickness(null)
     setProcessMetric(null)
     setMetricRuns({ thickness: null, process: null })
+    setCapabilities(null)
+    setAutoMeasureRunId(null)
+    setPendingMetricIntent(null)
+    setCalibrationAttention(false)
     setVisibleOverlays({})
     setVisibleVectors?.({ thickness: true, process: true })
     setError(null)
@@ -397,6 +761,71 @@ export default function AnalysisPanel({
     })
   }, [overlayNames, setVisibleOverlays])
 
+  useEffect(() => {
+    const metricRunId = metricRuns.process?.runId
+    if (!processMetric || !metricRunId || metricRuns.process?.status !== 'SUCCEEDED') {
+      setProcessMetric(prev => prev?.areaPreview ? { ...prev, areaPreview: null } : prev)
+      return
+    }
+
+    const minPercentile = Number(watershed?.minAreaPercentile ?? 0)
+    const maxPercentile = Number(watershed?.maxAreaPercentile ?? 100)
+    const committedWatershed = metricRuns.process?.request?.watershed || processMetric?.watershed || {}
+    const committedMin = Number(committedWatershed.minAreaPercentile ?? 0)
+    const committedMax = Number(committedWatershed.maxAreaPercentile ?? 100)
+    if (
+      !Number.isFinite(minPercentile)
+      || !Number.isFinite(maxPercentile)
+      || minPercentile < 0
+      || maxPercentile > 100
+      || minPercentile >= maxPercentile
+    ) return
+    if (
+      Number.isFinite(committedMin)
+      && Number.isFinite(committedMax)
+      && committedMin === minPercentile
+      && committedMax === maxPercentile
+    ) {
+      setProcessMetric(prev => prev?.areaPreview ? { ...prev, areaPreview: null } : prev)
+      return
+    }
+
+    const controller = new AbortController()
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      try {
+        const preview = await fetchJson(`${API}/analysis-runs/${encodeURIComponent(metricRunId)}/process-area-preview`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({ minPercentile, maxPercentile }),
+        })
+        if (cancelled) return
+        setProcessMetric(prev => prev ? { ...prev, areaPreview: { ...preview, unit: prev.unit || 'um' } } : prev)
+      } catch (err) {
+        if (!cancelled && err.name !== 'AbortError') setError(err.message)
+      }
+    }, 80)
+
+    return () => {
+      cancelled = true
+      controller.abort()
+      window.clearTimeout(timer)
+    }
+  }, [
+    metricRuns.process?.runId,
+    metricRuns.process?.status,
+    Boolean(processMetric),
+    processMetric?.unit,
+    setProcessMetric,
+    metricRuns.process?.request?.watershed?.minAreaPercentile,
+    metricRuns.process?.request?.watershed?.maxAreaPercentile,
+    processMetric?.watershed?.minAreaPercentile,
+    processMetric?.watershed?.maxAreaPercentile,
+    watershed?.minAreaPercentile,
+    watershed?.maxAreaPercentile,
+  ])
+
   const rolesForTask = useMemo(() => {
     if (!selectedTask) return []
     if (selectedTask.id === 'gbm' && nhsMode === 'combined-actn4') return ['nhs', 'actn4']
@@ -422,12 +851,54 @@ export default function AnalysisPanel({
     effectivePixelSizeOverride: effectivePixelSizeOverride === '' ? null : Number(effectivePixelSizeOverride),
   }), [effectivePixelSizeOverride, expanded, expansionFactor, pixelSize, pixelUnit])
 
+  const currentRunRequest = useMemo(() => ({
+    zIndex,
+    channels: channelPayload,
+    modelNames: expectedModelNames(selectedTask, nhsMode),
+    nhsMode,
+    preprocessingMode,
+  }), [channelPayload, nhsMode, preprocessingMode, selectedTask, zIndex])
+
+  const currentRunFingerprint = useMemo(
+    () => stableJson(currentRunRequest),
+    [currentRunRequest]
+  )
+
+  const loadCapabilities = useCallback(async () => {
+    if (!run?.runId) {
+      setCapabilities(null)
+      return null
+    }
+    try {
+      const response = await fetchJson(
+        `${API}/analysis-runs/${encodeURIComponent(run.runId)}/capabilities${queryForCalibration(calibrationPayload)}`
+      )
+      setCapabilities(response)
+      return response
+    } catch (err) {
+      setCapabilities(null)
+      return null
+    }
+  }, [calibrationPayload, run?.runId])
+
+  useEffect(() => {
+    if (!run?.runId) {
+      setCapabilities(null)
+      return
+    }
+    loadCapabilities()
+  }, [loadCapabilities, run?.runId, run?.status])
+
   const startRun = async () => {
     if (!selectedTask) return
     setError(null)
     setThickness(null)
     setProcessMetric(null)
     setMetricRuns({ thickness: null, process: null })
+    setCapabilities(null)
+    setAutoMeasureRunId(null)
+    setPendingMetricIntent(null)
+    setCalibrationAttention(false)
     setProcessSettingsDirty(false)
     try {
       const created = await fetchJson(`${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}/analysis-runs`, {
@@ -443,6 +914,7 @@ export default function AnalysisPanel({
         }),
       })
       setRun(created)
+      if (selectedTask.id === 'full') setAutoMeasureRunId(created.runId)
       setVisibleOverlays({})
       setVisibleVectors?.({ thickness: true, process: true })
       loadSavedRuns()
@@ -472,6 +944,10 @@ export default function AnalysisPanel({
           setThickness(null)
           setProcessMetric(null)
           setMetricRuns({ thickness: null, process: null })
+          setCapabilities(null)
+          setAutoMeasureRunId(null)
+          setPendingMetricIntent(null)
+          setCalibrationAttention(false)
           setVisibleOverlays({})
         }
       }
@@ -511,64 +987,123 @@ export default function AnalysisPanel({
     setError(null)
   }, [imgMeta?.numZSlices, onSetRoleChannel, onZIndexChange])
 
+  const metricSources = useMemo(() => ({
+    thickness: latestSuccessfulSource(
+      [
+        ...(run?.runId ? [run] : []),
+        ...savedRuns.filter(item => item.runId !== run?.runId),
+      ].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))),
+      'thickness'
+    ),
+    process: latestSuccessfulSource(
+      [
+        ...(run?.runId ? [run] : []),
+        ...savedRuns.filter(item => item.runId !== run?.runId),
+      ].sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || ''))),
+      'process'
+    ),
+  }), [run, savedRuns])
+
+  const focusMeasurementCalibration = useCallback((intent) => {
+    setPendingMetricIntent(intent)
+    setMeasurementSetupOpen(true)
+    setCalibrationAttention(true)
+    window.setTimeout(() => calibrationInputRef.current?.focus(), 0)
+  }, [])
+
   const queueMetric = useCallback(async (kind) => {
-    if (!run?.runId || run.status !== 'SUCCEEDED') return null
+    const sourceRun = metricSources[kind]
+    if (!sourceRun?.runId) {
+      throw new Error(kind === 'thickness'
+        ? 'No NHS Ester segmentation is available for GBM thickness.'
+        : 'No ACTN4 segmentation is available for Process NND.')
+    }
     const path = kind === 'thickness' ? 'gbm-thickness' : 'process-nnd'
     const roi = metricScope === 'selected' ? analysisRoi : null
     const payload = { roi, calibration: calibrationPayload }
     if (kind === 'process') payload.watershed = watershed
-    const metricRun = await fetchJson(`${API}/analysis-runs/${encodeURIComponent(run.runId)}/metrics/${path}`, {
+    const metricRun = await fetchJson(`${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}/metrics/${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
-    setMetricRuns(prev => ({ ...prev, [kind]: metricRun }))
+    const sourceRunId = metricRun.sourceSegmentationRunId || sourceRun.runId
+    const createdAt = new Date().toISOString()
+    const enrichedMetricRun = {
+      ...metricRun,
+      createdAt,
+      request: { ...payload, segmentationRunId: sourceRunId },
+    }
+    setMetricRuns(prev => ({ ...prev, [kind]: enrichedMetricRun }))
     setSavedRunMetrics(prev => ({
       ...prev,
-      [run.runId]: upsertMetricRun(prev[run.runId], {
-        ...metricRun,
-        createdAt: new Date().toISOString(),
-        request: { ...payload, segmentationRunId: run.runId },
-      }),
+      [sourceRunId]: upsertMetricRun(prev[sourceRunId], enrichedMetricRun),
     }))
-    if (kind === 'thickness') setThickness(null)
-    else {
-      setProcessMetric(null)
-      setProcessSettingsDirty(false)
-    }
-    return metricRun
-  }, [analysisRoi, calibrationPayload, metricScope, run, setProcessMetric, setThickness, watershed])
+    if (kind === 'process') setProcessSettingsDirty(false)
+    return enrichedMetricRun
+  }, [analysisRoi, calibrationPayload, caseId, filename, metricScope, metricSources, watershed])
 
   const invalidateDisplayedProcessMetric = useCallback(() => {
-    setProcessMetric(null)
-    setMetricRuns(prev => ({ ...prev, process: null }))
     setProcessSettingsDirty(true)
-  }, [setProcessMetric])
+  }, [])
 
   const handleWatershedChange = useCallback((nextWatershed) => {
     setWatershed(nextWatershed)
     invalidateDisplayedProcessMetric()
   }, [invalidateDisplayedProcessMetric])
 
+  const requestMetric = async kind => {
+    setError(null)
+    const needsThickness = kind === 'thickness' || kind === 'all'
+    const needsProcess = kind === 'process' || kind === 'all'
+    if (needsThickness && !metricSources.thickness) {
+      setError('No NHS Ester segmentation is available for GBM thickness.')
+      return
+    }
+    if (needsProcess && !metricSources.process) {
+      setError('No ACTN4 segmentation is available for Process NND.')
+      return
+    }
+    if (!calibrationReady) {
+      focusMeasurementCalibration(kind)
+      return
+    }
+    setPendingMetricIntent(null)
+    setCalibrationAttention(false)
+    try {
+      if (kind === 'all') {
+        const jobs = []
+        if (metricSources.thickness) jobs.push(queueMetric('thickness'))
+        if (metricSources.process) jobs.push(queueMetric('process'))
+        await Promise.all(jobs)
+      } else {
+        await queueMetric(kind)
+      }
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
+  const continuePendingMetric = () => {
+    if (!pendingMetricIntent) return
+    if (!calibrationReady) {
+      focusMeasurementCalibration(pendingMetricIntent)
+      return
+    }
+    requestMetric(pendingMetricIntent)
+  }
+
   const computeMetric = async kind => {
     setError(null)
     try {
-      await queueMetric(kind)
+      await requestMetric(kind)
     } catch (err) {
       setError(err.message)
     }
   }
 
   const computeAllAvailable = async () => {
-    setError(null)
-    try {
-      const jobs = []
-      if (hasNhs) jobs.push(queueMetric('thickness'))
-      if (hasActn4) jobs.push(queueMetric('process'))
-      await Promise.all(jobs)
-    } catch (err) {
-      setError(err.message)
-    }
+    await requestMetric('all')
   }
 
   const busy = run?.status === 'QUEUED' || run?.status === 'RUNNING'
@@ -577,15 +1112,25 @@ export default function AnalysisPanel({
   const segmentations = run?.result?.segmentations || {}
   const hasNhs = Boolean(segmentations.NHS_SINGLE_CHANNEL || segmentations.NHS_COMBINED_ACTN4)
   const hasActn4 = Boolean(segmentations.ACTN4)
+  const sourceHasNhs = Boolean(metricSources.thickness)
+  const sourceHasActn4 = Boolean(metricSources.process)
   const thicknessBusy = ['QUEUED', 'RUNNING'].includes(metricRuns.thickness?.status)
   const processBusy = ['QUEUED', 'RUNNING'].includes(metricRuns.process?.status)
   const metricBusy = thicknessBusy || processBusy
   const canRun = imgMeta && selectedTask && numChannels > 0 && !busy && !missingRoles.length && !duplicatedChannels
   const matchingSavedRun = selectedTask
-    ? savedRuns.find(item => runSupportsTask(item, selectedTask.id) && item.status === 'SUCCEEDED')
+    ? savedRuns.find(item =>
+      runSupportsTask(item, selectedTask.id)
+      && item.status === 'SUCCEEDED'
+      && stableJson({
+        zIndex: item.request?.zIndex,
+        channels: item.request?.channels || {},
+        modelNames: [...(item.request?.modelNames || [])].sort(),
+        nhsMode: item.request?.nhsMode || 'single-channel',
+        preprocessingMode: item.request?.preprocessingMode || 'percentile-stretch',
+      }) === currentRunFingerprint
+    )
     : null
-  const nhsSegmentation = segmentations.NHS_SINGLE_CHANNEL || segmentations.NHS_COMBINED_ACTN4
-  const actn4Segmentation = segmentations.ACTN4
   const numericPixelSize = Number(pixelSize)
   const numericFactor = Number(expansionFactor)
   const numericEffectiveOverride = Number(effectivePixelSizeOverride)
@@ -601,8 +1146,350 @@ export default function AnalysisPanel({
     : expanded
       ? 'Raw pixel size / expansion factor'
       : 'Raw pixel size'
+  const thicknessAvailable = sourceHasNhs
+  const processAvailable = sourceHasActn4
+  const metricRoi = metricScope === 'selected' ? analysisRoi : null
+  const currentThicknessFingerprint = metricFingerprint({
+    runId: metricSources.thickness?.runId,
+    roi: metricRoi,
+    calibration: calibrationPayload,
+    effectivePixelSize,
+  })
+  const currentProcessFingerprint = metricFingerprint({
+    runId: metricSources.process?.runId,
+    roi: metricRoi,
+    calibration: calibrationPayload,
+    effectivePixelSize,
+    watershed,
+  })
+  const thicknessFingerprint = metricRuns.thickness ? metricFingerprint({
+    runId: metricRuns.thickness.request?.segmentationRunId || metricSources.thickness?.runId,
+    roi: metricRuns.thickness.request?.roi,
+    calibration: metricRuns.thickness.request?.calibration,
+  }) : null
+  const processFingerprint = metricRuns.process ? metricFingerprint({
+    runId: metricRuns.process.request?.segmentationRunId || metricSources.process?.runId,
+    roi: metricRuns.process.request?.roi,
+    calibration: metricRuns.process.request?.calibration,
+    watershed: metricRuns.process.request?.watershed,
+  }) : null
+  const thicknessStale = Boolean(thickness && thicknessFingerprint && thicknessFingerprint !== currentThicknessFingerprint)
+  const processStale = Boolean(processMetric && processFingerprint && processFingerprint !== currentProcessFingerprint)
+  const thicknessResultSource = savedRuns.find(item => item.runId === metricRuns.thickness?.request?.segmentationRunId) || metricSources.thickness || run
+  const processResultSource = savedRuns.find(item => item.runId === metricRuns.process?.request?.segmentationRunId) || metricSources.process || run
+  const thicknessSegmentation = thicknessResultSource?.result?.segmentations?.NHS_SINGLE_CHANNEL
+    || thicknessResultSource?.result?.segmentations?.NHS_COMBINED_ACTN4
+  const processSegmentation = processResultSource?.result?.segmentations?.ACTN4
+  const showMeasurements = succeeded || sourceHasNhs || sourceHasActn4
+  const preflightRows = selectedTask ? [
+    ...rolesForTask.map(role => {
+      const value = channelPayload[role]
+      return {
+        key: role,
+        ready: value != null,
+        label: roleInfo(role).label,
+        value: value != null ? channelLabel(channelMapping, value) : 'Not assigned',
+      }
+    }),
+    {
+      key: 'z',
+      ready: true,
+      label: 'Z-slice',
+      value: imgMeta.numZSlices > 1 ? `${zIndex + 1} of ${imgMeta.numZSlices}` : 'Single slice',
+    },
+    {
+      key: 'calibration',
+      ready: calibrationReady,
+      label: 'Calibration',
+      value: calibrationReady ? `${fmt(effectivePixelSize)} ${pixelUnit} / px` : 'Missing',
+    },
+    {
+      key: 'scope',
+      ready: metricScope !== 'selected' || Boolean(analysisRoi),
+      label: 'Scope',
+      value: metricScope === 'selected' && analysisRoi
+        ? `ROI ${Math.round(analysisRoi.width)} x ${Math.round(analysisRoi.height)} px`
+        : metricScope === 'selected'
+          ? 'ROI not drawn'
+          : 'Whole image',
+    },
+  ] : []
+  const analysisComplete = Boolean(thickness || processMetric)
+
+  useEffect(() => {
+    if (!autoMeasureRunId || autoMeasureRunId !== run?.runId || run?.status !== 'SUCCEEDED' || metricBusy) return
+    if (!capabilities) return
+    const canQueueAny = thicknessAvailable || processAvailable
+    if (!canQueueAny) {
+      const blockers = [
+        ...blockersFor(capabilities, 'thickness'),
+        ...blockersFor(capabilities, 'process'),
+      ]
+      const waitingForCalibration = blockers.some(blocker => blocker.code === 'CALIBRATION_REQUIRED')
+      if (!waitingForCalibration) setAutoMeasureRunId(null)
+      return
+    }
+    computeAllAvailable()
+    setAutoMeasureRunId(null)
+  }, [autoMeasureRunId, run?.runId, run?.status, metricBusy, capabilities, thicknessAvailable, processAvailable])
 
   if (!imgMeta) return null
+
+  const scopeLabel = metricScope === 'selected' && analysisRoi ? 'Selected region' : 'Whole image'
+  const latestMeasurementDate = metricRuns.thickness?.finishedAt
+    || metricRuns.process?.finishedAt
+    || metricRuns.thickness?.createdAt
+    || metricRuns.process?.createdAt
+    || run?.finishedAt
+    || run?.createdAt
+  const hasAnyMeasurement = Boolean(thickness || processMetric)
+
+  return (
+    <div className="space-y-3 px-3 py-3">
+      <div className="flex items-center gap-2">
+        <p className="ux-section-label">Measurements</p>
+        {busy || metricBusy ? <Loader2 size={12} className="ml-auto animate-spin text-[var(--accent)]" /> : null}
+        {!busy && !metricBusy && hasAnyMeasurement && <CheckCircle2 size={12} className="ml-auto text-[var(--success)]" />}
+        {!busy && !metricBusy && failed && <XCircle size={12} className="ml-auto text-red-400" />}
+      </div>
+
+      {!hasAnyMeasurement && (
+        <div className="ux-card space-y-3 p-3">
+          <div>
+            <p className="text-sm font-semibold text-[var(--text)]">No measurements available for this image.</p>
+            <p className="mt-1 text-[12px] leading-snug text-[var(--text-muted)]">
+              Calculate GBM thickness and process nearest-neighbor distance from the available channels.
+            </p>
+          </div>
+          {missingRoles.length > 0 && (
+            <p className="rounded border border-amber-400/30 bg-amber-400/5 p-2 text-[12px] leading-snug text-amber-200">
+              Assign {missingRoles.map(role => roleInfo(role).label).join(', ')} channels in Display before calculating measurements.
+            </p>
+          )}
+          <button onClick={startRun} disabled={!canRun} className={`ux-button w-full ${canRun ? 'ux-button-primary' : 'ux-button-secondary cursor-not-allowed opacity-50'}`}>
+            {busy ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+            {busy ? 'Calculating measurements...' : 'Calculate kidney measurements'}
+          </button>
+        </div>
+      )}
+
+      {hasAnyMeasurement && (
+        <div className="ux-card space-y-3 p-3">
+          <div className="flex items-center justify-between gap-2">
+            <p className="text-sm font-semibold text-[var(--text)]">Kidney measurements</p>
+            {latestMeasurementDate && <span className="text-[11px] text-[var(--text-subtle)]">{formatDate(latestMeasurementDate)}</span>}
+          </div>
+
+          <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[12px] font-semibold text-[var(--text)]">GBM thickness</p>
+                <p className="mt-1 font-mono text-2xl font-semibold text-[var(--text)]">{fmt(thickness?.meanThickness)} {thickness?.unit || 'um'}</p>
+                <p className="mt-1 text-[12px] text-[var(--text-subtle)]">Measured across {fmtCount(thickness?.points?.length)} points</p>
+              </div>
+              <div className="flex flex-col gap-2">
+                <button type="button" onClick={() => setVisibleVectors?.(prev => ({ ...prev, thickness: prev.thickness === false }))} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
+                  {visibleVectors?.thickness === false ? 'Show overlay' : 'Hide overlay'}
+                </button>
+                <button type="button" onClick={() => requestMetric('thickness')} disabled={metricBusy || !thicknessAvailable} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
+                  Recalculate
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-[12px] font-semibold text-[var(--text)]">Process nearest-neighbor distance</p>
+                <p className="mt-1 font-mono text-2xl font-semibold text-[var(--text)]">{fmt(processMetric?.meanDistance)} {processMetric?.unit || 'um'}</p>
+                <p className="mt-1 text-[12px] text-[var(--text-subtle)]">
+                  Calculated from {fmtCount(processMetric?.areaFilter?.includedProcessCount ?? processMetric?.nndIncludedProcessCount ?? processMetric?.processCount)} included processes
+                </p>
+              </div>
+              <div className="flex flex-col gap-2">
+                <button type="button" onClick={() => setVisibleVectors?.(prev => ({ ...prev, process: prev.process === false }))} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
+                  {visibleVectors?.process === false ? 'Show overlay' : 'Hide overlay'}
+                </button>
+                <button type="button" onClick={() => requestMetric('process')} disabled={metricBusy || !processAvailable} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">
+                  Recalculate
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <p className="text-[12px] text-[var(--text-subtle)]">
+            Scope: {scopeLabel}
+            {calibrationReady && <> · Calibration: <span className="font-mono text-[var(--text-muted)]">{fmt(effectivePixelSize)} {pixelUnit} / px</span></>}
+          </p>
+        </div>
+      )}
+
+      <div className="ux-card space-y-2 p-3">
+        <div className="flex items-center justify-between gap-2">
+          <p className="text-[12px] font-semibold text-[var(--text)]">Scope</p>
+          {analysisRoi && <span className="font-mono text-[11px] text-[var(--accent)]">{Math.round(analysisRoi.width)} x {Math.round(analysisRoi.height)} px</span>}
+        </div>
+        <div className="grid grid-cols-2 gap-1 rounded-md border border-[var(--border)] bg-[var(--canvas-bg)] p-1">
+          <button onClick={() => setMetricScope('whole')} className={`rounded px-2 py-1 text-[12px] ${metricScope === 'whole' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}>Whole image</button>
+          <button
+            onClick={() => {
+              setMetricScope('selected')
+              if (!analysisRoi) onActivateAnalysisRoiTool?.()
+            }}
+            className={`rounded px-2 py-1 text-[12px] ${metricScope === 'selected' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}
+          >
+            Selected region
+          </button>
+        </div>
+        {metricScope === 'selected' && (
+          !analysisRoi ? (
+            <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary w-full text-[12px]"><ScanLine size={12} />Draw measurement region</button>
+          ) : (
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary text-[12px]"><ScanLine size={12} />Redraw region</button>
+              <button onClick={onClearAnalysisRoi} className="ux-button ux-button-ghost text-[12px]">Clear region</button>
+            </div>
+          )
+        )}
+        {selectedAnnotationRoi && (
+          <button onClick={onUseSelectedAnnotationRoi} className="ux-button ux-button-ghost w-full min-h-0 py-1 text-[12px]">Use selected annotation as measurement region</button>
+        )}
+      </div>
+
+      <details className="ux-card p-3" open={measurementSetupOpen || calibrationAttention}>
+        <summary className="cursor-pointer text-[12px] font-semibold text-[var(--text-muted)]">Measurement settings</summary>
+        <div className="mt-3 space-y-3">
+          {selectedTask?.models.nhs && (
+            <label className="block">
+              <span className="text-[12px] text-[var(--text-subtle)]">NHS model</span>
+              <select value={nhsMode} onChange={e => setNhsMode(e.target.value)} className="ux-select mt-1">
+                <option value="single-channel">NHS single-channel</option>
+                <option value="combined-actn4">NHS + ACTN4 input</option>
+              </select>
+            </label>
+          )}
+          <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-2 text-[12px]">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[var(--text-muted)]">Channels</span>
+              <button type="button" onClick={onEditMapping} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[11px]">Edit in Display</button>
+            </div>
+            <div className="mt-2 space-y-1">
+              {rolesForTask.map(role => {
+                const value = channelPayload[role]
+                return (
+                  <div key={role} className="flex items-center justify-between gap-2">
+                    <span className="text-[var(--text-subtle)]">{roleInfo(role).label}</span>
+                    <span className={value != null ? 'font-mono text-[var(--text)]' : 'text-amber-300'}>{value != null ? channelLabel(channelMapping, value) : 'Not assigned'}</span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+          {imgMeta.numZSlices > 1 && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-[12px] text-[var(--text-subtle)]">
+                <span>Measurement Z-slice</span>
+                <span className="font-mono text-[var(--text)]">{zIndex + 1} / {imgMeta.numZSlices}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={imgMeta.numZSlices - 1}
+                step={1}
+                value={zIndex}
+                onChange={e => onZIndexChange?.(clampIndex(e.target.value, imgMeta.numZSlices))}
+                className="w-full"
+              />
+            </div>
+          )}
+          <MeasurementCalibrationCard
+            open
+            onToggle={() => {}}
+            calibrationReady={calibrationReady}
+            attention={calibrationAttention && !calibrationReady}
+            pixelSize={pixelSize}
+            setPixelSize={value => {
+              setPixelSize(value)
+              setCalibrationAttention(false)
+            }}
+            pixelUnit={pixelUnit}
+            setPixelUnit={setPixelUnit}
+            expanded={expanded}
+            setExpanded={setExpanded}
+            expansionFactor={expansionFactor}
+            setExpansionFactor={setExpansionFactor}
+            effectivePixelSizeOverride={effectivePixelSizeOverride}
+            setEffectivePixelSizeOverride={value => {
+              setEffectivePixelSizeOverride(value)
+              setCalibrationAttention(false)
+            }}
+            effectivePixelSize={effectivePixelSize}
+            effectivePixelSizeSource={effectivePixelSizeSource}
+            pendingMetricIntent={pendingMetricIntent}
+            onContinue={continuePendingMetric}
+            inputRef={calibrationInputRef}
+          />
+        </div>
+      </details>
+
+      {sourceHasActn4 && (
+        <ProcessDegroupingPanel
+          value={watershed}
+          onChange={handleWatershedChange}
+          onApply={() => requestMetric('process')}
+          dirty={processSettingsDirty}
+          disabled={processBusy}
+          areaPreview={processMetric?.areaPreview}
+        />
+      )}
+
+      <AnalysisLayerPanel
+        overlayNames={overlayNames}
+        visibleOverlays={visibleOverlays}
+        setVisibleOverlays={setVisibleOverlays}
+        thickness={thickness}
+        processMetric={processMetric}
+        visibleVectors={visibleVectors}
+        setVisibleVectors={setVisibleVectors}
+      />
+
+      <AnalysisHistory
+        runs={reusableSavedRuns}
+        activeRunId={run?.runId}
+        metricsByRun={savedRunMetrics}
+        loading={savedRunsLoading}
+        open={historyOpen}
+        onToggleOpen={() => setHistoryOpen(value => !value)}
+        onRestore={selectSegmentationRun}
+        onDuplicateSettings={duplicateRunSettings}
+        onDelete={deleteSavedRun}
+        deletingRunId={deletingRunId}
+      />
+
+      <MetricResultCard
+        kind="thickness"
+        metric={thickness}
+        metricRun={metricRuns.thickness}
+        segmentationRun={thicknessResultSource}
+        segmentationArtifact={thicknessSegmentation}
+        staleReason={thicknessStale ? 'The measurement region or calibration changed after this value was calculated.' : null}
+        onRecompute={thicknessAvailable ? () => computeMetric('thickness') : null}
+      />
+
+      <MetricResultCard
+        kind="process"
+        metric={processMetric}
+        metricRun={metricRuns.process}
+        segmentationRun={processResultSource}
+        segmentationArtifact={processSegmentation}
+        staleReason={processStale ? 'The measurement region, calibration, or process-size range changed after this value was calculated.' : null}
+        onRecompute={processAvailable ? () => computeMetric('process') : null}
+      />
+
+      {(error || run?.error) && <p className="break-words text-[12px] leading-snug text-red-300">{error || run.error}</p>}
+    </div>
+  )
 
   return (
     <div className="space-y-3 px-3 py-3">
@@ -615,7 +1502,15 @@ export default function AnalysisPanel({
 
       {!selectedTask ? (
         <div className="space-y-2">
-          {TASKS.map(task => <TaskCard key={task.id} task={task} onClick={() => setTaskId(task.id)} />)}
+          <StepFrame step="1" title="Choose analysis" status="Recommended path">
+            <TaskCard task={TASKS.find(task => task.id === 'full')} onClick={() => setTaskId('full')} />
+            <div className="mt-4 space-y-2">
+              <p className="ux-section-label">Run a specific measurement only</p>
+              {TASKS.filter(task => task.id !== 'full').map(task => (
+                <TaskCard key={task.id} task={task} compact onClick={() => setTaskId(task.id)} />
+              ))}
+            </div>
+          </StepFrame>
           <AnalysisHistory
             runs={reusableSavedRuns}
             activeRunId={run?.runId}
@@ -636,46 +1531,45 @@ export default function AnalysisPanel({
             Analysis workflows
           </button>
 
-          <div>
-            <p className="text-sm font-semibold text-gray-100">{selectedTask.title}</p>
-            <p className="mt-1 text-[11px] leading-snug text-gray-500">{selectedTask.description}</p>
-          </div>
+          <StepFrame step="2" title="Confirm inputs" status={missingRoles.length || !calibrationReady ? 'Needs attention' : 'Ready'}>
+            <div>
+              <p className="text-sm font-semibold text-gray-100">{selectedTask.title}</p>
+              <p className="mt-1 text-[12px] leading-snug text-gray-500">{selectedTask.description}</p>
+            </div>
 
-          {selectedTask.models.nhs && (
-            <label className="block">
-              <span className="text-[10px] text-gray-500">NHS model</span>
-              <select value={nhsMode} onChange={e => setNhsMode(e.target.value)} className="ux-select mt-1">
-                <option value="single-channel">NHS single-channel</option>
-                <option value="combined-actn4">NHS + ACTN4 input</option>
-              </select>
-            </label>
-          )}
+            {selectedTask.models.nhs && (
+              <label className="mt-3 block">
+                <span className="text-[12px] text-gray-500">NHS model</span>
+                <select value={nhsMode} onChange={e => setNhsMode(e.target.value)} className="ux-select mt-1">
+                  <option value="single-channel">NHS single-channel</option>
+                  <option value="combined-actn4">NHS + ACTN4 input</option>
+                </select>
+              </label>
+            )}
 
-          <div className="space-y-2">
-            <p className="ux-section-label">Channel mapping</p>
-            {rolesForTask.map(role => {
-              const info = roleInfo(role)
-              const value = channelIndexForRole(channelMapping, role)
-              return (
-                <label key={role} className="block">
-                  <span className="text-[10px] text-gray-500">{info.label} channel</span>
-                  <select
-                    value={value ?? ''}
-                    onChange={e => onSetRoleChannel?.(role, Number(e.target.value))}
-                    className="ux-select mt-1"
-                  >
-                    <option value="" disabled>Choose channel</option>
-                    {Array.from({ length: numChannels }, (_, i) => (
-                      <option key={i} value={i}>{channelLabel(channelMapping, i)}</option>
-                    ))}
-                  </select>
-                </label>
-              )
-            })}
-          </div>
+            <div className="mt-3 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <p className="ux-section-label">Analysis inputs</p>
+                <button type="button" onClick={onEditMapping} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[11px]">
+                  Edit mapping
+                </button>
+              </div>
+              {preflightRows.map(row => (
+                <PreflightRow
+                  key={row.key}
+                  ready={row.ready}
+                  label={row.label}
+                  value={row.value}
+                  action={row.key === 'calibration' && !row.ready ? (
+                    <button type="button" onClick={() => setSettingsOpen(true)} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]">Edit</button>
+                  ) : null}
+                />
+              ))}
+            </div>
+          </StepFrame>
 
           <button onClick={() => setSettingsOpen(open => !open)} className="flex w-full items-center justify-between text-[11px] text-gray-500 hover:text-gray-200">
-            <span>Analysis settings</span>
+            <span>Edit analysis plane and calibration</span>
             {settingsOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           </button>
 
@@ -786,42 +1680,60 @@ export default function AnalysisPanel({
             </div>
           )}
 
-          {missingRoles.length > 0 && (
-            <p className="text-[10px] text-amber-300">Assign {missingRoles.map(role => roleInfo(role).label).join(', ')} before running.</p>
-          )}
+          <StepFrame step="3" title="Run segmentation and measurements" status={busy ? 'Running' : succeeded ? 'Segmentation ready' : 'Ready to run'}>
+            {missingRoles.length > 0 && (
+              <p className="mb-3 text-[12px] text-amber-300">Assign {missingRoles.map(role => roleInfo(role).label).join(', ')} before running.</p>
+            )}
 
-          {matchingSavedRun && (
-            <div className="ux-card space-y-2 p-3">
-              <div className="flex items-center gap-2">
-                <CheckCircle2 size={12} className="text-[var(--accent)]" />
-                <span className="min-w-0 flex-1 truncate text-[11px] text-gray-200">Saved {runSummary(matchingSavedRun)}</span>
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <button onClick={() => selectSegmentationRun(matchingSavedRun)} className="ux-button ux-button-secondary text-[10px]">Use saved</button>
-                <button onClick={() => deleteSavedRun(matchingSavedRun)} disabled={deletingRunId === matchingSavedRun.runId} className="ux-button ux-button-danger text-[10px]">
-                  {deletingRunId === matchingSavedRun.runId ? <Loader2 size={10} className="animate-spin" /> : <Trash2 size={10} />}
-                  Delete
-                </button>
-              </div>
-            </div>
-          )}
-
-          <button onClick={startRun} disabled={!canRun} className={`ux-button w-full ${canRun ? 'ux-button-primary' : 'ux-button-secondary cursor-not-allowed opacity-50'}`}>
-            {busy ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
-            {busy ? 'Running segmentation...' : matchingSavedRun ? 'Run segmentation again' : 'Run segmentation'}
-          </button>
+            <button onClick={startRun} disabled={!canRun} className={`ux-button w-full ${canRun ? 'ux-button-primary' : 'ux-button-secondary cursor-not-allowed opacity-50'}`}>
+              {busy ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+              {busy
+                ? 'Running analysis...'
+                : selectedTask.id === 'full'
+                  ? 'Run full analysis'
+                  : matchingSavedRun
+                    ? 'Run segmentation again'
+                    : 'Run segmentation'}
+            </button>
+            {matchingSavedRun && (
+              <button type="button" onClick={() => selectSegmentationRun(matchingSavedRun)} className="ux-button ux-button-secondary mt-2 w-full text-[12px]">
+                Restore newest matching result
+              </button>
+            )}
+          </StepFrame>
         </div>
       )}
 
-      {run?.progress && busy && (
-        <div className="text-[10px] text-gray-500">
-          <span className="text-gray-400">{run.progress.current || 'Queued'}</span>
-          {run.progress.completed?.length > 0 && <span> / {run.progress.completed.join(', ')}</span>}
-        </div>
-      )}
+      {run?.progress && busy && <AnalysisProgressCard run={run} selectedTask={selectedTask} />}
 
-      {succeeded && (
+      {showMeasurements && (
         <div className="space-y-3">
+          {analysisComplete && (
+            <StepFrame step="4" title="Review results" status="Needs QC review">
+              <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-2 text-[12px]">
+                <span className="text-[var(--text-muted)]">GBM thickness</span>
+                <span className="font-mono text-[var(--text)]">{fmt(thickness?.meanThickness)} {thickness?.unit || 'um'}</span>
+                <span className="text-[var(--text-muted)]">Process NND</span>
+                <span className="font-mono text-[var(--text)]">{fmt(processMetric?.meanDistance)} {processMetric?.unit || 'um'}</span>
+                <span className="text-[var(--text-muted)]">Processes retained</span>
+                <span className="font-mono text-[var(--text)]">
+                  {fmtCount(processMetric?.areaFilter?.includedProcessCount ?? processMetric?.nndIncludedProcessCount ?? processMetric?.processCount)}
+                  {' / '}
+                  {fmtCount(processMetric?.areaFilter?.totalProcessCount ?? processMetric?.processCount)}
+                </span>
+                <span className="text-[var(--text-muted)]">Excluded by area filter</span>
+                <span className="font-mono text-[var(--text)]">{fmtCount(processMetric?.areaFilter?.excludedProcessCount)}</span>
+                <span className="text-[var(--text-muted)]">Scope</span>
+                <span className="font-mono text-[var(--text)]">{metricScope === 'selected' && analysisRoi ? 'Analysis ROI' : 'Whole image'}</span>
+                <span className="text-[var(--text-muted)]">Z-slice</span>
+                <span className="font-mono text-[var(--text)]">{imgMeta.numZSlices > 1 ? `${zIndex + 1} of ${imgMeta.numZSlices}` : 'Single slice'}</span>
+              </div>
+              <button type="button" onClick={onReviewQc} className="ux-button ux-button-primary mt-3 w-full text-[12px]">
+                Review segmentation QC
+              </button>
+            </StepFrame>
+          )}
+
           <div className="ux-card space-y-2 p-3">
             <div className="flex items-center justify-between gap-2">
               <p className="text-[11px] font-semibold text-gray-200">Measurement scope</p>
@@ -829,43 +1741,106 @@ export default function AnalysisPanel({
             </div>
             <div className="grid grid-cols-2 gap-1 rounded-md border border-[var(--border)] bg-[var(--canvas-bg)] p-1">
               <button onClick={() => setMetricScope('whole')} className={`rounded px-2 py-1 text-[10px] ${metricScope === 'whole' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}>Whole image</button>
-              <button onClick={() => setMetricScope('selected')} disabled={!analysisRoi} className={`rounded px-2 py-1 text-[10px] ${metricScope === 'selected' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)] disabled:opacity-40'}`}>Analysis ROI</button>
+              <button
+                onClick={() => {
+                  setMetricScope('selected')
+                  if (!analysisRoi) onActivateAnalysisRoiTool?.()
+                }}
+                className={`rounded px-2 py-1 text-[10px] ${metricScope === 'selected' ? 'bg-[var(--accent-soft)] text-[var(--accent)]' : 'text-[var(--text-subtle)] hover:text-[var(--text)]'}`}
+              >
+                Analysis ROI
+              </button>
             </div>
-            <div className="grid grid-cols-2 gap-2">
-              <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary text-[10px]"><ScanLine size={11} />Draw ROI</button>
-              <button onClick={onClearAnalysisRoi} disabled={!analysisRoi} className="ux-button ux-button-ghost text-[10px]">Clear ROI</button>
-            </div>
+            {metricScope === 'whole' && analysisRoi && (
+              <p className="text-[9px] leading-snug text-gray-600">Saved ROI available. Switch to Analysis ROI to use it.</p>
+            )}
+            {metricScope === 'selected' && (
+              <div className="space-y-2">
+                {!analysisRoi ? (
+                  <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary w-full text-[10px]"><ScanLine size={11} />Draw ROI</button>
+                ) : (
+                  <div className="grid grid-cols-2 gap-2">
+                    <button onClick={onActivateAnalysisRoiTool} className="ux-button ux-button-secondary text-[10px]"><ScanLine size={11} />Redraw ROI</button>
+                    <button onClick={onClearAnalysisRoi} className="ux-button ux-button-ghost text-[10px]">Clear ROI</button>
+                  </div>
+                )}
+              </div>
+            )}
             {selectedAnnotationRoi && (
-              <button onClick={onUseSelectedAnnotationRoi} className="ux-button ux-button-ghost w-full min-h-0 py-1 text-[10px]">Use selected rectangle annotation as ROI</button>
+              <button onClick={onUseSelectedAnnotationRoi} className="ux-button ux-button-ghost w-full min-h-0 py-1 text-[12px]">Use selected annotation as analysis ROI</button>
             )}
           </div>
 
-          {hasActn4 && (
+          <MeasurementCalibrationCard
+            open={measurementSetupOpen}
+            onToggle={() => setMeasurementSetupOpen(open => !open)}
+            calibrationReady={calibrationReady}
+            attention={calibrationAttention && !calibrationReady}
+            pixelSize={pixelSize}
+            setPixelSize={value => {
+              setPixelSize(value)
+              setCalibrationAttention(false)
+            }}
+            pixelUnit={pixelUnit}
+            setPixelUnit={setPixelUnit}
+            expanded={expanded}
+            setExpanded={setExpanded}
+            expansionFactor={expansionFactor}
+            setExpansionFactor={setExpansionFactor}
+            effectivePixelSizeOverride={effectivePixelSizeOverride}
+            setEffectivePixelSizeOverride={value => {
+              setEffectivePixelSizeOverride(value)
+              setCalibrationAttention(false)
+            }}
+            effectivePixelSize={effectivePixelSize}
+            effectivePixelSizeSource={effectivePixelSizeSource}
+            pendingMetricIntent={pendingMetricIntent}
+            onContinue={continuePendingMetric}
+            inputRef={calibrationInputRef}
+          />
+
+          {sourceHasActn4 && (
             <ProcessDegroupingPanel
               value={watershed}
               onChange={handleWatershedChange}
-              onApply={() => computeMetric('process')}
+              onApply={() => requestMetric('process')}
               dirty={processSettingsDirty}
               disabled={processBusy}
+              areaPreview={processMetric?.areaPreview}
             />
           )}
 
-          {hasNhs && hasActn4 && (
-            <button onClick={computeAllAvailable} disabled={metricBusy || !calibrationReady} className="ux-button ux-button-primary w-full text-[11px]">
+          <div className="space-y-2">
+            <MetricSourceLine kind="thickness" source={metricSources.thickness} busy={thicknessBusy} metric={thickness} />
+            <MetricSourceLine kind="process" source={metricSources.process} busy={processBusy} metric={processMetric} />
+          </div>
+
+          {sourceHasNhs && sourceHasActn4 && (
+            <button onClick={computeAllAvailable} disabled={metricBusy} className="ux-button ux-button-primary w-full text-[11px]">
               {metricBusy ? <Loader2 size={11} className="animate-spin" /> : <Play size={11} />}
-              Compute all measurements
+              {metricBusy ? 'Measurement running...' : 'Compute all measurements'}
             </button>
           )}
 
           <div className="grid grid-cols-2 gap-2">
-            <button onClick={() => computeMetric('thickness')} disabled={metricBusy || !hasNhs || !calibrationReady} className="ux-button ux-button-secondary text-[11px]">
-              {thicknessBusy ? <Loader2 size={11} className="animate-spin" /> : <Ruler size={11} />}
-              GBM thickness
-            </button>
-            <button onClick={() => computeMetric('process')} disabled={metricBusy || !hasActn4 || !calibrationReady} className="ux-button ux-button-secondary text-[11px]">
-              {processBusy ? <Loader2 size={11} className="animate-spin" /> : <Waypoints size={11} />}
-              {processSettingsDirty ? 'Recompute Process NND' : 'Process NND'}
-            </button>
+            <div className="space-y-1">
+              <button onClick={() => requestMetric('thickness')} disabled={metricBusy || !thicknessAvailable} className="ux-button ux-button-secondary w-full text-[11px]">
+                {thicknessBusy ? <Loader2 size={11} className="animate-spin" /> : <Ruler size={11} />}
+                {thicknessStale ? 'Recompute GBM' : 'GBM thickness'}
+              </button>
+              {!thicknessAvailable && (
+                <p className="text-[9px] leading-snug text-amber-300">Run NHS segmentation to calculate GBM thickness.</p>
+              )}
+            </div>
+            <div className="space-y-1">
+              <button onClick={() => requestMetric('process')} disabled={metricBusy || !processAvailable} className="ux-button ux-button-secondary w-full text-[11px]">
+                {processBusy ? <Loader2 size={11} className="animate-spin" /> : <Waypoints size={11} />}
+                {processSettingsDirty || processStale ? 'Recompute NND' : 'Process NND'}
+              </button>
+              {!processAvailable && (
+                <p className="text-[9px] leading-snug text-amber-300">Run ACTN4 segmentation to calculate Process NND.</p>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -884,20 +1859,24 @@ export default function AnalysisPanel({
         kind="thickness"
         metric={thickness}
         metricRun={metricRuns.thickness}
-        segmentationRun={run}
-        segmentationArtifact={nhsSegmentation}
+        segmentationRun={thicknessResultSource}
+        segmentationArtifact={thicknessSegmentation}
         vectorVisible={visibleVectors?.thickness}
         onToggleVector={() => setVisibleVectors?.(prev => ({ ...prev, thickness: prev.thickness === false }))}
+        staleReason={thicknessStale ? 'The ROI or calibration has changed since this value was calculated.' : null}
+        onRecompute={thicknessAvailable ? () => computeMetric('thickness') : null}
       />
 
       <MetricResultCard
         kind="process"
         metric={processMetric}
         metricRun={metricRuns.process}
-        segmentationRun={run}
-        segmentationArtifact={actn4Segmentation}
+        segmentationRun={processResultSource}
+        segmentationArtifact={processSegmentation}
         vectorVisible={visibleVectors?.process}
         onToggleVector={() => setVisibleVectors?.(prev => ({ ...prev, process: prev.process === false }))}
+        staleReason={processStale ? 'The ROI, calibration, or degrouping settings have changed since this value was calculated.' : null}
+        onRecompute={processAvailable ? () => computeMetric('process') : null}
       />
 
       {(error || run?.error) && <p className="break-words text-[10px] leading-snug text-red-300">{error || run.error}</p>}

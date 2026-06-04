@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import {
   X,
-  Save,
   Download,
   MousePointer,
   Circle,
@@ -23,8 +22,8 @@ import {
   Info,
   PanelRightClose,
   PanelRightOpen,
-  Plus,
   RotateCcw,
+  ScanLine,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react'
@@ -51,7 +50,6 @@ const API = '/agh/api'
 const TOOLS = [
   { id: 'select',   icon: MousePointer, label: 'Select' },
   { id: 'pan',      icon: Hand,         label: 'Pan - Hold Space' },
-  { id: 'analysis-roi', icon: Square,      label: 'Analysis ROI' },
   { id: 'point',    icon: Circle,       label: 'Point' },
   { id: 'line',     icon: Minus,        label: 'Line' },
   { id: 'arrow',    icon: ArrowRight,   label: 'Arrow' },
@@ -61,13 +59,14 @@ const TOOLS = [
   { id: 'text',     icon: Type,         label: 'Text' },
 ]
 
+const ANNOTATION_TOOL_IDS = ['point', 'line', 'arrow', 'rect', 'ellipse', 'freehand', 'text']
+
 const COLORS = ['#ffee55','#ff4444','#44ff88','#44aaff','#ff44ff','#ffffff','#ff8800']
 
 const SIDEBAR_TABS = [
-  { id: 'view', label: 'Display' },
-  { id: 'analyze', label: 'Analysis' },
-  { id: 'annotate', label: 'Annotations' },
-  { id: 'export', label: 'Export' },
+  { id: 'display', label: 'Display' },
+  { id: 'measurements', label: 'Measurements' },
+  { id: 'report', label: 'Report' },
 ]
 
 function defaultChSettings(n, mapping = defaultChannelMapping(n)) {
@@ -104,7 +103,15 @@ async function fetchJson(url, options = {}) {
   return body
 }
 
-export default function ImageViewer({ caseId, filename, onClose, files = [], onNavigateFile }) {
+export default function ImageViewer({
+  caseId,
+  filename,
+  onClose,
+  files = [],
+  onNavigateFile,
+  initialTab = 'display',
+  onMeasurementStatusChange,
+}) {
   // Image metadata
   const [imgMeta, setImgMeta]           = useState(null)
   // Channel display settings [{enabled, minVal, maxVal}]
@@ -129,14 +136,17 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
   // Tools
   const [activeTool, setActiveTool]     = useState('select')
   const [annColor, setAnnColor]         = useState('#ffee55')
-  const [fontSize, setFontSize]         = useState(18)
+  const [fontSize]                     = useState(18)
   const [annotator, setAnnotator]       = useState(() => localStorage.getItem('annotatorName') || '')
   // Annotations panel
   const [showAnnPanel, setShowAnnPanel] = useState(true)
-  const [sidebarTab, setSidebarTab]     = useState('view')
+  const [sidebarTab, setSidebarTab]     = useState(initialTab || 'display')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [annotationToolsOpen, setAnnotationToolsOpen] = useState(false)
   // About modal
   const [showAbout, setShowAbout]       = useState(false)
+  const [toast, setToast]               = useState(null)
+  const [reportNote, setReportNote]     = useState('')
   // Export
   const [exporting, setExporting]       = useState(false)
   // MagnifySeg analysis
@@ -155,6 +165,16 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
   const panRafRef   = useRef(null)
   const undoStackRef = useRef([])
   const redoStackRef = useRef([])
+
+  useEffect(() => {
+    setSidebarTab(initialTab || 'display')
+  }, [initialTab, filename])
+
+  useEffect(() => {
+    if (!toast) return
+    const id = window.setTimeout(() => setToast(null), 2600)
+    return () => window.clearTimeout(id)
+  }, [toast])
 
   const fitToViewport = useCallback((meta) => {
     if (!meta || !viewportRef.current) return
@@ -193,6 +213,7 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
         setViewerZIndex(0)
         setDisplayProjection('slice')
         setAnalysisRoi(null)
+        setReportNote('')
         const savedMapping = localStorage.getItem(`agh-channel-map-${caseId}`)
         let mapping = defaultChannelMapping(meta.numChannels)
         if (savedMapping) {
@@ -294,7 +315,8 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
 
   const handleEditAnnotation = useCallback((id) => {
     setSelectedId(id)
-    setSidebarTab('annotate')
+    setSidebarTab('display')
+    setAnnotationToolsOpen(true)
     setSidebarCollapsed(false)
   }, [])
 
@@ -396,6 +418,13 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
 
   // ── Annotator name persistence ─────────────────────────────────────────────
   useEffect(() => { localStorage.setItem('annotatorName', annotator) }, [annotator])
+
+  useEffect(() => {
+    if (!onMeasurementStatusChange || !analysisRun?.status) return
+    if (analysisRun.status === 'QUEUED' || analysisRun.status === 'RUNNING') onMeasurementStatusChange('Measurements processing')
+    else if (analysisRun.status === 'SUCCEEDED') onMeasurementStatusChange('Measurements available')
+    else if (analysisRun.status === 'FAILED') onMeasurementStatusChange('Measurements need attention')
+  }, [analysisRun?.status, onMeasurementStatusChange])
 
   useEffect(() => {
     if (!imgMeta) return
@@ -529,7 +558,11 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
 
   const selectedAnn = annotations.find(a => a.id === selectedId)
   const selectedAnnotationRoi = rectAnnotationToRoi(selectedAnn)
-  const displayFontSize = selectedAnn?.type === 'text' ? (selectedAnn.fontSize || fontSize) : fontSize
+  const useSelectedAnnotationAsRoi = useCallback(() => {
+    if (!selectedAnnotationRoi) return
+    setAnalysisRoi(selectedAnnotationRoi)
+    setToast('Measurement region updated. Existing measurements may need recalculation.')
+  }, [selectedAnnotationRoi])
   const panActive = spacePan || activeTool === 'pan'
   const isDrawTool = activeTool !== 'select' && activeTool !== 'pan' && !spacePan
   const transform = `translate(${tx}px, ${ty}px) scale(${scale})`
@@ -542,6 +575,28 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
         ? 'Saved just now'
         : 'Saved'
   const activeMappedChannels = channelMapping.filter(item => item.role !== 'unassigned')
+  const analysisBusy = ['QUEUED', 'RUNNING'].includes(analysisRun?.status)
+  const measurementStatusLabel = analysisBusy
+    ? 'Measurements processing...'
+    : analysisRun?.status === 'SUCCEEDED'
+      ? 'Measurements available'
+      : analysisRun?.status === 'FAILED'
+        ? 'Measurements need attention'
+        : 'Measurements not calculated'
+  const measurementTabLabel = analysisBusy
+    ? 'Measurements processing...'
+    : analysisRun?.status === 'SUCCEEDED'
+      ? 'Measurements available'
+      : 'Measurements'
+  const filePositionLabel = currentFileIndex >= 0 && files.length
+    ? `Image ${currentFileIndex + 1} of ${files.length}`
+    : 'Image'
+  const zPlaneLabel = imgMeta?.numZSlices > 1
+    ? `Z ${viewerZIndex + 1}/${imgMeta.numZSlices}`
+    : 'Single Z'
+  const roiBadgeLabel = analysisRoi
+    ? `Measurement region ${Math.round(analysisRoi.width)} x ${Math.round(analysisRoi.height)} px`
+    : 'Scope: whole image'
   const analysisZIndex = Number(analysisRun?.request?.zIndex)
   const analysisPlaneAligned = !analysisRun?.runId || (
     displayProjection === 'slice'
@@ -553,35 +608,103 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
     if (dirty && !window.confirm('Discard unsaved annotations?')) return
     onClose()
   }
+  const annotationModeActive = annotationToolsOpen || ANNOTATION_TOOL_IDS.includes(activeTool)
 
   return (
     <div className="viewer-shell fixed inset-0 z-50 flex">
       <div className="viewer-tool-rail w-12 flex-shrink-0 flex flex-col items-center gap-1 border-r py-3">
-        {TOOLS.slice(0, 3).map(({ id, icon: Icon, label }) => (
+        {TOOLS.slice(0, 2).map(({ id, icon: Icon, label }) => (
           <button key={id} title={label} onClick={() => setActiveTool(id)}
             className={`ux-tool-button ${activeTool === id ? 'ux-tool-button-active' : ''}`}>
             <Icon size={16} />
           </button>
         ))}
         <div className="ux-divider mt-2 h-px w-8" />
-        {TOOLS.slice(3).map(({ id, icon: Icon, label }) => (
+        <button onClick={() => fitToViewport(imgMeta)}
+          className="ux-tool-button"
+          title="Fit image">
+          <RotateCcw size={16} />
+        </button>
+        <button onClick={() => zoomAroundCenter(1 / 1.18)}
+          className="ux-tool-button"
+          title="Zoom out">
+          <ZoomOut size={16} />
+        </button>
+        <button onClick={() => zoomAroundCenter(1.18)}
+          className="ux-tool-button"
+          title="Zoom in">
+          <ZoomIn size={16} />
+        </button>
+        <div className="ux-divider my-2 h-px w-8" />
+        <button
+          type="button"
+          onClick={() => {
+            setAnnotationToolsOpen(open => !open)
+            setSidebarTab('display')
+          }}
+          className={`ux-tool-button ${annotationModeActive ? 'ux-tool-button-active' : ''}`}
+          title="Annotate"
+          aria-expanded={annotationModeActive}
+        >
+          <PenLine size={16} />
+        </button>
+        {annotationModeActive && TOOLS.filter(tool => ANNOTATION_TOOL_IDS.includes(tool.id)).map(({ id, icon: Icon, label }) => (
           <button key={id} title={label} onClick={() => setActiveTool(id)}
             className={`ux-tool-button ${activeTool === id ? 'ux-tool-button-active' : ''}`}>
             <Icon size={16} />
           </button>
         ))}
+        <div className="ux-divider my-2 h-px w-8" />
+        <button
+          type="button"
+          onClick={() => {
+            setActiveTool('analysis-roi')
+            setSidebarTab('measurements')
+          }}
+          className={`ux-tool-button ${activeTool === 'analysis-roi' ? 'ux-tool-button-active' : ''}`}
+          title="Select measurement region"
+        >
+          <ScanLine size={16} />
+        </button>
       </div>
 
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="viewer-commandbar flex flex-shrink-0 items-center gap-1.5 px-2">
+        <div className="viewer-commandbar flex flex-shrink-0 items-center gap-2 px-2">
           <button onClick={requestClose}
             className="ux-button ux-button-ghost">
             <ChevronLeft size={14} />
             Back
           </button>
           <div className="min-w-0 flex-1 px-2">
-            <p className="truncate text-xs text-gray-200">{caseId} / {filename}</p>
+            <p className="truncate text-sm font-semibold text-gray-100">{caseId} / {filePositionLabel}</p>
+            <p className="truncate text-[12px] text-[var(--text-subtle)]">{filename}</p>
           </div>
+          <span className="ux-badge ux-badge-neutral">{zPlaneLabel}</span>
+          <span className={`ux-badge ${analysisRun?.status === 'FAILED' ? 'ux-badge-danger' : analysisRun?.status === 'SUCCEEDED' ? 'ux-badge-success' : analysisBusy ? 'ux-badge-neutral' : 'ux-badge-neutral'}`}>
+            {analysisBusy && <Loader2 size={12} className="animate-spin" />}
+            {measurementStatusLabel}
+          </span>
+          <span className="ux-badge ux-badge-neutral hidden xl:inline-flex">{roiBadgeLabel}</span>
+          <div className="flex items-center gap-1">
+            {[
+              ['display', 'Display'],
+              ['measurements', measurementTabLabel],
+              ['report', 'Report'],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => {
+                  setSidebarCollapsed(false)
+                  setSidebarTab(id)
+                }}
+                className={`ux-button ${sidebarTab === id ? 'ux-button-secondary' : 'ux-button-ghost'}`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <div className="ux-divider mx-1 h-5 w-px" />
           <button onClick={() => navigateFile(previousFile)} disabled={!previousFile}
             className="ux-button ux-button-ghost">
             <ChevronLeft size={14} />
@@ -593,26 +716,10 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
             <ChevronRight size={14} />
           </button>
           <div className="ux-divider mx-1 h-5 w-px" />
-          <button onClick={() => fitToViewport(imgMeta)}
-            className="ux-button ux-button-ghost">
-            <RotateCcw size={13} />
-            Fit
-          </button>
           <button onClick={setActualSize}
             className="ux-button ux-button-ghost font-mono">
             {zoomLabel}
           </button>
-          <button onClick={() => zoomAroundCenter(1 / 1.18)}
-            className="ux-icon-button"
-            title="Zoom out">
-            <ZoomOut size={13} />
-          </button>
-          <button onClick={() => zoomAroundCenter(1.18)}
-            className="ux-icon-button"
-            title="Zoom in">
-            <ZoomIn size={13} />
-          </button>
-          <div className="ux-divider mx-1 h-5 w-px" />
           <span className={`ux-badge ${dirty ? 'ux-badge-warning' : 'ux-badge-success'}`}>
             {saveLabel}
           </span>
@@ -682,6 +789,10 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                   onEditAnnotation={handleEditAnnotation}
                   analysisRoi={analysisRoi}
                   setAnalysisRoi={setAnalysisRoi}
+                  onAnalysisRoiDrawn={() => {
+                    setActiveTool('select')
+                    setToast('Measurement region updated. Existing measurements may need recalculation.')
+                  }}
                 />
               )}
             </div>
@@ -700,6 +811,21 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
             </div>
           )}
         </div>
+        <div className="viewer-job-tray flex flex-shrink-0 items-center justify-between gap-3 px-4 py-2">
+          <div className="min-w-0 flex items-center gap-3 text-[12px] text-[var(--text-muted)]">
+            <span className="font-semibold text-[var(--text)]">Measurements</span>
+            {analysisBusy ? (
+              <span className="flex items-center gap-2"><Loader2 size={13} className="animate-spin text-[var(--accent)]" />Processing...</span>
+            ) : analysisRun?.status === 'SUCCEEDED' ? (
+              <span className="text-[var(--success)]">Updated</span>
+            ) : analysisRun?.status === 'FAILED' ? (
+              <span className="text-[var(--danger)]">Needs attention</span>
+            ) : (
+              <span>Not calculated</span>
+            )}
+          </div>
+          <span className="text-[12px] text-[var(--text-subtle)]">Annotation changes {dirty ? 'saving' : 'saved'}</span>
+        </div>
       </div>
 
       {!sidebarCollapsed && (
@@ -714,7 +840,7 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
           </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto">
-            {sidebarTab === 'view' && (
+            {sidebarTab === 'display' && (
               <div className="px-3 py-3 space-y-4">
                 {imgMeta?.numZSlices > 1 && (
                   <div className="ux-card space-y-2 p-3">
@@ -792,52 +918,28 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                     onMappingChange={updateChannelRole}
                   />
                 </div>
-              </div>
-            )}
-
-            {sidebarTab === 'analyze' && (
-              <AnalysisPanel
-                caseId={caseId}
-                filename={filename}
-                imgMeta={imgMeta}
-                channelMapping={channelMapping}
-                onSetRoleChannel={setRoleChannel}
-                zIndex={viewerZIndex}
-                onZIndexChange={setViewerZIndex}
-                displayProjection={displayProjection}
-                onDisplayProjectionChange={setDisplayProjection}
-                analysisRoi={analysisRoi}
-                onClearAnalysisRoi={() => setAnalysisRoi(null)}
-                selectedAnnotationRoi={selectedAnnotationRoi}
-                onUseSelectedAnnotationRoi={() => selectedAnnotationRoi && setAnalysisRoi(selectedAnnotationRoi)}
-                onActivateAnalysisRoiTool={() => setActiveTool('analysis-roi')}
-                run={analysisRun}
-                setRun={setAnalysisRun}
-                visibleOverlays={visibleAnalysisOverlays}
-                setVisibleOverlays={setVisibleAnalysisOverlays}
-                visibleVectors={visibleAnalysisVectors}
-                setVisibleVectors={setVisibleAnalysisVectors}
-                thickness={thicknessMetric}
-                setThickness={setThicknessMetric}
-                processMetric={processMetric}
-                setProcessMetric={setProcessMetric}
-              />
-            )}
-
-            {sidebarTab === 'annotate' && (
-              <div className="px-3 py-3 space-y-4">
-                <div>
-                  <div className="flex items-center gap-2 mb-1">
-                    <User size={12} className="text-gray-500" />
-                    <span className="ux-section-label">Annotator</span>
-                  </div>
-                  <input value={annotator} onChange={e => setAnnotator(e.target.value)}
-                    placeholder="Your name..."
-                    className="ux-input" />
-                </div>
 
                 <div className="ux-card p-3 space-y-3">
-                  <p className="ux-section-label">Drawing style</p>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="ux-section-label">Annotations</p>
+                    <button
+                      type="button"
+                      onClick={() => setAnnotationToolsOpen(open => !open)}
+                      className={`ux-button min-h-0 px-2 py-1 text-[11px] ${annotationModeActive ? 'ux-button-secondary' : 'ux-button-ghost'}`}
+                    >
+                      <PenLine size={12} />
+                      Annotate
+                    </button>
+                  </div>
+                  <div>
+                    <div className="mb-1 flex items-center gap-2">
+                      <User size={12} className="text-gray-500" />
+                      <span className="text-[12px] text-[var(--text-subtle)]">Reviewer name</span>
+                    </div>
+                    <input value={annotator} onChange={e => setAnnotator(e.target.value)}
+                      placeholder="Your name..."
+                      className="ux-input" />
+                  </div>
                   <div className="flex flex-wrap gap-2">
                     {COLORS.map(c => (
                       <button
@@ -852,139 +954,159 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
                       />
                     ))}
                   </div>
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] text-[var(--text-subtle)]">
-                      {selectedAnn?.type === 'text' ? 'Selected text size' : 'Text size'}
-                    </span>
-                    <div className="flex items-center gap-1">
-                      <button
-                        onClick={() => {
-                          if (selectedAnn?.type === 'text') setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, fontSize: Math.max(8, (a.fontSize || fontSize) - 2) } : a))
-                          else setFontSize(s => Math.max(8, s - 2))
-                        }}
-                        className="ux-icon-button h-7 w-7"
-                        title="Decrease text size"
-                      >
-                        <Minus size={13} />
-                      </button>
-                      <span className="w-8 text-center font-mono text-[11px] text-[var(--text)]">{displayFontSize}</span>
-                      <button
-                        onClick={() => {
-                          if (selectedAnn?.type === 'text') setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, fontSize: Math.min(200, (a.fontSize || fontSize) + 2) } : a))
-                          else setFontSize(s => Math.min(200, s + 2))
-                        }}
-                        className="ux-icon-button h-7 w-7"
-                        title="Increase text size"
-                      >
-                        <Plus size={13} />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="ux-card p-3 space-y-2">
-                  <p className="ux-section-label">Selected annotation</p>
                   {selectedAnn ? (
-                    <>
-                      <div className="grid grid-cols-2 gap-2 text-[10px] text-gray-500">
-                        <span>Type</span>
-                        <span className="text-right text-gray-200">{selectedAnn.type}</span>
-                        <span>Color</span>
-                        <span className="text-right">
-                          <span className="inline-block w-3 h-3 rounded-full align-middle" style={{ background: selectedAnn.color }} />
-                        </span>
+                    <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-2">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <span className="text-[12px] font-semibold text-[var(--text)]">Selected {selectedAnn.type}</span>
+                        <button onClick={deleteSelected} className="ux-button ux-button-danger min-h-0 px-2 py-1 text-[11px]">
+                          <Trash2 size={12} />
+                          Delete
+                        </button>
                       </div>
                       <label className="block">
-                        <span className="text-[10px] text-gray-500">{selectedAnn.type === 'text' ? 'Text' : 'Label / note'}</span>
+                        <span className="text-[12px] text-[var(--text-subtle)]">{selectedAnn.type === 'text' ? 'Text' : 'Label / note'}</span>
                         <input
                           value={selectedAnn.label || ''}
                           onChange={e => updateSelectedAnnotation({ label: e.target.value })}
                           className="ux-input mt-1"
                         />
                       </label>
-                      <button onClick={deleteSelected}
-                        className="ux-button ux-button-danger w-full">
-                        <Trash2 size={12} />
-                        Delete annotation
-                      </button>
-                    </>
-                  ) : (
-                    <p className="text-[10px] text-gray-600">Select an annotation to edit details.</p>
-                  )}
-                </div>
-
-                <div className="ux-card">
-                  <button onClick={() => setShowAnnPanel(p => !p)}
-                    className="w-full flex items-center justify-between px-3 py-2 text-[11px] text-gray-500 hover:text-gray-300 transition-colors">
-                    <span className="flex items-center gap-1.5">
-                      <List size={10} />
-                      Annotations ({annotations.length})
-                    </span>
-                    {showAnnPanel ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
-                  </button>
-                  {showAnnPanel && (
-                    <div className="max-h-64 overflow-y-auto px-2 pb-2 space-y-0.5">
-                      {annotations.length === 0 ? (
-                        <p className="text-[10px] text-gray-600 text-center py-2 italic">No annotations yet</p>
-                      ) : annotations.map(a => (
-                        <div key={a.id}
-                          onClick={() => setSelectedId(a.id === selectedId ? null : a.id)}
-                          className={`flex items-center gap-1.5 rounded px-2 py-1.5 cursor-pointer text-[10px] group transition-colors
-                            ${a.id === selectedId ? 'bg-[var(--accent-soft)] text-[var(--text)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-hover)]'}`}>
-                          <span className="w-2 h-2 rounded-full flex-shrink-0 ring-1 ring-white/20" style={{ background: a.color }} />
-                          <span className="flex-1 min-w-0 truncate">{a.type}{a.label ? `: ${a.label}` : ''}</span>
-                          <button title="Edit" onClick={e => { e.stopPropagation(); handleEditAnnotation(a.id) }}
-                            className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 p-0.5 flex-shrink-0 transition-opacity">
-                            <Pencil size={9} />
-                          </button>
-                          <button title="Delete" onClick={e => { e.stopPropagation(); deleteAnnotation(a.id) }}
-                            className="opacity-0 group-hover:opacity-100 text-gray-500 hover:text-red-400 p-0.5 flex-shrink-0 transition-opacity">
-                            <Trash2 size={9} />
-                          </button>
-                        </div>
-                      ))}
                     </div>
+                  ) : (
+                    <p className="text-[12px] text-[var(--text-subtle)]">Select an annotation to edit details.</p>
                   )}
-                </div>
-
-                <div className="flex flex-col gap-2">
-                  <button onClick={saveAnnotations} disabled={!dirty || saving}
-                    className={`ux-button w-full ${dirty && !saving ? 'ux-button-primary' : 'ux-button-secondary cursor-not-allowed opacity-50'}`}>
-                    <Save size={13} /> {saving ? 'Saving...' : dirty ? 'Save Annotations' : 'Saved'}
-                  </button>
-                  {saveError && <p className="text-[10px] text-red-300 leading-snug">{saveError}</p>}
+                  <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)]">
+                    <button onClick={() => setShowAnnPanel(p => !p)}
+                      className="flex w-full items-center justify-between px-3 py-2 text-[12px] text-[var(--text-muted)] hover:text-[var(--text)]">
+                      <span className="flex items-center gap-2">
+                        <List size={12} />
+                        Annotations ({annotations.length})
+                      </span>
+                      {showAnnPanel ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                    </button>
+                    {showAnnPanel && (
+                      <div className="max-h-56 overflow-y-auto px-2 pb-2 space-y-1">
+                        {annotations.length === 0 ? (
+                          <p className="py-2 text-center text-[12px] text-[var(--text-subtle)]">No annotations yet</p>
+                        ) : annotations.map(a => (
+                          <div key={a.id}
+                            onClick={() => setSelectedId(a.id === selectedId ? null : a.id)}
+                            className={`flex cursor-pointer items-center gap-2 rounded px-2 py-2 text-[12px]
+                              ${a.id === selectedId ? 'bg-[var(--accent-soft)] text-[var(--text)]' : 'text-[var(--text-muted)] hover:bg-[var(--surface-hover)]'}`}>
+                            <span className="h-2.5 w-2.5 flex-shrink-0 rounded-full ring-1 ring-white/20" style={{ background: a.color }} />
+                            <span className="min-w-0 flex-1 truncate">{a.type}{a.label ? `: ${a.label}` : ''}</span>
+                            <button title="Edit" onClick={e => { e.stopPropagation(); handleEditAnnotation(a.id) }}
+                              className="ux-icon-button h-8 w-8 flex-shrink-0">
+                              <Pencil size={12} />
+                            </button>
+                            <button title="Delete" onClick={e => { e.stopPropagation(); deleteAnnotation(a.id) }}
+                              className="ux-icon-button h-8 w-8 flex-shrink-0 text-[var(--danger)]">
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {saveError && <p className="text-[12px] leading-snug text-red-300">{saveError}</p>}
                 </div>
               </div>
             )}
 
-            {sidebarTab === 'export' && (
-              <div className="px-3 py-3 space-y-3">
-                <button onClick={() => exportPDF(true)} disabled={exporting}
-                  className="ux-button ux-button-primary w-full">
-                  <Download size={13} /> Export annotated PDF
-                </button>
-                <button onClick={() => exportPDF(false)} disabled={exporting}
-                  className="ux-button ux-button-secondary w-full">
-                  <Download size={13} /> Export image only
-                </button>
-                {exportSegmentationEntries.length > 0 && (
-                  <div className="ux-card p-3 space-y-2">
-                    <p className="ux-section-label">Segmentation TIFF</p>
+            {sidebarTab === 'measurements' && (
+              <AnalysisPanel
+                caseId={caseId}
+                filename={filename}
+                imgMeta={imgMeta}
+                channelMapping={channelMapping}
+                onSetRoleChannel={setRoleChannel}
+                zIndex={viewerZIndex}
+                onZIndexChange={setViewerZIndex}
+                displayProjection={displayProjection}
+                onDisplayProjectionChange={setDisplayProjection}
+                analysisRoi={analysisRoi}
+                onClearAnalysisRoi={() => setAnalysisRoi(null)}
+                selectedAnnotationRoi={selectedAnnotationRoi}
+                onUseSelectedAnnotationRoi={useSelectedAnnotationAsRoi}
+                onActivateAnalysisRoiTool={() => setActiveTool('analysis-roi')}
+                onEditMapping={() => setSidebarTab('display')}
+                run={analysisRun}
+                setRun={setAnalysisRun}
+                visibleOverlays={visibleAnalysisOverlays}
+                setVisibleOverlays={setVisibleAnalysisOverlays}
+                visibleVectors={visibleAnalysisVectors}
+                setVisibleVectors={setVisibleAnalysisVectors}
+                thickness={thicknessMetric}
+                setThickness={setThicknessMetric}
+                processMetric={processMetric}
+                setProcessMetric={setProcessMetric}
+              />
+            )}
+
+            {sidebarTab === 'report' && (
+              <div className="px-3 py-3 space-y-4">
+                <div className="ux-card space-y-3 p-3">
+                  <div>
+                    <p className="ux-section-label">Report</p>
+                    <p className="mt-1 text-[12px] leading-snug text-[var(--text-muted)]">Kidney measurement summary for this image.</p>
+                  </div>
+                  <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
+                    <p className="text-[12px] font-semibold text-[var(--text)]">Kidney measurement summary</p>
+                    <div className="mt-3 grid grid-cols-[1fr_auto] gap-x-3 gap-y-2 text-[12px]">
+                      <span className="text-[var(--text-muted)]">GBM thickness</span>
+                      <span className="font-mono text-[var(--text)]">
+                        {Number.isFinite(Number(thicknessMetric?.meanThickness)) ? Number(thicknessMetric.meanThickness).toFixed(3) : 'Not calculated'} {thicknessMetric?.unit || 'um'}
+                      </span>
+                      <span className="text-[var(--text-muted)]">Process nearest-neighbor distance</span>
+                      <span className="font-mono text-[var(--text)]">
+                        {Number.isFinite(Number(processMetric?.meanDistance)) ? Number(processMetric.meanDistance).toFixed(3) : 'Not calculated'} {processMetric?.unit || 'um'}
+                      </span>
+                      <span className="text-[var(--text-muted)]">Scope</span>
+                      <span className="font-mono text-[var(--text)]">{analysisRoi ? 'Selected region' : 'Whole image'}</span>
+                    </div>
+                  </div>
+                  <label className="block">
+                    <span className="text-[12px] text-[var(--text-subtle)]">Clinical note</span>
+                    <textarea
+                      value={reportNote}
+                      onChange={e => setReportNote(e.target.value)}
+                      rows={4}
+                      placeholder="Add note..."
+                      className="ux-input mt-1 resize-none"
+                    />
+                  </label>
+                  <button onClick={() => exportPDF(true)} disabled={exporting}
+                    className="ux-button ux-button-primary w-full">
+                    <Download size={13} /> Export measurement report
+                  </button>
+                </div>
+
+                <details className="ux-card p-3">
+                  <summary className="cursor-pointer text-[12px] font-semibold text-[var(--text-muted)]">Technical exports</summary>
+                  <div className="mt-3 space-y-2">
+                    <button onClick={() => exportPDF(false)} disabled={exporting}
+                      className="ux-button ux-button-secondary w-full">
+                      <Download size={13} /> Image-only PDF
+                    </button>
                     {exportSegmentationEntries.map(([model, artifact]) => (
                       <a key={model}
                         href={`${API}/analysis-runs/${encodeURIComponent(analysisRun.runId)}/artifacts/${encodeURIComponent(artifact)}`}
-                        className="ux-button ux-button-secondary flex w-full justify-between text-[10px]">
-                        <span className="truncate">{model}</span>
-                        <Download size={10} />
+                        className="ux-button ux-button-secondary flex w-full justify-between text-[12px]">
+                        <span className="truncate">{model} segmentation TIFF</span>
+                        <Download size={12} />
                       </a>
                     ))}
+                    {!exportSegmentationEntries.length && (
+                      <p className="text-[12px] text-[var(--text-subtle)]">No technical artifacts are available yet.</p>
+                    )}
                   </div>
-                )}
+                </details>
+
                 <div className="pt-2 border-t border-[var(--border)] flex items-center justify-between">
                   <span className="ux-meta font-mono">v0.1</span>
                   <button onClick={() => setShowAbout(true)}
-                    className="flex items-center gap-1 text-[9px] text-gray-600 hover:text-gray-300 transition-colors">
-                    <Info size={9} /> About
+                    className="flex items-center gap-1 text-[12px] text-[var(--text-subtle)] hover:text-gray-300 transition-colors">
+                    <Info size={12} /> About
                   </button>
                 </div>
               </div>
@@ -1030,7 +1152,12 @@ export default function ImageViewer({ caseId, filename, onClose, files = [], onN
           </div>
         </div>
       )}
+
+      {toast && (
+        <div className="pointer-events-none fixed bottom-12 left-1/2 z-[70] -translate-x-1/2 rounded border border-[var(--border-strong)] bg-[var(--surface-1)] px-4 py-2 text-[12px] text-[var(--text)] shadow-xl">
+          {toast}
+        </div>
+      )}
     </div>
   )
 }
-

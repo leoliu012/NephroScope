@@ -7,7 +7,8 @@ export async function fetchJson(url, options = {}) {
   return body
 }
 
-export function artifactUrl(runId, artifactPath) {
+export function artifactUrl(runId, artifactPath, revision = null) {
   const encodedPath = String(artifactPath).split('/').map(encodeURIComponent).join('/')
-  return `${API}/analysis-runs/${encodeURIComponent(runId)}/artifacts/${encodedPath}`
+  const query = revision ? `?rev=${encodeURIComponent(revision)}` : ''
+  return `${API}/analysis-runs/${encodeURIComponent(runId)}/artifacts/${encodedPath}${query}`
 }
