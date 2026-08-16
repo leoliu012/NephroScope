@@ -13,14 +13,15 @@ class PathGuardTests(unittest.TestCase):
         self.case = self.root / "case A"
         self.case.mkdir()
         (self.case / "image.tif").write_bytes(b"fake")
+        (self.case / "stack.nd2").write_bytes(b"fake")
         (self.case / "notes.txt").write_text("nope", encoding="utf-8")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_lists_only_direct_cases_and_tiffs(self):
+    def test_lists_only_direct_cases_and_supported_images(self):
         self.assertEqual(list_cases(self.root), ["case A"])
-        self.assertEqual(list_tiff_files(self.root, "case A"), ["image.tif"])
+        self.assertEqual(list_tiff_files(self.root, "case A"), ["image.tif", "stack.nd2"])
 
     def test_rejects_case_traversal(self):
         with self.assertRaises(BadRequest):

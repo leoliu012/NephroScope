@@ -15,10 +15,9 @@ Thumbs.db
 *:Zone.Identifier
 *:encryptable
 .agh_watcher_state.json
+.patch_backups/
+.last_*_patch_backup
+src_dump*.txt
+dump-folder.mjs
 backend/annotations/
-backend/.local_data/agh_annotations
-backend/.local_data/agh_cache
-backend/.local_data/agh_models
-backend/.local_data/agh_analysis
-
-
+backend/.local_data/

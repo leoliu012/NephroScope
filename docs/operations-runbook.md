@@ -14,6 +14,19 @@ sudo journalctl -u agh_backend -f
 sudo systemctl restart agh_backend
 ```
 
+## Dependency Check
+
+If opening an ND2 file reports `ND2 support is not installed on this server`,
+install the locked backend dependencies into the same virtualenv used by the
+systemd service, then restart the API:
+
+```bash
+cd /home/ubuntu/agh-viewer/backend
+/home/ubuntu/agh-viewer/venv/bin/python -m pip install -r requirements.lock.txt
+/home/ubuntu/agh-viewer/venv/bin/python -c "import nd2; print(nd2.__version__)"
+sudo systemctl restart agh_backend
+```
+
 ## Apache Check
 
 ```bash
@@ -29,18 +42,16 @@ Back up `/data/agh_annotations` before backend upgrades that change annotation b
 sudo tar -C /data -czf /data/agh_annotations-$(date +%Y%m%d-%H%M%S).tgz agh_annotations
 ```
 
-## Cache Cleanup
+## Remote Image Sync Recovery
 
-The cache can be rebuilt from raw TIFF files. If disk pressure is high:
+Check that the remote share is mounted on the backend host, then inspect and
+restart the cache worker:
 
 ```bash
-sudo systemctl stop agh_backend
-sudo find /data/agh_cache -mindepth 1 -maxdepth 2 -type d -mtime +30 -print
-sudo systemctl start agh_backend
+systemctl status agh_image_sync
+sudo journalctl -u agh_image_sync -n 100
+sudo systemctl restart agh_image_sync
 ```
 
-Review the printed paths before deleting. The application will regenerate missing channel PNGs on demand.
-
-## Watcher Recovery
-
-If the Windows watcher was stopped or the NAS was unavailable, restart it. Startup reconciliation compares local TIFF signatures against `.agh_watcher_state.json` and queues changed files automatically.
+The worker runs an initial reconciliation after restart. Admins can also use
+**Administration → Image sync → Sync now** after the mount is available.

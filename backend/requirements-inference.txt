@@ -1,5 +1,0 @@
--r requirements.txt
-tensorflow>=2.15
-scikit-image>=0.22
-scipy>=1.11
-opencv-python-headless>=4.8

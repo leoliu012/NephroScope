@@ -1,0 +1,22 @@
+[Unit]
+Description=AGH Viewer remote image cache synchronizer
+After=network.target remote-fs.target
+Wants=remote-fs.target
+# Create this file with AGH_REMOTE_DATA_ROOT before enabling the worker.
+ConditionPathExists=/etc/agh-viewer/image-sync.env
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agh-viewer/backend
+Environment="AGH_DATA_ROOT=/data/AGH_APP"
+Environment="AGH_ANN_ROOT=/data/agh_annotations"
+Environment="AGH_STATE_DIR=/home/ubuntu/agh-viewer/state"
+EnvironmentFile=/etc/agh-viewer/image-sync.env
+Environment="PATH=/home/ubuntu/agh-viewer/venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/agh-viewer/venv/bin/python /home/ubuntu/agh-viewer/backend/sync_images.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

@@ -3,6 +3,7 @@ from pathlib import Path
 from .errors import BadRequest, NotFound
 
 
+IMAGE_EXTS = {".tif", ".tiff", ".nd2"}
 TIFF_EXTS = {".tif", ".tiff"}
 
 
@@ -26,11 +27,15 @@ def ensure_simple_name(value: str, label: str) -> str:
     return value
 
 
-def ensure_tiff_name(filename: str) -> str:
+def ensure_image_name(filename: str) -> str:
     filename = ensure_simple_name(filename, "filename")
-    if Path(filename).suffix.lower() not in TIFF_EXTS:
-        raise BadRequest("Only .tif and .tiff files are supported")
+    if Path(filename).suffix.lower() not in IMAGE_EXTS:
+        raise BadRequest("Only .tif, .tiff, and .nd2 files are supported")
     return filename
+
+
+def ensure_tiff_name(filename: str) -> str:
+    return ensure_image_name(filename)
 
 
 def list_cases(data_root: Path) -> list[str]:
@@ -53,7 +58,7 @@ def case_dir(data_root: Path, case: str) -> Path:
 
 
 def image_path(data_root: Path, case: str, filename: str) -> Path:
-    filename = ensure_tiff_name(filename)
+    filename = ensure_image_name(filename)
     directory = case_dir(data_root, case)
     path = resolve_under_root(directory, filename)
     if not path.is_file():
@@ -62,9 +67,13 @@ def image_path(data_root: Path, case: str, filename: str) -> Path:
 
 
 def list_tiff_files(data_root: Path, case: str) -> list[str]:
+    return list_image_files(data_root, case)
+
+
+def list_image_files(data_root: Path, case: str) -> list[str]:
     directory = case_dir(data_root, case)
     return sorted(
         child.name
         for child in directory.iterdir()
-        if child.is_file() and child.suffix.lower() in TIFF_EXTS
+        if child.is_file() and child.suffix.lower() in IMAGE_EXTS
     )

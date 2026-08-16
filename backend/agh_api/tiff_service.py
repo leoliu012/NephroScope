@@ -1,9 +1,17 @@
-import hashlib
-import json
-import os
-import uuid
+"""TIFF metadata and browser-display transcoding.
+
+The viewer intentionally does not perform image analysis or scientific image
+preprocessing. The PNG preview endpoint selects the first displayable source
+plane. The raw-channel endpoint exposes one selected channel plane as immutable
+little-endian bytes so the browser can apply reversible display-only controls.
+"""
+from collections import OrderedDict
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+import threading
+import math
+import re
 from xml.etree import ElementTree
 
 import numpy as np
@@ -11,32 +19,103 @@ import tifffile
 from PIL import Image
 
 from .errors import BadRequest, UnsupportedTiff
-from .file_lock import file_lock
 
-METADATA_REQUIRED_KEYS = {
-    "cacheKey",
-    "sourceRelPath",
-    "sourceSize",
-    "sourceMtimeNs",
-    "numChannels",
-    "numZSlices",
-    "axes",
-    "width",
-    "height",
-    "pixelSize",
-    "pixelUnit",
-    "sampleDtype",
-    "bitsPerSample",
-}
+try:
+    import nd2
+except ImportError:  # pragma: no cover - exercised only without optional dependency
+    nd2 = None
 
+
+RAW_DISPLAY_POLICY = "first-plane-no-preprocessing"
+RAW_CHANNEL_DISPLAY_POLICY = "selected-raw-channel-client-display-controls"
+PREVIEW_DISPLAY_POLICY = "bounded-auto-window-display-preview"
+DEFAULT_PIXEL_SIZE_UM = 0.106872
+DEFAULT_PREVIEW_MAX_SIZE = 1400
+MAX_PREVIEW_MAX_SIZE = 2400
+PREVIEW_COLOR = (255, 255, 255)
 
 @dataclass(frozen=True)
-class CacheContext:
-    key: str
-    directory: Path
-    rel_path: str
-    size: int
-    mtime_ns: int
+class RawChannelBundle:
+    channels: tuple[bytes, ...]
+    byte_count: int
+
+
+class RawChannelCache:
+    """Bounded in-process cache for decoded raw channel payloads."""
+
+    def __init__(self, max_bytes: int = 512 * 1024 * 1024):
+        self.max_bytes = max(0, int(max_bytes or 0))
+        self._cache = OrderedDict()
+        self._current_bytes = 0
+        self._inflight = {}
+        self._lock = threading.RLock()
+
+    def channel_bytes(self, filepath: Path, channel_index: int, z_index: int = 0):
+        if isinstance(channel_index, bool) or not isinstance(channel_index, int) or channel_index < 0:
+            raise BadRequest("channel index must be a non-negative integer")
+        z_index = _z_index(z_index)
+
+        bundle = self._bundle(filepath, z_index)
+        if channel_index >= len(bundle.channels):
+            raise BadRequest(f"channel index must be between 0 and {len(bundle.channels) - 1}")
+        return BytesIO(bundle.channels[channel_index])
+
+    def _bundle(self, filepath: Path, z_index: int = 0):
+        key = _raw_channel_cache_key(filepath, z_index)
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                self._cache.move_to_end(key)
+                return cached
+
+            state = self._inflight.get(key)
+            if state is None:
+                state = {
+                    "event": threading.Event(),
+                    "bundle": None,
+                    "error": None,
+                }
+                self._inflight[key] = state
+                builder = True
+            else:
+                builder = False
+
+        if builder:
+            try:
+                bundle = _build_raw_channel_bundle(filepath, z_index)
+                with self._lock:
+                    state["bundle"] = bundle
+                    self._store_locked(key, bundle)
+            except Exception as exc:
+                with self._lock:
+                    state["error"] = exc
+            finally:
+                with self._lock:
+                    state["event"].set()
+                    self._inflight.pop(key, None)
+
+        if not builder:
+            state["event"].wait()
+
+        if state["error"] is not None:
+            raise state["error"]
+        if state["bundle"] is None:
+            raise RuntimeError("Raw channel cache did not produce a channel bundle")
+        return state["bundle"]
+
+    def _store_locked(self, key, bundle):
+        if self.max_bytes <= 0 or bundle.byte_count > self.max_bytes:
+            return
+
+        previous = self._cache.pop(key, None)
+        if previous is not None:
+            self._current_bytes -= previous.byte_count
+
+        self._cache[key] = bundle
+        self._current_bytes += bundle.byte_count
+        while self._current_bytes > self.max_bytes and self._cache:
+            _, evicted = self._cache.popitem(last=False)
+            self._current_bytes -= evicted.byte_count
 
 
 def infer_axes(shape):
@@ -48,361 +127,732 @@ def infer_axes(shape):
             return "YXC"
         if shape[0] <= 8:
             return "CYX"
-        return "ZYX"
+        return "IYX"
     if ndim == 4:
-        if shape[0] <= 8:
-            return "CZYX"
-        if shape[1] <= 8:
-            return "ZCYX"
         if shape[-1] <= 4:
-            return "ZYXC"
-        return "CZYX"
-    if ndim == 5:
-        if shape[0] == 1 and shape[1] <= 8:
-            return "TCZYX"
-        if shape[0] == 1 and shape[2] <= 8:
-            return "TZCYX"
+            return "IYXC"
+        if shape[0] <= 8:
+            return "CIYX"
+        if shape[1] <= 8:
+            return "ICYX"
     return ""
 
 
-def normalise_shape_to_czyx(shape, axes=""):
-    return normalise_shape_to_czyx_with_axes(shape, axes)[0]
+def get_metadata(filepath: Path):
+    path = Path(filepath)
+    if _is_nd2(path):
+        return _get_nd2_metadata(path)
+    st = path.stat()
+    with tifffile.TiffFile(path) as tf:
+        series = _display_series(tf)
+        axes = _axes_for_shape(series.shape, series.axes)
+        axes = _z_display_axes(series.shape, axes)
+        height, width = _image_dimensions(series.shape, axes)
+        sample_dtype, bits_per_sample = _read_sample_info(series)
+        channel_count = _channel_count(series.shape, axes)
+        channel_value_min, channel_value_max = _channel_value_range(series.dtype)
+        pixel_size = _read_pixel_size_um(tf, series)
+    return {
+        "sourceRelPath": path.name,
+        "sourceFormat": "TIFF",
+        "sourceSize": st.st_size,
+        "sourceMtimeNs": st.st_mtime_ns,
+        "axes": axes,
+        "width": int(width),
+        "height": int(height),
+        "sampleDtype": sample_dtype,
+        "bitsPerSample": bits_per_sample,
+        "displayPolicy": RAW_DISPLAY_POLICY,
+        "channelCount": int(channel_count),
+        "channelAxis": "C" if "C" in axes else None,
+        "channelDtype": sample_dtype,
+        "channelBitsPerSample": bits_per_sample,
+        "channelValueMin": channel_value_min,
+        "channelValueMax": channel_value_max,
+        "channelByteOrder": "little",
+        "channelDisplayPolicy": RAW_CHANNEL_DISPLAY_POLICY,
+        "zCount": int(_z_count(series.shape, axes)),
+        "zAxis": "Z" if "Z" in axes else None,
+        "zIndex": 0,
+        "timeCount": int(_axis_count(series.shape, axes, "T")),
+        "previewDisplayPolicy": PREVIEW_DISPLAY_POLICY,
+        "pixelSizeUm": pixel_size["x"],
+        "pixelSizeXUm": pixel_size["x"],
+        "pixelSizeYUm": pixel_size["y"],
+        "pixelSizeSource": pixel_size["source"],
+        "pixelSizeIsDefault": pixel_size["isDefault"],
+    }
 
 
-def normalise_shape_to_czyx_with_axes(shape, axes=""):
-    dims = list(shape)
-    source_axes = (axes or "").upper()
-    axes = _prepare_axes(axes, dims)
-
-    dims, axes = _drop_extra_singletons(dims, axes)
-    if "Y" not in axes or "X" not in axes:
-        axes = infer_axes(dims)
-    dims, axes = _prepare_czyx_axes(dims, axes)
-
-    order = [axes.index(axis) for axis in "CZYX"]
-    return tuple(dims[i] for i in order), "".join(axes), source_axes
-
-
-def load_channels(filepath: Path):
+def render_raw_image_png(filepath: Path):
+    """Encode the first source plane as PNG without scientific preprocessing."""
+    if _is_nd2(filepath):
+        plane = _nd2_channel_plane(filepath, 0, 0)
+        image = _raw_image_from_array(plane)
+        buf = BytesIO()
+        image.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
     with tifffile.TiffFile(filepath) as tf:
-        series = tf.series[0]
-        axes = (series.axes or "").upper()
+        series = _display_series(tf)
+        axes = _axes_for_shape(series.shape, series.axes)
+        axes = _z_display_axes(series.shape, axes)
         data = series.asarray()
-    return normalise_array_to_channels(data, axes)
+
+    plane = _first_displayable_plane(data, axes)
+    image = _raw_image_from_array(plane)
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
 
 
-def load_raw_plane(filepath: Path, channel_index: int, z_index: int = 0) -> np.ndarray:
-    """Return one raw YX plane from a TIFF without applying MIP or display scaling."""
-    if channel_index < 0:
-        raise BadRequest("Channel index must be non-negative")
-    if z_index < 0:
-        raise BadRequest("Z-slice index must be non-negative")
+def render_raw_channel_bytes(filepath: Path, channel_index: int, z_index: int = 0):
+    """Return one channel plane as immutable raw bytes for browser composition."""
+    if _is_nd2(filepath):
+        plane = _nd2_channel_plane(filepath, channel_index, _z_index(z_index))
+        raw = _raw_channel_array(plane)
+        buf = BytesIO(raw.tobytes(order="C"))
+        buf.seek(0)
+        return buf
+
     with tifffile.TiffFile(filepath) as tf:
-        series = tf.series[0]
-        axes = (series.axes or "").upper()
+        series = _display_series(tf)
+        axes = _axes_for_shape(series.shape, series.axes)
+        axes = _z_display_axes(series.shape, axes)
+        plane = _read_raw_channel_plane(series, axes, channel_index, _z_index(z_index))
+
+    raw = _raw_channel_array(plane)
+    buf = BytesIO(raw.tobytes(order="C"))
+    buf.seek(0)
+    return buf
+
+def render_preview_png(filepath: Path, max_size: int = DEFAULT_PREVIEW_MAX_SIZE, z_index: int = 0):
+    """Render a bounded display preview for browsing over slower connections."""
+    max_size = _preview_max_size(max_size)
+    if _is_nd2(filepath):
+        return _render_nd2_preview_png(filepath, max_size, _z_index(z_index))
+
+    with tifffile.TiffFile(filepath) as tf:
+        series = _display_series(tf)
+        axes = _axes_for_shape(series.shape, series.axes)
+        axes = _z_display_axes(series.shape, axes)
         data = series.asarray()
-    czyx = normalise_array_to_czyx(data, axes)
-    if channel_index >= czyx.shape[0]:
-        raise BadRequest("Channel index out of range")
-    if z_index >= czyx.shape[1]:
-        raise BadRequest("Z-slice index out of range")
-    return czyx[channel_index, z_index].astype(np.float32, copy=False)
 
-
-def normalise_array_to_czyx(data, axes=""):
     arr = np.asarray(data)
-    axes = _prepare_axes(axes, list(arr.shape))
-    arr, axes = _drop_array_extra_singletons(arr, axes)
+    axes = _axes_for_shape(arr.shape, axes)
+    height, width = _image_dimensions(arr.shape, axes)
+    target_width, target_height = _preview_dimensions(width, height, max_size)
+    channel_count = _channel_count(arr.shape, axes)
+    output = np.zeros((target_height, target_width, 3), dtype=np.float32)
 
-    if "Y" not in axes or "X" not in axes:
-        axes = infer_axes(arr.shape)
+    for channel_index in _preview_visible_channels(channel_count):
+        plane = _raw_channel_array(_raw_channel_plane(arr, axes, channel_index, _z_index(z_index)))
+        thumbnail = _resize_preview_plane(plane, target_width, target_height)
+        intensity = 1.0 - (_auto_window_uint8(thumbnail).astype(np.float32) / 255.0)
+        color = _preview_color(channel_count, channel_index)
+        output[..., 0] += intensity * color[0]
+        output[..., 1] += intensity * color[1]
+        output[..., 2] += intensity * color[2]
 
-    arr, axes = _prepare_array_czyx_axes(arr, axes)
-    order = [axes.index(axis) for axis in "CZYX"]
-    return np.transpose(arr, order)
-
-
-def normalise_array_to_channels(data, axes=""):
-    czyx = normalise_array_to_czyx(data, axes)
-    mip = czyx.max(axis=1)
-    return [mip[c].astype(np.float32, copy=False) for c in range(mip.shape[0])]
-
-
-def auto_scale(channel, lo_pct=0.0, hi_pct=99.5):
-    lo = float(np.percentile(channel, lo_pct))
-    hi = float(np.percentile(channel, hi_pct))
-    if hi <= lo:
-        return np.zeros(channel.shape, dtype=np.uint8)
-    scaled = (channel - lo) / (hi - lo) * 255.0
-    return np.clip(scaled, 0, 255).astype(np.uint8)
+    image = Image.fromarray(np.clip(output, 0, 255).astype(np.uint8), mode="RGB")
+    buf = BytesIO()
+    image.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
 
 
-def _prepare_axes(axes, dims):
+
+def _raw_channel_cache_key(filepath: Path, z_index: int = 0):
+    path = Path(filepath)
+    stat = path.stat()
+    return (str(path.resolve()), stat.st_size, stat.st_mtime_ns, int(z_index or 0))
+
+
+def _build_raw_channel_bundle(filepath: Path, z_index: int = 0):
+    if _is_nd2(filepath):
+        return _build_nd2_raw_channel_bundle(filepath, z_index)
+
+    with tifffile.TiffFile(filepath) as tf:
+        series = _display_series(tf)
+        axes = _axes_for_shape(series.shape, series.axes)
+        axes = _z_display_axes(series.shape, axes)
+        channel_count = _channel_count(series.shape, axes)
+        channels = []
+        byte_count = 0
+        for channel_index in range(channel_count):
+            plane = _read_raw_channel_plane(series, axes, channel_index, _z_index(z_index))
+            raw = _raw_channel_array(plane)
+            payload = raw.tobytes(order="C")
+            channels.append(payload)
+            byte_count += len(payload)
+    return RawChannelBundle(tuple(channels), byte_count)
+
+def _axes_for_shape(shape, axes):
     axes = (axes or "").upper()
-    if len(axes) != len(dims):
-        axes = infer_axes(dims)
-    if not axes or len(axes) != len(dims):
-        raise UnsupportedTiff(f"Cannot infer TIFF axes for shape {tuple(dims)}")
+    if len(axes) != len(shape):
+        axes = infer_axes(shape)
+    if not axes or len(axes) != len(shape):
+        raise UnsupportedTiff(f"Cannot infer TIFF axes for shape {tuple(shape)}")
     if "S" in axes and "C" not in axes:
         axes = axes.replace("S", "C")
     return axes
 
 
-def _drop_extra_singletons(dims, axes):
-    i = 0
-    dims = list(dims)
-    axes = list(axes)
-    while i < len(dims):
-        axis = axes[i]
-        if axis not in "CZYX":
-            if dims[i] == 1:
-                del dims[i]
-                del axes[i]
-                continue
-            raise UnsupportedTiff(f"Unsupported non-singleton TIFF axis {axis}")
-        i += 1
-    return dims, "".join(axes)
+def _display_series(tf):
+    series = getattr(tf, "series", None) or []
+    if not series:
+        raise UnsupportedTiff("TIFF does not contain an image series")
+    return series[0]
 
 
-def _drop_array_extra_singletons(arr, axes):
-    i = 0
-    axes = list(axes)
-    while i < arr.ndim:
-        axis = axes[i]
-        if axis not in "CZYX":
-            if arr.shape[i] == 1:
-                arr = np.take(arr, 0, axis=i)
-                del axes[i]
-                continue
-            raise UnsupportedTiff(f"Unsupported non-singleton TIFF axis {axis}")
-        i += 1
-    return arr, "".join(axes)
+def _z_display_axes(shape, axes):
+    """Treat unlabelled multi-page image stacks as Z for viewer navigation."""
+    if "Z" in axes or "I" not in axes:
+        return axes
+    if "Y" not in axes or "X" not in axes:
+        return axes
+    if "C" in axes and shape[axes.index("I")] <= 1:
+        return axes
+    return axes.replace("I", "Z", 1)
 
 
-def _prepare_czyx_axes(dims, axes):
-    dims = list(dims)
-    axes = list(axes)
+def _image_dimensions(shape, axes):
+    if "Y" in axes and "X" in axes:
+        return shape[axes.index("Y")], shape[axes.index("X")]
+    if len(shape) >= 2:
+        return shape[-2], shape[-1]
+    raise UnsupportedTiff(f"Cannot infer image dimensions for shape {tuple(shape)}")
+
+
+def _channel_count(shape, axes):
     if "C" not in axes:
-        dims.insert(0, 1)
-        axes.insert(0, "C")
-    if "Z" not in axes:
-        insert_at = axes.index("C") + 1
-        dims.insert(insert_at, 1)
-        axes.insert(insert_at, "Z")
-    unknown = [axis for axis in axes if axis not in "CZYX"]
-    if unknown:
-        raise UnsupportedTiff(f"Unsupported TIFF axes: {''.join(unknown)}")
-    return dims, "".join(axes)
+        return 1
+    return shape[axes.index("C")]
 
 
-def _prepare_array_czyx_axes(arr, axes):
-    axes = list(axes)
+def _axis_count(shape, axes, axis):
+    return int(shape[axes.index(axis)]) if axis in axes else 1
+
+
+def _z_count(shape, axes):
+    return _axis_count(shape, axes, "Z")
+
+
+def _z_index(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 0
+    if number < 0:
+        raise BadRequest("z index must be a non-negative integer")
+    return number
+
+
+def _is_nd2(filepath: Path):
+    return Path(filepath).suffix.lower() == ".nd2"
+
+
+def _require_nd2():
+    if nd2 is None:
+        raise UnsupportedTiff("ND2 support is not installed on this server")
+
+
+def _get_nd2_metadata(path: Path):
+    _require_nd2()
+    st = path.stat()
+    with nd2.ND2File(path) as ndfile:
+        sizes = dict(ndfile.sizes)
+        dtype = np.dtype(ndfile.dtype)
+        width = int(sizes.get("X") or getattr(ndfile.attributes, "widthPx", 0) or 0)
+        height = int(sizes.get("Y") or getattr(ndfile.attributes, "heightPx", 0) or 0)
+        channel_count = int(sizes.get("C") or 1)
+        z_count = int(sizes.get("Z") or 1)
+        time_count = int(sizes.get("T") or 1)
+        pixel_size = _read_nd2_pixel_size_um(ndfile)
+        channel_value_min, channel_value_max = _channel_value_range(dtype)
+        axes = "".join(sizes.keys()) or "YX"
+
+    if width <= 0 or height <= 0:
+        raise UnsupportedTiff("Cannot infer ND2 image dimensions")
+
+    return {
+        "sourceRelPath": path.name,
+        "sourceFormat": "ND2",
+        "sourceSize": st.st_size,
+        "sourceMtimeNs": st.st_mtime_ns,
+        "axes": axes,
+        "width": width,
+        "height": height,
+        "sampleDtype": str(dtype),
+        "bitsPerSample": int(dtype.itemsize * 8),
+        "displayPolicy": RAW_DISPLAY_POLICY,
+        "channelCount": channel_count,
+        "channelAxis": "C" if channel_count > 1 else None,
+        "channelDtype": str(dtype),
+        "channelBitsPerSample": int(dtype.itemsize * 8),
+        "channelValueMin": channel_value_min,
+        "channelValueMax": channel_value_max,
+        "channelByteOrder": "little",
+        "channelDisplayPolicy": RAW_CHANNEL_DISPLAY_POLICY,
+        "zCount": z_count,
+        "zAxis": "Z" if z_count > 1 else None,
+        "zIndex": 0,
+        "timeCount": time_count,
+        "previewDisplayPolicy": PREVIEW_DISPLAY_POLICY,
+        "pixelSizeUm": pixel_size["x"],
+        "pixelSizeXUm": pixel_size["x"],
+        "pixelSizeYUm": pixel_size["y"],
+        "pixelSizeSource": pixel_size["source"],
+        "pixelSizeIsDefault": pixel_size["isDefault"],
+    }
+
+
+def _read_nd2_pixel_size_um(ndfile):
+    try:
+        voxel = ndfile.voxel_size()
+        x = _positive_number(getattr(voxel, "x", None))
+        y = _positive_number(getattr(voxel, "y", None))
+    except Exception:
+        x = y = None
+    completed = _complete_pixel_size(x, y, "ND2 voxel size")
+    if completed:
+        x_value, y_value, source = completed
+        return {"x": x_value, "y": y_value, "source": source, "isDefault": False}
+    return {
+        "x": DEFAULT_PIXEL_SIZE_UM,
+        "y": DEFAULT_PIXEL_SIZE_UM,
+        "source": "default",
+        "isDefault": True,
+    }
+
+
+def _build_nd2_raw_channel_bundle(filepath: Path, z_index: int = 0):
+    _require_nd2()
+    z_index = _z_index(z_index)
+
+    # Open the ND2 once and read each underlying frame once, rather than
+    # re-opening the file (and re-reading frames) for every channel. Opening an
+    # ND2 is expensive, so this is the dominant cost when scrubbing Z on a
+    # multi-channel stack.
+    with nd2.ND2File(filepath) as ndfile:
+        sizes = dict(ndfile.sizes)
+        channel_count = int(sizes.get("C") or 1)
+        z_count = int(sizes.get("Z") or 1)
+        if z_index >= z_count:
+            raise BadRequest(f"z index must be between 0 and {z_count - 1}")
+
+        channel_looped = _nd2_channel_is_looped(ndfile)
+        frame_cache: dict[int, np.ndarray] = {}
+        channels = []
+        byte_count = 0
+        for channel_index in range(channel_count):
+            frame_index = _nd2_frame_index(ndfile, channel_index, z_index)
+            frame = frame_cache.get(frame_index)
+            if frame is None:
+                frame = np.asarray(ndfile.read_frame(frame_index))
+                frame_cache[frame_index] = frame
+            plane = _nd2_plane_from_frame(frame, sizes, channel_index, channel_looped)
+            raw = _raw_channel_array(np.array(plane, copy=True))
+            payload = raw.tobytes(order="C")
+            channels.append(payload)
+            byte_count += len(payload)
+    return RawChannelBundle(tuple(channels), byte_count)
+
+
+def _nd2_channel_plane(filepath: Path, channel_index: int, z_index: int = 0):
+    _require_nd2()
+    if isinstance(channel_index, bool) or not isinstance(channel_index, int) or channel_index < 0:
+        raise BadRequest("channel index must be a non-negative integer")
+    z_index = _z_index(z_index)
+
+    with nd2.ND2File(filepath) as ndfile:
+        sizes = dict(ndfile.sizes)
+        channel_count = int(sizes.get("C") or 1)
+        z_count = int(sizes.get("Z") or 1)
+        if channel_index >= channel_count:
+            raise BadRequest(f"channel index must be between 0 and {channel_count - 1}")
+        if z_index >= z_count:
+            raise BadRequest(f"z index must be between 0 and {z_count - 1}")
+
+        frame_index = _nd2_frame_index(ndfile, channel_index, z_index)
+        frame = np.asarray(ndfile.read_frame(frame_index))
+        plane = _nd2_plane_from_frame(frame, sizes, channel_index, _nd2_channel_is_looped(ndfile))
+        return np.array(plane, copy=True)
+
+
+def _nd2_channel_is_looped(ndfile):
+    try:
+        return any("C" in item for item in ndfile.loop_indices)
+    except Exception:
+        return False
+
+
+def _nd2_frame_index(ndfile, channel_index: int, z_index: int):
+    try:
+        loop_indices = tuple(ndfile.loop_indices)
+    except Exception:
+        loop_indices = ()
+    if not loop_indices:
+        return 0
+
+    channel_looped = any("C" in item for item in loop_indices)
+    for index, coords in enumerate(loop_indices):
+        for axis, value in coords.items():
+            target = 0
+            if axis == "Z":
+                target = z_index
+            elif axis == "C" and channel_looped:
+                target = channel_index
+            if int(value) != int(target):
+                break
+        else:
+            return index
+    raise BadRequest("Requested ND2 z/channel plane is not available")
+
+
+def _nd2_plane_from_frame(frame, sizes, channel_index: int, channel_looped: bool):
+    arr = np.asarray(frame)
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and not channel_looped:
+        channel_count = int(sizes.get("C") or 1)
+        if channel_count > 1 and arr.shape[0] == channel_count:
+            return arr[channel_index]
+        if channel_count > 1 and arr.shape[-1] == channel_count:
+            return arr[..., channel_index]
+    while arr.ndim > 2:
+        arr = arr[0]
+    return arr
+
+
+def _render_nd2_preview_png(filepath: Path, max_size: int, z_index: int = 0):
+    max_size = _preview_max_size(max_size)
+    metadata = _get_nd2_metadata(filepath)
+    z_count = int(metadata["zCount"])
+    if z_index >= z_count:
+        raise BadRequest(f"z index must be between 0 and {z_count - 1}")
+
+    width = int(metadata["width"])
+    height = int(metadata["height"])
+    target_width, target_height = _preview_dimensions(width, height, max_size)
+    channel_count = int(metadata["channelCount"])
+    output = np.zeros((target_height, target_width, 3), dtype=np.float32)
+
+    for channel_index in _preview_visible_channels(channel_count):
+        plane = _raw_channel_array(_nd2_channel_plane(filepath, channel_index, z_index))
+        thumbnail = _resize_preview_plane(plane, target_width, target_height)
+        intensity = 1.0 - (_auto_window_uint8(thumbnail).astype(np.float32) / 255.0)
+        color = _preview_color(channel_count, channel_index)
+        output[..., 0] += intensity * color[0]
+        output[..., 1] += intensity * color[1]
+        output[..., 2] += intensity * color[2]
+
+    image = Image.fromarray(np.clip(output, 0, 255).astype(np.uint8), mode="RGB")
+    buf = BytesIO()
+    image.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    return buf
+
+def _preview_max_size(value):
+    try:
+        requested = int(value)
+    except (TypeError, ValueError):
+        requested = DEFAULT_PREVIEW_MAX_SIZE
+    return max(256, min(MAX_PREVIEW_MAX_SIZE, requested))
+
+
+def _preview_dimensions(width, height, max_size):
+    width = max(1, int(width))
+    height = max(1, int(height))
+    scale = min(1.0, float(max_size) / max(width, height))
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+def _preview_visible_channels(channel_count):
+    if channel_count <= 1:
+        return (0,)
+    return (1 if channel_count > 1 else 0,)
+
+
+def _preview_color(channel_count, channel_index):
+    return PREVIEW_COLOR
+
+
+def _resize_preview_plane(plane, target_width, target_height):
+    if plane.shape == (target_height, target_width):
+        return plane
+
+    resampling = getattr(Image, "Resampling", Image).BILINEAR
+    image = Image.fromarray(plane)
+    resized = image.resize((target_width, target_height), resampling)
+    return np.asarray(resized)
+
+
+def _auto_window_uint8(arr):
+    arr = np.asarray(arr)
+    if arr.size == 0:
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    observed_min = float(np.min(arr))
+    observed_max = float(np.max(arr))
+    if observed_max <= observed_min:
+        return np.zeros(arr.shape, dtype=np.uint8)
+
+    bins, edges = np.histogram(arr, bins=256, range=(observed_min, observed_max))
+    pixel_count = max(1, int(arr.size))
+    dominant_bin_limit = pixel_count / 10
+    threshold = pixel_count / 5000
+
+    low = 0
+    while low < len(bins) - 1:
+        count = int(bins[low])
+        if count <= dominant_bin_limit and count > threshold:
+            break
+        low += 1
+
+    high = len(bins) - 1
+    while high > 0:
+        count = int(bins[high])
+        if count <= dominant_bin_limit and count > threshold:
+            break
+        high -= 1
+
+    window_min = observed_min
+    window_max = observed_max
+    if high >= low:
+        window_min = float(edges[low])
+        window_max = float(edges[min(high + 1, len(edges) - 1)])
+    if not math.isfinite(window_min) or not math.isfinite(window_max) or window_max <= window_min:
+        window_min = observed_min
+        window_max = observed_max
+
+    normalized = (arr.astype(np.float32) - window_min) / max(1e-6, window_max - window_min)
+    return (np.clip(normalized, 0.0, 1.0) * 255).astype(np.uint8)
+
+
+def _first_displayable_plane(data, axes):
+    arr = np.asarray(data)
+    axes = _axes_for_shape(arr.shape, axes)
+
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and axes.endswith("C") and arr.shape[-1] in (3, 4):
+        return arr
+
+    slices = []
+    kept_axes = []
+    for axis in axes:
+        if axis in ("Y", "X"):
+            slices.append(slice(None))
+            kept_axes.append(axis)
+        else:
+            slices.append(0)
+
+    plane = arr[tuple(slices)]
+    if kept_axes == ["X", "Y"]:
+        plane = plane.T
+    while plane.ndim > 2:
+        plane = plane[0]
+    return plane
+
+
+def _raw_channel_plane(data, axes, channel_index, z_index=0):
+    arr = np.asarray(data)
+    axes = _axes_for_shape(arr.shape, axes)
+    if isinstance(channel_index, bool) or not isinstance(channel_index, int) or channel_index < 0:
+        raise BadRequest("channel index must be a non-negative integer")
+
+    channel_count = _channel_count(arr.shape, axes)
+    if channel_index >= channel_count:
+        raise BadRequest(f"channel index must be between 0 and {channel_count - 1}")
+    z_index = _z_index(z_index)
+    z_count = _z_count(arr.shape, axes)
+    if z_index >= z_count:
+        raise BadRequest(f"z index must be between 0 and {z_count - 1}")
+
     if "C" not in axes:
-        arr = np.expand_dims(arr, axis=0)
-        axes.insert(0, "C")
-    if "Z" not in axes:
-        insert_at = axes.index("C") + 1
-        arr = np.expand_dims(arr, axis=insert_at)
-        axes.insert(insert_at, "Z")
-    unknown = [axis for axis in axes if axis not in "CZYX"]
-    if unknown:
-        raise UnsupportedTiff(f"Unsupported TIFF axes: {''.join(unknown)}")
-    return arr, "".join(axes)
+        slices = []
+        kept_axes = []
+        for axis in axes:
+            if axis in ("Y", "X"):
+                slices.append(slice(None))
+                kept_axes.append(axis)
+            elif axis == "Z":
+                slices.append(z_index)
+            else:
+                slices.append(0)
+        plane = arr[tuple(slices)]
+        if kept_axes == ["X", "Y"]:
+            plane = plane.T
+        while plane.ndim > 2:
+            plane = plane[0]
+        if plane.ndim != 2:
+            raise UnsupportedTiff("Raw channel display requires a grayscale source plane")
+        return plane
+
+    slices = []
+    kept_axes = []
+    for axis in axes:
+        if axis in ("Y", "X"):
+            slices.append(slice(None))
+            kept_axes.append(axis)
+        elif axis == "C":
+            slices.append(channel_index)
+        elif axis == "Z":
+            slices.append(z_index)
+        else:
+            slices.append(0)
+
+    plane = arr[tuple(slices)]
+    if kept_axes == ["X", "Y"]:
+        plane = plane.T
+    while plane.ndim > 2:
+        plane = plane[0]
+    if plane.ndim != 2:
+        raise UnsupportedTiff("Cannot extract a two-dimensional raw channel plane")
+    return plane
 
 
-class ImageCacheService:
-    def __init__(self, data_root: Path, cache_root: Path):
-        self.data_root = Path(data_root).resolve()
-        self.cache_root = Path(cache_root)
+def _read_raw_channel_plane(series, axes, channel_index, z_index=0):
+    shape = tuple(series.shape)
+    axes = _axes_for_shape(shape, axes)
+    axes = _z_display_axes(shape, axes)
+    if isinstance(channel_index, bool) or not isinstance(channel_index, int) or channel_index < 0:
+        raise BadRequest("channel index must be a non-negative integer")
 
-    def get_metadata(self, image_path: Path):
-        ctx = self._context(image_path)
-        metadata_path = ctx.directory / "metadata.json"
-        if metadata_path.exists():
-            metadata = _read_json(metadata_path)
-            if _metadata_complete(metadata):
-                return metadata
+    channel_count = _channel_count(shape, axes)
+    if channel_index >= channel_count:
+        raise BadRequest(f"channel index must be between 0 and {channel_count - 1}")
+    z_index = _z_index(z_index)
+    z_count = _z_count(shape, axes)
+    if z_index >= z_count:
+        raise BadRequest(f"z index must be between 0 and {z_count - 1}")
 
-        with file_lock(self._lock_path(ctx)):
-            if metadata_path.exists():
-                metadata = _read_json(metadata_path)
-                if _metadata_complete(metadata):
-                    return metadata
-            metadata = self._read_metadata_fast(image_path, ctx)
-            ctx.directory.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(metadata_path, metadata)
-            return metadata
+    page_plane = _raw_channel_plane_from_pages(series, axes, channel_index, z_index)
+    if page_plane is not None:
+        return page_plane
 
-    def get_channel_path(
-        self,
-        image_path: Path,
-        channel_index: int,
-        z_index: int | None = None,
-        projection: str = "mip",
-    ) -> Path:
-        if channel_index < 0:
-            raise BadRequest("Channel index must be non-negative")
-        metadata = self.get_metadata(image_path)
-        if channel_index >= metadata["numChannels"]:
-            raise BadRequest("Channel index out of range")
+    key = []
+    kept_axes = []
+    for axis in axes:
+        if axis in ("Y", "X"):
+            key.append(slice(None))
+            kept_axes.append(axis)
+        elif axis == "C":
+            key.append(channel_index)
+        elif axis == "Z":
+            key.append(z_index)
+        else:
+            key.append(0)
 
-        projection = (projection or "mip").lower()
-        if projection not in {"mip", "slice"}:
-            raise BadRequest("projection must be either 'mip' or 'slice'")
+    try:
+        plane = series.asarray(key=tuple(key))
+    except TypeError:
+        plane = _raw_channel_plane(series.asarray(), axes, channel_index, z_index)
+    except Exception:
+        plane = _raw_channel_plane(series.asarray(), axes, channel_index, z_index)
 
-        ctx = self._context(image_path)
-        if projection == "mip":
-            png_path = ctx.directory / f"channel_{channel_index}.png"
-            if not png_path.exists():
-                self._ensure_rendered(image_path, ctx)
-            return png_path
-
-        z_index = 0 if z_index is None else int(z_index)
-        if z_index < 0 or z_index >= metadata["numZSlices"]:
-            raise BadRequest("Z-slice index out of range")
-        png_path = ctx.directory / f"channel_{channel_index}_z_{z_index}.png"
-        if not png_path.exists():
-            self._ensure_slice_rendered(image_path, ctx, channel_index, z_index, png_path)
-        return png_path
-
-    def _ensure_slice_rendered(
-        self,
-        image_path: Path,
-        ctx: CacheContext,
-        channel_index: int,
-        z_index: int,
-        png_path: Path,
-    ):
-        if png_path.exists():
-            return
-        with file_lock(self._lock_path(ctx)):
-            if png_path.exists():
-                return
-            ctx.directory.mkdir(parents=True, exist_ok=True)
-            plane = load_raw_plane(image_path, channel_index=channel_index, z_index=z_index)
-            _atomic_write_png(png_path, auto_scale(plane))
-
-    def get_thumbnail_path(self, image_path: Path) -> Path:
-        ctx = self._context(image_path)
-        thumbnail = ctx.directory / "thumbnail.png"
-        if not thumbnail.exists():
-            self._ensure_rendered(image_path, ctx)
-        return thumbnail
-
-    def _ensure_rendered(self, image_path: Path, ctx: CacheContext):
-        if self._cache_complete(ctx):
-            return
-        with file_lock(self._lock_path(ctx)):
-            if self._cache_complete(ctx):
-                return
-            self._render_cache(image_path, ctx)
-
-    def _context(self, image_path: Path) -> CacheContext:
-        path = Path(image_path).resolve()
-        try:
-            rel_path = path.relative_to(self.data_root).as_posix()
-        except ValueError as exc:
-            raise BadRequest("Image path escapes data root") from exc
-        st = path.stat()
-        raw_key = f"{rel_path}|{st.st_size}|{st.st_mtime_ns}"
-        key = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-        return CacheContext(
-            key=key,
-            directory=self.cache_root / key[:2] / key,
-            rel_path=rel_path,
-            size=st.st_size,
-            mtime_ns=st.st_mtime_ns,
-        )
-
-    def _read_metadata_fast(self, image_path: Path, ctx: CacheContext):
-        with tifffile.TiffFile(image_path) as tf:
-            series = tf.series[0]
-            (c, z, y, x), _normalized_axes, source_axes = normalise_shape_to_czyx_with_axes(series.shape, series.axes)
-            pixel_size, pixel_unit = _read_pixel_calibration(tf)
-            sample_dtype, bits_per_sample = _read_sample_info(series)
-        return {
-            "cacheKey": ctx.key,
-            "sourceRelPath": ctx.rel_path,
-            "sourceSize": ctx.size,
-            "sourceMtimeNs": ctx.mtime_ns,
-            "numChannels": int(c),
-            "numZSlices": int(z),
-            "axes": "CZYX",
-            "sourceAxes": source_axes or None,
-            "width": int(x),
-            "height": int(y),
-            "pixelSize": pixel_size,
-            "pixelUnit": pixel_unit,
-            "sampleDtype": sample_dtype,
-            "bitsPerSample": bits_per_sample,
-        }
-
-    def _cache_complete(self, ctx: CacheContext):
-        metadata_path = ctx.directory / "metadata.json"
-        thumbnail_path = ctx.directory / "thumbnail.png"
-        if not metadata_path.exists() or not thumbnail_path.exists():
-            return False
-        try:
-            metadata = _read_json(metadata_path)
-            if not _metadata_complete(metadata):
-                return False
-            num_channels = int(metadata["numChannels"])
-        except Exception:
-            return False
-        return all((ctx.directory / f"channel_{index}.png").exists() for index in range(num_channels))
-
-    def _lock_path(self, ctx: CacheContext):
-        return self.cache_root / ".locks" / f"{ctx.key}.lock"
-
-    def _render_cache(self, image_path: Path, ctx: CacheContext):
-        ctx.directory.mkdir(parents=True, exist_ok=True)
-        metadata = self._read_metadata_fast(image_path, ctx)
-        channels = load_channels(image_path)
-        if not channels:
-            raise UnsupportedTiff("TIFF did not contain any renderable channels")
-
-        height, width = channels[0].shape[:2]
-        metadata["numChannels"] = len(channels)
-        metadata["width"] = int(width)
-        metadata["height"] = int(height)
-
-        for index, channel in enumerate(channels):
-            _atomic_write_png(ctx.directory / f"channel_{index}.png", auto_scale(channel))
-
-        thumb = Image.fromarray(auto_scale(channels[0]), mode="L")
-        thumb.thumbnail((512, 512))
-        _atomic_save_image(ctx.directory / "thumbnail.png", thumb)
-        _atomic_write_json(ctx.directory / "metadata.json", metadata)
+    plane = np.asarray(plane)
+    if kept_axes == ["X", "Y"]:
+        plane = plane.T
+    while plane.ndim > 2:
+        plane = plane[0]
+    if plane.ndim != 2:
+        raise UnsupportedTiff("Cannot extract a two-dimensional raw channel plane")
+    return plane
 
 
-def _atomic_write_png(path: Path, arr):
-    image = Image.fromarray(arr, mode="L")
-    _atomic_save_image(path, image)
+def _raw_channel_plane_from_pages(series, axes, channel_index, z_index):
+    pages = getattr(series, "pages", None)
+    if pages is None:
+        return None
+
+    shape = tuple(series.shape)
+    non_spatial_axes = [axis for axis in axes if axis not in ("Y", "X")]
+    if not non_spatial_axes:
+        return None
+
+    page_count = 1
+    for axis in non_spatial_axes:
+        page_count *= int(shape[axes.index(axis)])
+
+    try:
+        if len(pages) != page_count:
+            return None
+    except TypeError:
+        return None
+
+    coords = []
+    for axis in non_spatial_axes:
+        if axis == "C":
+            coords.append(channel_index)
+        elif axis == "Z":
+            coords.append(z_index)
+        else:
+            coords.append(0)
+
+    page_index = 0
+    for axis, coord in zip(non_spatial_axes, coords):
+        page_index = (page_index * int(shape[axes.index(axis)])) + int(coord)
+
+    try:
+        plane = np.asarray(pages[page_index].asarray())
+    except Exception:
+        return None
+
+    if plane.ndim == 3 and "C" in axes:
+        c_size = int(shape[axes.index("C")])
+        if plane.shape[0] == c_size:
+            plane = plane[channel_index]
+        elif plane.shape[-1] == c_size:
+            plane = plane[..., channel_index]
+    while plane.ndim > 2:
+        plane = plane[0]
+    if plane.ndim != 2:
+        return None
+    return plane
 
 
-def _atomic_save_image(path: Path, image: Image.Image):
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    image.save(tmp, format="PNG")
-    os.replace(tmp, path)
+def _raw_image_from_array(arr):
+    """Create an image only when PNG can preserve source intensity values."""
+    arr = np.asarray(arr)
+    if arr.ndim == 2 and arr.dtype in (np.dtype("uint8"), np.dtype("uint16")):
+        return Image.fromarray(arr)
+
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4) and arr.dtype == np.dtype("uint8"):
+        return Image.fromarray(arr)
+
+    raise UnsupportedTiff(
+        "Raw display supports 8-bit or 16-bit grayscale TIFF planes and "
+        "8-bit RGB/RGBA TIFF planes. This file would require intensity conversion, "
+        "so the viewer refuses to preprocess it silently."
+    )
 
 
-def _atomic_write_json(path: Path, payload):
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
-        f.write("\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+def _raw_channel_array(arr):
+    """Return a contiguous little-endian grayscale plane without scaling values."""
+    arr = np.asarray(arr)
+    if arr.ndim != 2:
+        raise UnsupportedTiff("Raw channel display requires a two-dimensional grayscale plane")
+    if arr.dtype == np.dtype("uint8"):
+        return np.ascontiguousarray(arr)
+    if arr.dtype == np.dtype("uint16") or arr.dtype == np.dtype(">u2"):
+        return np.ascontiguousarray(arr.astype("<u2", copy=False))
+    raise UnsupportedTiff(
+        "Raw channel display supports only 8-bit or 16-bit unsigned TIFF planes. "
+        "This file would require intensity conversion, so the viewer refuses to preprocess it silently."
+    )
 
 
-def _read_json(path: Path):
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _metadata_complete(metadata):
-    return isinstance(metadata, dict) and METADATA_REQUIRED_KEYS.issubset(metadata.keys())
+def _channel_value_range(dtype):
+    try:
+        sample_dtype = np.dtype(dtype)
+    except Exception:
+        return None, None
+    if sample_dtype.kind != "u" or sample_dtype.itemsize not in (1, 2):
+        return None, None
+    info = np.iinfo(sample_dtype)
+    return int(info.min), int(info.max)
 
 
 def _read_sample_info(series):
@@ -424,64 +874,185 @@ def _read_sample_info(series):
     except Exception:
         return None, None
 
-
-def _read_pixel_calibration(tf: tifffile.TiffFile):
-    ome_pixel_size = _read_ome_physical_size_x(tf)
-    if ome_pixel_size[0] is not None:
-        return ome_pixel_size
-
-    imagej = getattr(tf, "imagej_metadata", None) or {}
-    for key in ("pixel_width", "pixelWidth"):
-        value = imagej.get(key)
-        if isinstance(value, (int, float)) and value > 0:
-            return float(value), _normalize_unit(imagej.get("unit") or "um")
-
-    try:
-        page = tf.series[0].pages[0]
-        x_resolution = page.tags.get("XResolution")
-        resolution_unit = page.tags.get("ResolutionUnit")
-        if not x_resolution or not resolution_unit:
-            return None, "um"
-        num, den = x_resolution.value
-        if not num or not den:
-            return None, "um"
-        pixels_per_unit = float(num) / float(den)
-        unit_value = getattr(resolution_unit.value, "value", resolution_unit.value)
-        if pixels_per_unit <= 0:
-            return None, "um"
-        if unit_value == 2:  # inch
-            return 25400.0 / pixels_per_unit, "um"
-        if unit_value == 3:  # centimeter
-            return 10000.0 / pixels_per_unit, "um"
-    except Exception:
-        return None, "um"
-    return None, "um"
-
-
-def _read_ome_physical_size_x(tf: tifffile.TiffFile):
-    xml = getattr(tf, "ome_metadata", None)
-    if not xml:
-        return None, "um"
-    try:
-        root = ElementTree.fromstring(xml)
-    except ElementTree.ParseError:
-        return None, "um"
-    for pixels in root.iter():
-        if pixels.tag.rsplit("}", 1)[-1] != "Pixels":
-            continue
-        value = pixels.attrib.get("PhysicalSizeX")
-        if value is None:
-            continue
+def _read_pixel_size_um(tf, series):
+    """Read physical X/Y calibration in micrometers per pixel, with a safe fallback."""
+    for reader in (
+        _pixel_size_from_ome,
+        _pixel_size_from_imagej_metadata,
+        _pixel_size_from_resolution_tags,
+    ):
         try:
-            pixel_size = float(value)
-        except ValueError:
+            value = reader(tf, series)
+        except Exception:
+            value = None
+        if value:
+            x, y, source = value
+            return {
+                "x": float(x),
+                "y": float(y),
+                "source": source,
+                "isDefault": False,
+            }
+
+    return {
+        "x": DEFAULT_PIXEL_SIZE_UM,
+        "y": DEFAULT_PIXEL_SIZE_UM,
+        "source": "default",
+        "isDefault": True,
+    }
+
+
+def _pixel_size_from_ome(tf, series):
+    ome = getattr(tf, "ome_metadata", None)
+    if not ome:
+        return None
+    root = ElementTree.fromstring(ome)
+    pixels = root.find(".//{*}Pixels")
+    if pixels is None:
+        return None
+    x = _length_um(pixels.attrib.get("PhysicalSizeX"), pixels.attrib.get("PhysicalSizeXUnit", "µm"))
+    y = _length_um(pixels.attrib.get("PhysicalSizeY"), pixels.attrib.get("PhysicalSizeYUnit", "µm"))
+    return _complete_pixel_size(x, y, "OME-XML PhysicalSize")
+
+
+def _pixel_size_from_imagej_metadata(tf, series):
+    metadata = dict(getattr(tf, "imagej_metadata", None) or {})
+    try:
+        description = series.pages[0].description or ""
+    except Exception:
+        description = ""
+
+    for line in description.splitlines():
+        if "=" not in line:
             continue
-        if pixel_size > 0:
-            return pixel_size, _normalize_unit(pixels.attrib.get("PhysicalSizeXUnit") or "um")
-    return None, "um"
+        key, value = line.split("=", 1)
+        metadata.setdefault(key.strip(), value.strip())
+
+    unit = metadata.get("unit") or metadata.get("Unit")
+    x_value = (
+        metadata.get("pixel_width")
+        or metadata.get("pixelWidth")
+        or metadata.get("PixelWidth")
+    )
+    y_value = (
+        metadata.get("pixel_height")
+        or metadata.get("pixelHeight")
+        or metadata.get("PixelHeight")
+    )
+    if x_value is None and y_value is None:
+        return None
+
+    x = _length_um(x_value, unit)
+    y = _length_um(y_value, unit)
+    return _complete_pixel_size(x, y, "ImageJ metadata")
 
 
-def _normalize_unit(unit):
-    value = str(unit or "um").strip() or "um"
-    return value.replace("\u00b5", "u")
+def _pixel_size_from_resolution_tags(tf, series):
+    try:
+        page = series.pages[0]
+    except Exception:
+        return None
 
+    x_resolution = _resolution_value(page.tags.get("XResolution"))
+    y_resolution = _resolution_value(page.tags.get("YResolution"))
+    resolution_unit = page.tags.get("ResolutionUnit")
+    if resolution_unit is None:
+        return None
+
+    unit = resolution_unit.value
+    if _resolution_unit_is(unit, 2, "inch"):
+        scale_um = 25400.0
+    elif _resolution_unit_is(unit, 3, "centimeter", "centimetre", "cm"):
+        scale_um = 10000.0
+    else:
+        return None
+
+    x = scale_um / x_resolution if _positive_number(x_resolution) else None
+    y = scale_um / y_resolution if _positive_number(y_resolution) else None
+    return _complete_pixel_size(x, y, "TIFF resolution tags")
+
+
+def _resolution_value(tag):
+    if tag is None:
+        return None
+    value = tag.value
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        denominator = float(value[1])
+        return float(value[0]) / denominator if denominator else None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolution_unit_is(value, numeric, *names):
+    try:
+        if int(value) == numeric:
+            return True
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower()
+    return any(name in text for name in names)
+
+
+def _length_um(value, unit):
+    number = _positive_number(value)
+    if number is None:
+        return None
+    unit_text = str(unit or "").strip().lower().replace("μ", "µ")
+    unit_text = re.sub(r"[\s._-]+", "", unit_text)
+    scales = {
+        "µm": 1.0,
+        "um": 1.0,
+        "micron": 1.0,
+        "microns": 1.0,
+        "micrometer": 1.0,
+        "micrometers": 1.0,
+        "micrometre": 1.0,
+        "micrometres": 1.0,
+        "nm": 0.001,
+        "nanometer": 0.001,
+        "nanometers": 0.001,
+        "nanometre": 0.001,
+        "nanometres": 0.001,
+        "mm": 1000.0,
+        "millimeter": 1000.0,
+        "millimeters": 1000.0,
+        "millimetre": 1000.0,
+        "millimetres": 1000.0,
+        "cm": 10000.0,
+        "centimeter": 10000.0,
+        "centimeters": 10000.0,
+        "centimetre": 10000.0,
+        "centimetres": 10000.0,
+        "m": 1000000.0,
+        "meter": 1000000.0,
+        "meters": 1000000.0,
+        "metre": 1000000.0,
+        "metres": 1000000.0,
+    }
+    scale = scales.get(unit_text)
+    if scale is None:
+        return None
+    result = number * scale
+    return result if _positive_number(result) is not None else None
+
+
+def _positive_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0 or number > 1_000_000:
+        return None
+    return number
+
+
+def _complete_pixel_size(x, y, source):
+    if _positive_number(x) is None and _positive_number(y) is None:
+        return None
+    if _positive_number(x) is None:
+        x = y
+    if _positive_number(y) is None:
+        y = x
+    return float(x), float(y), source

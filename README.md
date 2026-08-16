@@ -1,22 +1,23 @@
 # AGH Image Viewer
 
-Web-based multi-channel microscopy image viewer for AGH TIFF images and JSON annotations.
+Web-based microscopy image viewer for AGH TIFF images and JSON annotations.
 
-The project intentionally stays simple: Apache serves the React build at `/agh/`, proxies `/agh/api/` to a Flask API running behind Gunicorn, and a Windows sync agent uploads TIFFs from the CMU NAS to the server.
+The viewer supports adjustable annotation color and stroke thickness, editable text annotations with font sizing, and calibrated ruler measurements. Pixel size is read from TIFF metadata when available; otherwise the viewer uses the explicit default calibration `0.106872 µm/px` and marks it as a default in the bottom status bar.
+
+The project intentionally stays simple: Apache serves the React build at `/agh/`, proxies `/agh/api/` to a Flask API running behind Gunicorn, and a separate worker mirrors a mounted remote image folder into the local cache.
 
 ## Architecture
 
 ```text
-CMU NAS
+Mounted remote image folder
   |
-  | agh_watcher.py on a Windows lab machine
-  | reconciliation + retry + temp upload + atomic rename
+  | agh_image_sync service
+  | remote-authoritative cache sync + rename detection
   v
-AWS / Lightsail
+Backend host
   |
   | /data/AGH_APP          raw TIFF files
   | /data/agh_annotations  revisioned annotation JSON
-  | /data/agh_cache        metadata, channel PNGs, thumbnails
   |
   | Apache /agh            React static build
   | Apache /agh/api        reverse proxy
@@ -33,15 +34,7 @@ Gunicorn -> Flask agh_api on 127.0.0.1:5055
 
 /data/agh_annotations/
   <sha256-image-id>.json
-
-/data/agh_cache/
-  <cache-key>/
-    metadata.json
-    channel_0.png
-    thumbnail.png
 ```
-
-Cache keys include image relative path, file size, and mtime. If a TIFF changes, the cache automatically misses and regenerates.
 
 ## Configuration
 
@@ -52,23 +45,17 @@ Backend:
 ```bash
 export AGH_DATA_ROOT=/data/AGH_APP
 export AGH_ANN_ROOT=/data/agh_annotations
-export AGH_CACHE_ROOT=/data/agh_cache
-export AGH_ANALYSIS_ROOT=/data/agh_analysis
-export AGH_MODEL_ROOT=/data/agh_models
-export AGH_ANALYSIS_DB=/data/agh_analysis/jobs.sqlite3
 export AGH_HOST=127.0.0.1
 export AGH_PORT=5055
 ```
 
-Watcher:
+Remote image cache sync:
 
-```powershell
-$env:AGH_NAS_ROOT="T:\Ha\AGH_APP"
-$env:AGH_REMOTE_HOST="agh-upload@example.org"
-$env:AGH_REMOTE_DIR="/data/AGH_APP"
-$env:AGH_SSH_KEY_PATH="C:\Users\you\.ssh\agh-upload.pem"
-$env:AGH_KNOWN_HOSTS="C:\Users\you\.ssh\known_hosts"
-$env:AGH_STRICT_HOST_KEY_CHECKING="yes"
+```bash
+# The remote share must be mounted on the backend host.
+export AGH_REMOTE_DATA_ROOT=/mnt/r/AGH_APP
+export AGH_SYNC_STATE_DIR=/home/ubuntu/agh-viewer/state/localdata-sync
+export AGH_SYNC_INTERVAL_SECONDS=86400
 ```
 
 Deployment:
@@ -77,11 +64,14 @@ Deployment:
 export AGH_DEPLOY_REMOTE=ubuntu@example.org
 export AGH_SSH_KEY_PATH=$HOME/.ssh/agh-deploy.pem
 export AGH_STRICT_HOST_KEY_CHECKING=yes
-export AGH_BASIC_AUTH_USER=agh-lab
-export AGH_BASIC_AUTH_PASSWORD='choose-a-real-password'
+export AGH_STATE_DIR=/home/ubuntu/agh-viewer/state   # optional; this is the default
 ```
 
-Replace `ubuntu@example.org`, the key path, and the Basic Auth password with real values. The deploy script exits early if these are still placeholders, if the key file does not exist, or if Basic Auth credentials are missing.
+Replace `ubuntu@example.org` and the key path with real values. The deploy
+script exits early if these are still placeholders or if the key file does not
+exist. It deploys code only — accounts are created separately with
+`manage_users.py` (see Accounts below), so no password passes through the
+deploy.
 
 ## Backend
 
@@ -95,33 +85,47 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Run the analysis worker locally in another shell:
-
-```bash
-cd backend
-. .venv/bin/activate
-python worker.py --once   # process one queued run, useful for debugging
-python worker.py          # continuous worker loop
-```
-
-For real MagnifySeg inference, create a separate inference environment and install:
-
-```bash
-cd backend
-python3 -m venv ../inference-venv
-../inference-venv/bin/pip install -r requirements-inference.txt
-```
-
 When `python app.py` is run directly without `AGH_DATA_ROOT`, it uses writable local development folders under `backend/.local_data/`. Production remains configured by systemd environment variables and uses `/data/...`.
 
 If you previously exported production paths in the same terminal and see a `/data` permission error, clear them or force local mode:
 
 ```bash
-unset AGH_DATA_ROOT AGH_ANN_ROOT AGH_CACHE_ROOT
+unset AGH_DATA_ROOT AGH_ANN_ROOT
 python app.py
 
 # or
 AGH_LOCAL_DEV=1 python app.py
+```
+
+Local development defaults to `AGH_AUTH_REQUIRED=1` with an empty account
+store, so create a dev account first (state lives under
+`backend/.local_data/state`):
+
+```bash
+cd backend
+AGH_LOCAL_DEV=1 python manage_users.py add me
+# then run the app and sign in at the SPA login screen
+```
+
+Accounts have roles. New accounts default to `annotator`; assign a narrower or
+broader role with:
+
+```bash
+AGH_LOCAL_DEV=1 python manage_users.py add reviewer1 --role reviewer
+AGH_LOCAL_DEV=1 python manage_users.py role reviewer1 viewer
+```
+
+Supported roles are `admin`, `reviewer`, `pathologist`, `annotator`, `viewer`,
+and `upload_agent`. Audit events are written as JSONL to
+`AGH_AUDIT_LOG_FILE` or, by default, under the configured state directory.
+
+To skip login entirely while developing on a private loopback-only setup, set
+both variables below. Do not use this when exposing the app through ngrok,
+Tailscale, Apache, or any other network tunnel/proxy.
+
+```bash
+export AGH_AUTH_REQUIRED=0
+export AGH_ALLOW_INSECURE_AUTH_BYPASS=I_UNDERSTAND_THIS_EXPOSES_DATA
 ```
 
 Production runs with Gunicorn:
@@ -138,72 +142,43 @@ curl http://127.0.0.1:5055/agh/api/health
 
 ## API
 
-Current compatible endpoints:
+Current endpoints:
 
 ```text
-GET  /agh/api/health
+GET  /agh/api/health                 (public)
+GET  /agh/api/session                 (public; reports whether you are signed in)
+POST /agh/api/login                   (public; {username, password})
+POST /agh/api/logout
 GET  /agh/api/cases
 GET  /agh/api/cases/:case/files
 GET  /agh/api/cases/:case/files/:filename/meta
-GET  /agh/api/cases/:case/files/:filename/thumbnail
-GET  /agh/api/cases/:case/files/:filename/channel/:channelIndex
+GET  /agh/api/cases/:case/files/:filename/image
+GET  /agh/api/cases/:case/files/:filename/preview
+GET  /agh/api/cases/:case/files/:filename/channels/:channelIndex/raw
 GET  /agh/api/cases/:case/files/:filename/annotations
-PUT  /agh/api/cases/:case/files/:filename/annotations
-POST /agh/api/cases/:case/files/:filename/annotations
-POST /agh/api/cases/:case/files/:filename/analysis-runs
-GET  /agh/api/analysis-runs/:runId
-GET  /agh/api/analysis-runs/:runId/artifacts/:artifact
-GET  /agh/api/analysis-runs/:runId/metrics
-POST /agh/api/analysis-runs/:runId/metrics/gbm-thickness
-POST /agh/api/analysis-runs/:runId/metrics/process-nnd
+PUT  /agh/api/cases/:case/files/:filename/annotations   (requires X-AGH-CSRF)
 ```
 
-The API now rejects path traversal, only serves direct TIFF files inside known case folders, and only allows `.tif` / `.tiff`.
+The API rejects path traversal, only serves direct TIFF files inside known case folders, and only allows `.tif` / `.tiff`.
 
-Annotation writes are locked, atomic, and revisioned. A stale save returns `409 Conflict` instead of silently overwriting another user's work. `PUT` requests must include `revision`; `POST` remains only for legacy compatibility.
+Authentication is per-user. The login page posts the username and password to
+`/agh/api/login`; on success the server sets an HttpOnly, SameSite=Strict
+session cookie and returns a CSRF token the SPA echoes in the `X-AGH-CSRF`
+header on writes. Passwords are stored only as salted PBKDF2 hashes and are
+never kept in the browser. Apache must not protect `/agh/` or `/agh/api` with
+`AuthType Basic`. See `docs/security.md` for the full model and account
+management.
 
-MagnifySeg analysis runs are queued in SQLite and processed by `backend/worker.py`.
-The queue currently uses `magnifyseg-segmentation`, `gbm-thickness`, and `process-nnd`
-operations. Metric POST endpoints return a queued run id; poll
-`GET /agh/api/analysis-runs/:runId` for completion. Use
-`GET /agh/api/analysis-runs/:runId/metrics` to list the metric child runs for a
-completed segmentation run and restore prior metric results.
-Segmentation defaults to `preprocessingMode: percentile-stretch`: TIFF planes are
-stretched with 1.0-99.7 percentiles, written as uint8 model inputs, and
-`run_patches()` scales them by `1/255`. This matches the MagnifySeg
-`auto_enhance_single_channel` / `auto_enhance_multi_channel` flow and does not
-perform max-normalization before the percentile stretch. `direct-uint8` remains
-available as an explicit comparison mode.
-The API stores immutable segmentation artifacts under `AGH_ANALYSIS_ROOT/runs/<run-id>/`
-and metric artifacts under `AGH_ANALYSIS_ROOT/runs/<segmentation-run-id>/metrics/<metric-run-id>/`.
-Real segmentation requires the four model weights in `AGH_MODEL_ROOT`:
-`ACTN4.hdf5`, `DAPI.hdf5`, `NHS_ester_single.hdf5`, and `NHS_ester_com.hdf5`.
-Make sure these are real Git LFS files, not pointer text files.
+Annotation writes are locked, atomic, and revisioned. A stale save returns `409 Conflict` instead of silently overwriting another user's work. Annotation updates use `PUT` and must include `revision`. The `updatedBy` field is stamped from the authenticated session, so it cannot be forged.
 
-## Watcher
+## Remote image cache sync
 
-Install once on the Windows lab machine:
-
-```powershell
-pip install watchdog
-```
-
-Before first run, pin the server host key in `known_hosts` using your lab-approved process. Do not disable host key checking for routine operation.
-
-Run:
-
-```powershell
-python .\agh_watcher.py
-```
-
-The watcher combines three protections:
-
-- realtime polling events for new and modified TIFFs;
-- startup and periodic reconciliation using `relative_path + size + mtime`;
-- upload to `*.uploading` followed by remote atomic rename.
-- source file signature comparison before and after upload, so files that change during SCP are retried.
-
-Use a dedicated upload user such as `agh-upload`. That account should write only to a staging or data directory and should not be a general-purpose admin account.
+The production image source is always the local `AGH_DATA_ROOT` cache. To use
+a mounted remote drive, configure `AGH_REMOTE_DATA_ROOT` and run the separate
+`agh_image_sync` service described in [the deployment guide](docs/deployment.md#data-sync).
+It synchronizes only final `.tif`, `.tiff`, and `.nd2` files every 24 hours
+(or on an admin-requested run) without making normal image viewing wait for
+the network. The remote folder is authoritative.
 
 ## Deployment
 
@@ -212,16 +187,20 @@ Use a dedicated upload user such as `agh-upload`. That account should write only
 ```bash
 AGH_DEPLOY_REMOTE=ubuntu@example.org \
 AGH_SSH_KEY_PATH=$HOME/.ssh/agh-deploy.pem \
-AGH_BASIC_AUTH_USER=agh-lab \
-AGH_BASIC_AUTH_PASSWORD='choose-a-real-password' \
 python deploy.py
 ```
 
 Those values are placeholders. Use the real server address and the real SSH key path from your Lightsail setup.
 
-The script uploads the frontend source, builds it on the server, uploads the backend package, installs locked backend dependencies into `/home/ubuntu/agh-viewer/venv`, installs `backend/agh_backend.service`, creates the Apache Basic Auth password file, installs `infra/apache/agh-viewer.conf`, runs `apache2ctl configtest`, and reloads Apache.
+The script uploads the frontend source, builds it on the server, uploads the backend package (including `manage_users.py` and `sync_images.py`), installs locked backend dependencies into `/home/ubuntu/agh-viewer/venv`, creates the auth state directory, installs the API and image-sync services, installs `infra/apache/agh-viewer.conf`, runs `apache2ctl configtest`, and reloads Apache. Create accounts afterwards with `manage_users.py` (see `docs/security.md`).
 
 ## Tests
+
+Viewer-only source guard:
+
+```bash
+make viewer-only-check
+```
 
 Backend tests:
 
@@ -244,9 +223,17 @@ make test
 ## Viewer Features
 
 - Case and TIFF browser
-- TIFF metadata, channel PNG rendering, and thumbnail preview
-- Multi-channel canvas composition
+- Bounded auto-adjusted TIFF previews in the case browser; the TIFF source is never modified
+- Per-channel marker / antibody mapping, visibility, display color, min/max windowing, brightness, contrast, and black/white inversion
 - Pan and zoom
-- Point, line, arrow, rectangle, ellipse, freehand, and text annotations
+- Point, line, arrow, rectangle, ellipse, freehand, text, and calibrated ruler annotations
+- Adjustable annotation color, stroke thickness, and text size
+- Pixel calibration from image metadata with a visible `0.106872 µm/px` fallback
 - Revisioned annotation save with conflict detection
 - PDF export with or without annotation overlay
+
+## Raw Display Contract
+
+This repository is intentionally viewer-only. It does not contain segmentation, model inference, metrics, watershed processing, or analysis-worker code.
+
+The backend retains a simple raw PNG endpoint for compatibility. The case browser now uses a bounded, versioned PNG preview so remote users do not download every full-resolution raw channel just by selecting an image. Opening the editor still loads immutable raw channel planes and applies reversible display-only controls without changing the TIFF. Supported raw channel formats are 8-bit or 16-bit unsigned grayscale planes. Files that would require intensity conversion are rejected with an explicit error rather than silently normalized.

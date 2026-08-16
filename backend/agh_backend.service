@@ -7,10 +7,12 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/agh-viewer/backend
 Environment="AGH_DATA_ROOT=/data/AGH_APP"
 Environment="AGH_ANN_ROOT=/data/agh_annotations"
-Environment="AGH_CACHE_ROOT=/data/agh_cache"
-Environment="AGH_ANALYSIS_ROOT=/data/agh_analysis"
-Environment="AGH_MODEL_ROOT=/data/agh_models"
-Environment="AGH_ANALYSIS_DB=/data/agh_analysis/jobs.sqlite3"
+Environment="AGH_STATE_DIR=/home/ubuntu/agh-viewer/state"
+Environment="AGH_AUTH_REQUIRED=1"
+Environment="AGH_COOKIE_SECURE=auto"
+# Optional shared remote-sync settings.  Keep the mounted source out of
+# AGH_DATA_ROOT: the API always reads only the local cache.
+EnvironmentFile=-/etc/agh-viewer/image-sync.env
 Environment="PATH=/home/ubuntu/agh-viewer/venv/bin:/usr/local/bin:/usr/bin:/bin"
 ExecStart=/home/ubuntu/agh-viewer/venv/bin/gunicorn --bind 127.0.0.1:5055 --workers 2 --threads 4 --timeout 120 "agh_api:create_app()"
 Restart=always
