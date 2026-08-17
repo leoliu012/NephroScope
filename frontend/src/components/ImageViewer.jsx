@@ -29,10 +29,17 @@ import {
   ZoomOut,
   Ruler,
   Settings,
+  Play,
+  Loader2,
+  ScanLine,
+  Eye,
+  EyeOff,
 } from 'lucide-react'
 import { jsPDF } from 'jspdf'
 import AnnotationLayer from './AnnotationLayer.jsx'
 import ChannelControls from './ChannelControls.jsx'
+import ModelMaskOverlay from './ModelMaskOverlay.jsx'
+import ModelRoiLayer from './ModelRoiLayer.jsx'
 import MultiChannelCanvas from './MultiChannelCanvas.jsx'
 import ZSliceSlider, { zIndexForAnnotation } from './ZSliceSlider.jsx'
 import { autoWindowChannelSettings, loadChannelSettings, normalizeChannelSettings, saveChannelSettings } from '../channelDisplay.js'
@@ -47,6 +54,23 @@ import {
 import { normalizeAnnotationForStorage, normalizedAnnotationType } from '../annotationTypes.js'
 import { authFetch, currentProfile, currentUser, rememberProfile } from '../auth.js'
 import { fetchViewState, updateViewState } from '../collaboration.js'
+import {
+  calibrationPayload,
+  createModelRun,
+  deleteModelRunsForSlice,
+  dynamicThicknessMeasurements,
+  fetchLatestModelRuns,
+  fetchModelRun,
+  formatThicknessValue,
+  indexModelRunsByZ,
+  loadModelOverlaySettings,
+  measureGbmThickness,
+  modelMaskUrl,
+  normalizeModelOverlaySettings,
+  normalizeRunStatus,
+  saveModelOverlaySettings,
+  stableModelJson,
+} from '../modelAnalysis.js'
 
 const API = '/agh/api'
 const RESEARCH_USE_NOTICE = 'Research use only. Not validated for clinical diagnosis or treatment decisions.'
@@ -282,6 +306,55 @@ async function exportCanvasFromViewer(sourceCanvas, svg, withAnnotations) {
   return output
 }
 
+function modelErrorText(value, fallback = 'Model run failed') {
+  if (typeof value === 'string' && value.trim()) return value
+  if (typeof value?.message === 'string' && value.message.trim()) return value.message
+  if (typeof value?.error === 'string' && value.error.trim()) return value.error
+  return fallback
+}
+
+function modelProgressLabel(entry, globalBusy = false) {
+  if (!entry) return globalBusy ? 'Another Z slice is running…' : 'Not run on this Z slice'
+  const status = normalizeRunStatus(entry?.status)
+  if (entry?.status === 'SUBMITTING') return 'Starting model…'
+  if (status === 'QUEUED') return 'Model queued…'
+  if (status === 'RUNNING') {
+    const progress = entry?.progress
+    if (typeof progress === 'string' && progress.trim()) return progress
+    if (typeof progress?.message === 'string' && progress.message.trim()) return progress.message
+    if (typeof progress?.stage === 'string' && progress.stage.trim()) return progress.stage
+    return 'Running model…'
+  }
+  if (status === 'SUCCEEDED') {
+    if (entry?.maskStatus === 'error') return 'Mask unavailable'
+    if (entry?.maskStatus !== 'ready') return 'Loading model overlay…'
+    return 'Model ready'
+  }
+  if (status === 'FAILED') return 'Model failed'
+  return globalBusy ? 'Another Z slice is running…' : 'Not run on this Z slice'
+}
+
+function modelChannelLabel(settings, index) {
+  const setting = settings?.find?.(item => Number(item?.index) === Number(index)) || settings?.[index]
+  const marker = setting?.marker === 'Custom' ? setting.customMarker : setting?.marker
+  return marker && marker !== 'Unassigned' ? `Channel ${index + 1} — ${marker}` : `Channel ${index + 1}`
+}
+
+function modelProgressPercent(entry) {
+  const explicitPercent = Number(entry?.progress?.percent)
+  if (Number.isFinite(explicitPercent)) return Math.max(0, Math.min(100, explicitPercent))
+  const fraction = Number(entry?.progress?.fraction)
+  if (Number.isFinite(fraction)) return Math.max(0, Math.min(100, fraction * 100))
+  return entry?.status === 'SUBMITTING' ? 0 : null
+}
+
+function thicknessSampleCount(result) {
+  const source = result?.result && typeof result.result === 'object' ? result.result : result
+  const value = source?.sampleCount ?? source?.measurementCount ?? source?.pointCount ?? source?.points?.length
+  const number = Number(value)
+  return Number.isFinite(number) && number >= 0 ? Math.round(number) : null
+}
+
 export default function ImageViewer({
   caseId,
   filename,
@@ -306,6 +379,14 @@ export default function ImageViewer({
   const [sliceLoadState, setSliceLoadState] = useState({ status: 'idle', requestedZIndex: 0, displayedZIndex: null, loadedChannels: 0, channelCount: 0 })
   const [fullImageCacheRequest, setFullImageCacheRequest] = useState(0)
   const [fullImageCacheState, setFullImageCacheState] = useState({ status: 'idle', completedPlanes: 0, totalPlanes: 0, etaMs: 0, persistent: false, error: '' })
+  const [modelRunsByZ, setModelRunsByZ] = useState({})
+  const [modelInputChannel, setModelInputChannel] = useState(0)
+  const [modelOverlaySettings, setModelOverlaySettings] = useState(() => loadModelOverlaySettings())
+  const [modelRoisByZ, setModelRoisByZ] = useState({})
+  const [modelMeasurementsByZ, setModelMeasurementsByZ] = useState({})
+  const [modelRoiMessage, setModelRoiMessage] = useState('')
+  const [modelHistoryError, setModelHistoryError] = useState('')
+  const [modelDeleteState, setModelDeleteState] = useState({ zIndex: null, status: 'idle', message: '' })
   const [viewStateRevision, setViewStateRevision] = useState(0)
   const [viewStateChangedBy, setViewStateChangedBy] = useState('')
   const autoWindowAppliedRef = useRef(false)
@@ -365,6 +446,10 @@ export default function ImageViewer({
   const panRafRef = useRef(null)
   const zScrubTimerRef = useRef(null)
   const zScrubTargetRef = useRef(0)
+  const modelRequestEpochRef = useRef(0)
+  const modelStartAbortRef = useRef(null)
+  const modelMeasurementAbortRef = useRef(null)
+  const modelViewRef = useRef({ imageKey: '', zIndex: 0 })
   const undoStackRef = useRef([])
   const redoStackRef = useRef([])
   const annotationClipboardRef = useRef(null)
@@ -372,11 +457,17 @@ export default function ImageViewer({
   const toolbarDragRef = useRef(null)
 
   const imageKey = `${caseId}/${filename}`
+  modelViewRef.current = { imageKey, zIndex }
   const imageApiBase = `${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}`
   const measurementMeta = useMemo(() => (
     imgMeta ? applyMeasurementSettings(imgMeta, measurementSettings || defaultMeasurementSettings(imgMeta, caseId)) : null
   ), [caseId, imgMeta, measurementSettings])
   const zCount = Math.max(1, Number(imgMeta?.zCount) || 1)
+  const modelChannelCount = Math.max(1, Number(imgMeta?.channelCount) || 1)
+  const pendingModelRunTargets = useMemo(() => Object.entries(modelRunsByZ)
+    .filter(([, entry]) => entry?.runId && ['QUEUED', 'RUNNING'].includes(normalizeRunStatus(entry.status)))
+    .map(([zKey, entry]) => ({ zKey, runId: entry.runId })), [modelRunsByZ])
+  const pendingModelRunKey = pendingModelRunTargets.map(item => `${item.zKey}:${item.runId}`).sort().join('|')
 
   useEffect(() => {
     setSidebarTab(normalizeSidebarTab(initialTab))
@@ -419,6 +510,9 @@ export default function ImageViewer({
 
   useEffect(() => {
     const controller = new AbortController()
+    modelRequestEpochRef.current += 1
+    modelStartAbortRef.current?.abort()
+    modelMeasurementAbortRef.current?.abort()
     setLoadError(null)
     setImgMeta(null)
     setChannelSettings(null)
@@ -430,6 +524,13 @@ export default function ImageViewer({
     setSliceLoadState({ status: 'idle', requestedZIndex: 0, displayedZIndex: null, loadedChannels: 0, channelCount: 0 })
     setFullImageCacheRequest(0)
     setFullImageCacheState({ status: 'idle', completedPlanes: 0, totalPlanes: 0, etaMs: 0, persistent: false, error: '' })
+    setModelRunsByZ({})
+    setModelRoisByZ({})
+    setModelMeasurementsByZ({})
+    setModelRoiMessage('')
+    setModelHistoryError('')
+    setModelDeleteState({ zIndex: null, status: 'idle', message: '' })
+    setModelInputChannel(0)
     fetchJson(`${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}/meta`, { signal: controller.signal })
       .then(async meta => {
         let sharedState = null
@@ -451,6 +552,7 @@ export default function ImageViewer({
         setImgMeta(meta)
         setChannelSettings(nextChannelSettings)
         setMeasurementSettings(nextMeasurementSettings)
+        setModelInputChannel(Math.max(1, Number(meta?.channelCount) || 1) > 1 ? 1 : 0)
         setZIndex(nextZIndex)
         setZDraftIndex(nextZIndex)
         setViewStateRevision(sharedState?.revision || 0)
@@ -461,8 +563,38 @@ export default function ImageViewer({
         window.setTimeout(() => { applyingRemoteViewStateRef.current = false }, 0)
       })
       .catch(err => { if (err.name !== 'AbortError') setLoadError(err.message) })
-    return () => controller.abort()
+    return () => {
+      controller.abort()
+      modelRequestEpochRef.current += 1
+      modelStartAbortRef.current?.abort()
+      modelMeasurementAbortRef.current?.abort()
+    }
   }, [caseId, filename, fitToViewport])
+
+  useEffect(() => {
+    if (loadedImageKey !== imageKey) return undefined
+    const controller = new AbortController()
+    setModelHistoryError('')
+    fetchLatestModelRuns(imageApiBase, { signal: controller.signal })
+      .then(payload => {
+        if (controller.signal.aborted) return
+        const restored = indexModelRunsByZ(payload?.runs, imageKey)
+        setModelRunsByZ(current => {
+          // A run submitted in this browser while history was loading is newer
+          // than the response and must remain authoritative.
+          for (const [zKey, entry] of Object.entries(current)) {
+            if (entry?.imageKey === imageKey) restored[zKey] = entry
+          }
+          return restored
+        })
+      })
+      .catch(error => {
+        if (error.name !== 'AbortError') {
+          setModelHistoryError(error.message || 'Unable to restore saved model predictions')
+        }
+      })
+    return () => controller.abort()
+  }, [imageApiBase, imageKey, loadedImageKey])
 
   useEffect(() => {
     if (!channelSettings || loadedImageKey !== imageKey) return
@@ -473,6 +605,10 @@ export default function ImageViewer({
     if (!measurementSettings || loadedImageKey !== imageKey) return
     saveMeasurementSettings(caseId, filename, measurementSettings)
   }, [caseId, filename, imageKey, loadedImageKey, measurementSettings])
+
+  useEffect(() => {
+    saveModelOverlaySettings(modelOverlaySettings)
+  }, [modelOverlaySettings])
 
   useEffect(() => {
     if (!imgMeta || loadedImageKey !== imageKey || !channelSettings || !measurementSettings) return undefined
@@ -570,6 +706,56 @@ export default function ImageViewer({
     autoWindowAppliedRef.current = true
     setChannelSettings(autoWindowChannelSettings(channelSettings, channelStats, imgMeta, { onlyUninitialized: true }))
   }, [imgMeta, channelSettings, channelStats])
+
+  useEffect(() => {
+    if (!pendingModelRunKey) return undefined
+    const targets = pendingModelRunTargets
+    const controller = new AbortController()
+    let cancelled = false
+    let timer = null
+
+    const poll = async () => {
+      await Promise.all(targets.map(async ({ zKey, runId }) => {
+        try {
+          const latest = await fetchModelRun(runId, { signal: controller.signal })
+          if (cancelled) return
+          const status = normalizeRunStatus(latest.status)
+          setModelRunsByZ(current => {
+            const entry = current[zKey]
+            if (!entry || entry.runId !== runId) return current
+            return {
+              ...current,
+              [zKey]: {
+                ...entry,
+                ...latest,
+                status,
+                error: status === 'FAILED' ? modelErrorText(latest.error, 'Model run failed') : '',
+                pollError: '',
+                maskStatus: status === 'SUCCEEDED' ? (entry.maskStatus || 'loading') : entry.maskStatus,
+              },
+            }
+          })
+        } catch (error) {
+          if (cancelled || error.name === 'AbortError') return
+          setModelRunsByZ(current => {
+            const entry = current[zKey]
+            if (!entry || entry.runId !== runId) return current
+            return { ...current, [zKey]: { ...entry, pollError: error.message || 'Unable to refresh model status' } }
+          })
+        }
+      }))
+      if (!cancelled) timer = window.setTimeout(poll, 1500)
+    }
+
+    void poll()
+    return () => {
+      cancelled = true
+      controller.abort()
+      if (timer) window.clearTimeout(timer)
+    }
+    // Targets change only when this stable z/run fingerprint changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingModelRunKey])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -1013,6 +1199,324 @@ export default function ImageViewer({
   }, [caseId, filename, annotations, measurementMeta])
 
   const imageReady = loadedImageKey === imageKey && imgMeta && channelSettings
+  const displayedZIndex = sliceLoadState.displayedZIndex !== null
+    && Number.isInteger(Number(sliceLoadState.displayedZIndex))
+    ? Number(sliceLoadState.displayedZIndex)
+    : null
+  const modelPlaneReady = Boolean(
+    imageReady
+    && sliceLoadState.status === 'ready'
+    && displayedZIndex === zIndex
+    && zDraftIndex === zIndex,
+  )
+  const currentModelRun = modelRunsByZ[String(zIndex)] || null
+  const currentModelRunStatus = normalizeRunStatus(currentModelRun?.status)
+  const modelBusy = Object.values(modelRunsByZ).some(entry => (
+    entry?.status === 'SUBMITTING'
+    || ['QUEUED', 'RUNNING'].includes(normalizeRunStatus(entry?.status))
+  ))
+  const currentModelRunZ = Number(currentModelRun?.requestedZIndex ?? currentModelRun?.zIndex)
+  const modelOverlayAligned = Boolean(
+    currentModelRun?.runId
+    && currentModelRunStatus === 'SUCCEEDED'
+    && currentModelRun.imageKey === imageKey
+    && currentModelRunZ === zIndex
+    && loadedImageKey === imageKey
+    && displayedZIndex === zIndex
+    && sliceLoadState.status === 'ready',
+  )
+  const currentMaskReady = modelOverlayAligned && currentModelRun?.maskStatus === 'ready'
+  const currentRoiRecord = modelRoisByZ[String(zIndex)] || null
+  const currentModelRoi = modelOverlayAligned
+    && currentRoiRecord?.runId === currentModelRun?.runId
+    && Number(currentRoiRecord?.zIndex) === zIndex
+    ? currentRoiRecord.roi
+    : null
+  const currentCalibration = calibrationPayload(measurementMeta || {})
+  const currentCalibrationKey = stableModelJson(currentCalibration)
+  const currentRoiKey = currentModelRoi ? stableModelJson(currentModelRoi) : ''
+  const currentModelMeasurement = modelMeasurementsByZ[String(zIndex)] || null
+  const currentMeasurementMatches = Boolean(
+    currentModelMeasurement
+    && currentModelMeasurement.runId === currentModelRun?.runId
+    && currentModelMeasurement.roiKey === currentRoiKey
+  )
+  const currentMeasurementResult = currentMeasurementMatches && currentModelMeasurement?.status === 'ready'
+    ? currentModelMeasurement.result
+    : null
+  const currentThickness = currentMeasurementResult
+    ? dynamicThicknessMeasurements(currentMeasurementResult, currentCalibration)
+    : null
+  const currentModelRunBusy = Boolean(currentModelRun && (
+    currentModelRun.status === 'SUBMITTING'
+    || ['QUEUED', 'RUNNING'].includes(normalizeRunStatus(currentModelRun.status))
+  ))
+  const modelCanRun = modelPlaneReady && !modelBusy
+
+  const updateModelOverlaySettings = useCallback((patch) => {
+    setModelOverlaySettings(current => normalizeModelOverlaySettings({ ...current, ...patch }))
+  }, [])
+
+  const startModelRun = useCallback(async () => {
+    if (!modelPlaneReady || modelBusy || !imgMeta) return
+    const requestedZIndex = zIndex
+    const requestedChannelIndex = Math.max(0, Math.min(
+      Math.max(0, modelChannelCount - 1),
+      Math.round(Number(modelInputChannel) || 0),
+    ))
+    const zKey = String(requestedZIndex)
+    const requestEpoch = modelRequestEpochRef.current
+    const requestImageKey = imageKey
+    const controller = new AbortController()
+    modelStartAbortRef.current?.abort()
+    modelStartAbortRef.current = controller
+    setActiveTool(current => current === 'model-roi' ? 'select' : current)
+    setModelRoisByZ(current => {
+      if (!(zKey in current)) return current
+      const next = { ...current }
+      delete next[zKey]
+      return next
+    })
+    setModelMeasurementsByZ(current => {
+      if (!(zKey in current)) return current
+      const next = { ...current }
+      delete next[zKey]
+      return next
+    })
+    setModelRoiMessage('')
+    setModelDeleteState({ zIndex: null, status: 'idle', message: '' })
+    setModelRunsByZ(current => ({
+      ...current,
+      [zKey]: {
+        status: 'SUBMITTING',
+        requestedZIndex,
+        channelIndex: requestedChannelIndex,
+        imageKey: requestImageKey,
+        error: '',
+        pollError: '',
+        maskStatus: null,
+      },
+    }))
+
+    try {
+      const created = await createModelRun(imageApiBase, {
+        zIndex: requestedZIndex,
+        channelIndex: requestedChannelIndex,
+      }, { signal: controller.signal })
+      const runId = String(created?.runId ?? created?.id ?? '').trim()
+      if (!runId) throw new Error('The server did not return a model run identifier')
+      if (
+        controller.signal.aborted
+        || requestEpoch !== modelRequestEpochRef.current
+        || requestImageKey !== imageKey
+      ) return
+      const status = normalizeRunStatus(created?.status || 'QUEUED')
+      setModelRunsByZ(current => {
+        const entry = current[zKey]
+        if (!entry || entry.imageKey !== requestImageKey || entry.status !== 'SUBMITTING') return current
+        return {
+          ...current,
+          [zKey]: {
+            ...entry,
+            ...created,
+            runId,
+            status,
+            requestedZIndex,
+            channelIndex: requestedChannelIndex,
+            imageKey: requestImageKey,
+            maskStatus: status === 'SUCCEEDED' ? 'loading' : null,
+          },
+        }
+      })
+    } catch (error) {
+      if (error.name === 'AbortError') return
+      setModelRunsByZ(current => {
+        const entry = current[zKey]
+        if (!entry || entry.imageKey !== requestImageKey || entry.status !== 'SUBMITTING') return current
+        return {
+          ...current,
+          [zKey]: {
+            ...entry,
+            status: 'FAILED',
+            error: modelErrorText(error),
+          },
+        }
+      })
+    } finally {
+      if (modelStartAbortRef.current === controller) modelStartAbortRef.current = null
+    }
+  }, [imageApiBase, imageKey, imgMeta, modelBusy, modelChannelCount, modelInputChannel, modelPlaneReady, zIndex])
+
+  const deleteCurrentModelPrediction = useCallback(async () => {
+    if (!currentModelRun || currentModelRunBusy) return
+    const requestedZIndex = zIndex
+    if (!window.confirm(`Delete every saved model prediction for Z ${requestedZIndex + 1}? This cannot be undone.`)) return
+    setModelDeleteState({ zIndex: requestedZIndex, status: 'deleting', message: '' })
+    try {
+      const result = await deleteModelRunsForSlice(imageApiBase, requestedZIndex)
+      const zKey = String(requestedZIndex)
+      setModelRunsByZ(current => {
+        if (!(zKey in current)) return current
+        const next = { ...current }
+        delete next[zKey]
+        return next
+      })
+      setModelRoisByZ(current => {
+        if (!(zKey in current)) return current
+        const next = { ...current }
+        delete next[zKey]
+        return next
+      })
+      setModelMeasurementsByZ(current => {
+        if (!(zKey in current)) return current
+        const next = { ...current }
+        delete next[zKey]
+        return next
+      })
+      setActiveTool(current => current === 'model-roi' ? 'select' : current)
+      setModelDeleteState({
+        zIndex: requestedZIndex,
+        status: 'deleted',
+        message: result?.deleted
+          ? `Saved prediction deleted for Z ${requestedZIndex + 1}.`
+          : `No saved prediction remained on Z ${requestedZIndex + 1}.`,
+      })
+    } catch (error) {
+      setModelDeleteState({
+        zIndex: requestedZIndex,
+        status: 'error',
+        message: modelErrorText(error, 'Unable to delete the saved prediction'),
+      })
+    }
+  }, [currentModelRun, currentModelRunBusy, imageApiBase, zIndex])
+
+  const handleModelMaskReady = useCallback(() => {
+    const zKey = String(zIndex)
+    const runId = currentModelRun?.runId
+    setModelRunsByZ(current => {
+      const entry = current[zKey]
+      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
+      return { ...current, [zKey]: { ...entry, maskStatus: 'ready', maskError: '' } }
+    })
+  }, [currentModelRun?.runId, imageKey, zIndex])
+
+  const handleModelMaskError = useCallback((message) => {
+    const zKey = String(zIndex)
+    const runId = currentModelRun?.runId
+    setActiveTool(current => current === 'model-roi' ? 'select' : current)
+    setModelRunsByZ(current => {
+      const entry = current[zKey]
+      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
+      return {
+        ...current,
+        [zKey]: {
+          ...entry,
+          maskStatus: 'error',
+          maskError: modelErrorText(message, 'Unable to load the model mask'),
+        },
+      }
+    })
+  }, [currentModelRun?.runId, imageKey, zIndex])
+
+  const activateModelRoi = useCallback(() => {
+    if (!currentMaskReady) return
+    setAnnotationToolsOpen(false)
+    setSelectedId(null)
+    setModelRoiMessage('Drag around the region to measure, then release to close the ROI.')
+    setActiveTool('model-roi')
+  }, [currentMaskReady])
+
+  const handleModelRoiComplete = useCallback((roi) => {
+    if (!currentMaskReady || !currentModelRun?.runId) return
+    const zKey = String(zIndex)
+    setModelRoisByZ(current => ({
+      ...current,
+      [zKey]: { runId: currentModelRun.runId, zIndex, roi },
+    }))
+    setModelMeasurementsByZ(current => {
+      if (!(zKey in current)) return current
+      const next = { ...current }
+      delete next[zKey]
+      return next
+    })
+    setModelRoiMessage('ROI ready. Select Measure thickness to calculate the average.')
+    setActiveTool('select')
+  }, [currentMaskReady, currentModelRun?.runId, zIndex])
+
+  const handleModelRoiInvalid = useCallback((message) => {
+    setModelRoiMessage(message || 'Draw a larger closed region before measuring.')
+  }, [])
+
+  const clearModelRoi = useCallback(() => {
+    const zKey = String(zIndex)
+    setModelRoisByZ(current => {
+      if (!(zKey in current)) return current
+      const next = { ...current }
+      delete next[zKey]
+      return next
+    })
+    setModelMeasurementsByZ(current => {
+      if (!(zKey in current)) return current
+      const next = { ...current }
+      delete next[zKey]
+      return next
+    })
+    setModelRoiMessage('ROI cleared.')
+    setActiveTool(current => current === 'model-roi' ? 'select' : current)
+  }, [zIndex])
+
+  const measureCurrentModelRoi = useCallback(async () => {
+    if (!currentMaskReady || !currentModelRoi || !currentModelRun?.runId) return
+    const runId = currentModelRun.runId
+    const zKey = String(zIndex)
+    const roi = currentModelRoi
+    const roiKey = stableModelJson(roi)
+    const calibration = calibrationPayload(measurementMeta || {})
+    const calibrationKey = stableModelJson(calibration)
+    const requestEpoch = modelRequestEpochRef.current
+    const controller = new AbortController()
+    modelMeasurementAbortRef.current?.abort()
+    modelMeasurementAbortRef.current = controller
+    setModelMeasurementsByZ(current => ({
+      ...current,
+      [zKey]: { status: 'measuring', runId, roiKey, calibrationKey, error: '' },
+    }))
+    setModelRoiMessage('Measuring average GBM thickness…')
+    try {
+      const result = await measureGbmThickness(runId, { roi, calibration }, { signal: controller.signal })
+      if (controller.signal.aborted || requestEpoch !== modelRequestEpochRef.current) return
+      setModelMeasurementsByZ(current => {
+        const entry = current[zKey]
+        if (!entry || entry.runId !== runId || entry.roiKey !== roiKey || entry.calibrationKey !== calibrationKey) return current
+        return { ...current, [zKey]: { ...entry, status: 'ready', result } }
+      })
+      if (modelViewRef.current.imageKey === imageKey && modelViewRef.current.zIndex === zIndex) {
+        setModelRoiMessage('Thickness measurement complete.')
+      }
+    } catch (error) {
+      if (error.name === 'AbortError') return
+      setModelMeasurementsByZ(current => {
+        const entry = current[zKey]
+        if (!entry || entry.runId !== runId || entry.roiKey !== roiKey || entry.calibrationKey !== calibrationKey) return current
+        return {
+          ...current,
+          [zKey]: { ...entry, status: 'error', error: modelErrorText(error, 'Unable to measure GBM thickness') },
+        }
+      })
+      if (modelViewRef.current.imageKey === imageKey && modelViewRef.current.zIndex === zIndex) {
+        // The measurement card renders the request error below; keep the
+        // transient instruction line clear so the same message is not shown twice.
+        setModelRoiMessage('')
+      }
+    } finally {
+      if (modelMeasurementAbortRef.current === controller) modelMeasurementAbortRef.current = null
+    }
+  }, [currentMaskReady, currentModelRoi, currentModelRun?.runId, imageKey, measurementMeta, zIndex])
+
+  useEffect(() => {
+    setActiveTool(current => current === 'model-roi' ? 'select' : current)
+    setModelRoiMessage('')
+  }, [imageKey, zIndex])
 
   const handleSliceLoadState = useCallback(nextState => {
     setSliceLoadState(nextState)
@@ -1164,6 +1668,11 @@ export default function ImageViewer({
   const displayedMeasurementSettings = measurementSettings || defaultMeasurementSettings(imgMeta, caseId)
   const expansionEnabled = displayedMeasurementSettings.expansionEnabled !== false
   const expansionFactor = Number(displayedMeasurementSettings.expansionFactor) || DEFAULT_EXPANSION_FACTOR
+  const currentModelError = currentModelRun?.maskError || currentModelRun?.error || currentModelRun?.pollError || ''
+  const currentModelProgressPercent = modelProgressPercent(currentModelRun)
+  const currentMeasurementSampleCount = currentMeasurementResult
+    ? thicknessSampleCount(currentMeasurementResult)
+    : null
   const exportFloatingRight = sidebarCollapsed ? 18 : 338
   const exportFloatingBottom = zCount > 1 ? 108 : 64
   const exportFloatingStyle = {
@@ -1219,6 +1728,17 @@ export default function ImageViewer({
         >
           <PenLine size={16} />
         </button>
+        <div className="ux-divider my-2 h-px w-8" />
+        <button
+          type="button"
+          disabled={!currentMaskReady}
+          onClick={activateModelRoi}
+          className={`ux-tool-button ${activeTool === 'model-roi' ? 'ux-tool-button-active' : ''}`}
+          title={currentMaskReady ? 'Draw GBM thickness ROI' : 'Run the model on this Z slice before drawing an ROI'}
+          aria-label="Draw GBM thickness ROI"
+        >
+          <ScanLine size={16} />
+        </button>
       </div>
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -1241,6 +1761,20 @@ export default function ImageViewer({
             className="ux-button ux-button-ghost">
             Next
             <ChevronRight size={14} />
+          </button>
+          <button
+            type="button"
+            onClick={startModelRun}
+            disabled={!modelCanRun}
+            className="ux-button ux-button-primary whitespace-nowrap"
+            title={!modelPlaneReady
+              ? 'Wait for the current Z slice to finish displaying'
+              : modelBusy && !currentModelRunBusy
+                ? 'Wait for the active model run to finish'
+                : 'Run the GBM model on the displayed Z slice'}
+          >
+            {currentModelRunBusy ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
+            {currentModelRunBusy ? 'Running model' : 'Run model'}
           </button>
           <div className="ux-divider mx-1 h-5 w-px" />
           <button onClick={setActualSize}
@@ -1378,13 +1912,26 @@ export default function ImageViewer({
                   onCacheProgress={handleFullImageCacheProgress}
                 />
               )}
+              {modelOverlayAligned && currentModelRun?.runId && (
+                <ModelMaskOverlay
+                  key={`${imageKey}:${currentModelRun.runId}`}
+                  maskUrl={modelMaskUrl(currentModelRun.runId)}
+                  width={imgMeta?.width}
+                  height={imgMeta?.height}
+                  color={modelOverlaySettings.color}
+                  opacity={modelOverlaySettings.opacity}
+                  visible={modelOverlaySettings.visible}
+                  onReady={handleModelMaskReady}
+                  onError={handleModelMaskError}
+                />
+              )}
               {imgMeta && (
                 <AnnotationLayer
                   svgRef={svgRef}
                   imgMeta={measurementMeta}
                   annotations={annotations}
                   setAnnotations={setAnnsAndDirty}
-                  activeTool={activeTool}
+                  activeTool={activeTool === 'model-roi' ? 'select' : activeTool}
                   panActive={panActive}
                   annotatorName={annotator}
                   annotationColor={annColor}
@@ -1399,6 +1946,15 @@ export default function ImageViewer({
                   zIndex={zIndex}
                   zCount={zCount}
                   readOnly={!canAnnotate}
+                />
+              )}
+              {imgMeta && modelOverlayAligned && (
+                <ModelRoiLayer
+                  imgMeta={imgMeta}
+                  active={activeTool === 'model-roi' && currentMaskReady}
+                  roi={currentMaskReady ? currentModelRoi : null}
+                  onComplete={handleModelRoiComplete}
+                  onInvalid={handleModelRoiInvalid}
                 />
               )}
             </div>
@@ -1420,6 +1976,7 @@ export default function ImageViewer({
                 zCount={zCount}
                 value={zDraftIndex}
                 annotations={annotations}
+                modelRuns={modelRunsByZ}
                 onInput={scrubZSlice}
                 onCommit={commitZSlice}
                 onJumpToSlice={commitZSlice}
@@ -1476,6 +2033,15 @@ export default function ImageViewer({
             {measurementMeta?.expansionEnabled && <span>Expansion: {expansionFactor}x</span>}
             <span>{annotations.length} annotation{annotations.length === 1 ? '' : 's'}</span>
             {selectedMeasurement && <span>Selected ruler: {selectedMeasurement}</span>}
+            {(currentModelRun || modelBusy) && (
+              <span>GBM model: {modelProgressLabel(currentModelRun, modelBusy)}</span>
+            )}
+            {currentThickness && (
+              <span className="font-semibold text-[var(--text)]">
+                ROI average after EF: {formatThicknessValue(currentThickness.after)}
+                {' · '}before EF: {formatThicknessValue(currentThickness.before)}
+              </span>
+            )}
           </div>
           <div className="viewer-statusbar-actions">
             <span className="text-[12px] text-[var(--text-subtle)]">{canAnnotate ? (dirty ? 'Auto-saving annotations...' : 'Annotations saved') : 'Read-only'}</span>
@@ -1679,6 +2245,206 @@ export default function ImageViewer({
                       <span className="font-mono text-[var(--text)]">{expansionEnabled ? 'nm' : 'µm'}</span>
                     </div>
                   </div>
+                </div>
+
+                <div className="ux-card space-y-3 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-[12px] font-semibold text-[var(--text)]">
+                      <ScanLine size={13} /> MorphoGBM v10
+                    </div>
+                    <span className="ux-badge">Z {zIndex + 1}</span>
+                  </div>
+
+                  <label className="block">
+                    <span className="mb-1 block text-[11px] text-[var(--text-subtle)]">Model input channel</span>
+                    <select
+                      value={Math.max(0, Math.min(modelChannelCount - 1, modelInputChannel))}
+                      onChange={event => setModelInputChannel(Number(event.currentTarget.value))}
+                      disabled={!imageReady || currentModelRunBusy}
+                      className="ux-input"
+                    >
+                      {Array.from({ length: modelChannelCount }, (_, index) => (
+                        <option key={index} value={index}>{modelChannelLabel(channelSettings, index)}</option>
+                      ))}
+                    </select>
+                    <span className="mt-1 block text-[10px] leading-snug text-[var(--text-subtle)]">
+                      {modelChannelCount > 1
+                        ? 'Channel 2 is selected by default for multi-channel images.'
+                        : 'This image has one input channel.'}
+                    </span>
+                    {zCount > 1 && (
+                      <span className="mt-1 block text-[10px] leading-snug text-[var(--text-subtle)]">
+                        The model uses an up-to-five-plane Z MIP around the displayed slice.
+                      </span>
+                    )}
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={startModelRun}
+                    disabled={!modelCanRun}
+                    className="ux-button ux-button-primary w-full"
+                  >
+                    {currentModelRunBusy ? <Loader2 size={13} className="animate-spin" /> : <Play size={13} />}
+                    {currentModelRunBusy ? 'Running model…' : 'Run model on current Z'}
+                  </button>
+
+                  <div className="rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3" role="status" aria-live="polite">
+                    <div className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
+                      {currentModelRunBusy && <Loader2 size={12} className="animate-spin text-[var(--accent)]" />}
+                      <span>{modelProgressLabel(currentModelRun, modelBusy)}</span>
+                    </div>
+                    {currentModelRunBusy && currentModelProgressPercent !== null && (
+                      <div
+                        className="mt-2 h-1.5 overflow-hidden rounded-full bg-[var(--surface-1)]"
+                        role="progressbar"
+                        aria-label="GBM model progress"
+                        aria-valuemin="0"
+                        aria-valuemax="100"
+                        aria-valuenow={Math.round(currentModelProgressPercent)}
+                      >
+                        <div
+                          className="h-full rounded-full bg-[var(--accent)] transition-[width] duration-300"
+                          style={{ width: `${currentModelProgressPercent}%` }}
+                        />
+                      </div>
+                    )}
+                    {currentModelRun?.runId && (
+                      <p className="mt-1 truncate font-mono text-[10px] text-[var(--text-subtle)]" title={currentModelRun.runId}>
+                        Run {currentModelRun.runId} · input {Number(currentModelRun.channelIndex) + 1 || 1}
+                      </p>
+                    )}
+                    {currentModelError && (
+                      <p className="mt-2 break-words text-[11px] leading-snug text-red-300">{currentModelError}</p>
+                    )}
+                    {modelHistoryError && (
+                      <p className="mt-2 break-words text-[11px] leading-snug text-red-300">{modelHistoryError}</p>
+                    )}
+                  </div>
+
+                  {currentModelRun && !currentModelRunBusy && (
+                    <button
+                      type="button"
+                      onClick={deleteCurrentModelPrediction}
+                      disabled={modelDeleteState.status === 'deleting'}
+                      className="ux-button ux-button-secondary w-full text-red-300"
+                    >
+                      {modelDeleteState.status === 'deleting'
+                        ? <Loader2 size={13} className="animate-spin" />
+                        : <Trash2 size={13} />}
+                      {modelDeleteState.status === 'deleting'
+                        ? 'Deleting saved prediction…'
+                        : 'Delete prediction for this Z'}
+                    </button>
+                  )}
+                  {modelDeleteState.zIndex === zIndex && modelDeleteState.message && (
+                    <p className={`text-[11px] leading-snug ${modelDeleteState.status === 'error' ? 'text-red-300' : 'text-[var(--text-muted)]'}`}>
+                      {modelDeleteState.message}
+                    </p>
+                  )}
+
+                  <div className="space-y-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
+                    <label className="flex items-center justify-between gap-3">
+                      <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
+                        {modelOverlaySettings.visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                        Show overlay
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={modelOverlaySettings.visible}
+                        onChange={event => updateModelOverlaySettings({ visible: event.currentTarget.checked })}
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-3">
+                      <span className="text-[12px] text-[var(--text-muted)]">Overlay color</span>
+                      <input
+                        type="color"
+                        value={modelOverlaySettings.color}
+                        onChange={event => updateModelOverlaySettings({ color: event.currentTarget.value })}
+                        className="h-7 w-12 cursor-pointer rounded border border-[var(--border)] bg-transparent p-0.5"
+                        aria-label="Model overlay color"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 flex items-center justify-between gap-2 text-[12px] text-[var(--text-muted)]">
+                        <span>Overlay opacity</span>
+                        <span className="font-mono text-[var(--text)]">{Math.round(modelOverlaySettings.opacity * 100)}%</span>
+                      </span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        step="1"
+                        value={Math.round(modelOverlaySettings.opacity * 100)}
+                        onChange={event => updateModelOverlaySettings({ opacity: Number(event.currentTarget.value) / 100 })}
+                        className="w-full"
+                      />
+                    </label>
+                  </div>
+
+                  {currentMaskReady && (
+                    <div className="space-y-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
+                      <div>
+                        <p className="text-[12px] font-semibold text-[var(--text)]">ROI thickness</p>
+                        <p className="mt-1 text-[10px] leading-snug text-[var(--text-subtle)]">
+                          Draw a freehand polygon on this Z slice. The ROI is temporary and is not saved as an annotation.
+                        </p>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button type="button" onClick={activateModelRoi} className="ux-button ux-button-secondary min-h-0 px-2 py-1.5 text-[11px]">
+                          <ScanLine size={12} /> {currentModelRoi ? 'Redraw ROI' : 'Draw ROI'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={clearModelRoi}
+                          disabled={!currentModelRoi}
+                          className="ux-button ux-button-secondary min-h-0 px-2 py-1.5 text-[11px]"
+                        >
+                          <Trash2 size={12} /> Clear ROI
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={measureCurrentModelRoi}
+                        disabled={!currentModelRoi || currentModelMeasurement?.status === 'measuring'}
+                        className="ux-button ux-button-primary w-full"
+                      >
+                        {currentModelMeasurement?.status === 'measuring'
+                          ? <Loader2 size={13} className="animate-spin" />
+                          : <Ruler size={13} />}
+                        {currentModelMeasurement?.status === 'measuring' ? 'Measuring…' : 'Measure average thickness'}
+                      </button>
+                      {modelRoiMessage && (
+                        <p className="text-[11px] leading-snug text-[var(--text-muted)]">{modelRoiMessage}</p>
+                      )}
+                      {currentThickness && (
+                        <div className="rounded border border-[var(--accent)] bg-[var(--surface-1)] p-3">
+                          <p className="text-[10px] uppercase tracking-wide text-[var(--text-subtle)]">After EF adjustment · primary</p>
+                          <p className="mt-1 font-mono text-lg font-semibold text-[var(--text)]">
+                            {formatThicknessValue(currentThickness.after)}
+                          </p>
+                          <div className="mt-2 flex items-center justify-between gap-3 border-t border-[var(--border)] pt-2 text-[11px]">
+                            <span className="text-[var(--text-subtle)]">Before EF adjustment</span>
+                            <span className="font-mono font-semibold text-[var(--text)]">{formatThicknessValue(currentThickness.before)}</span>
+                          </div>
+                          <p className="mt-1 text-[10px] text-[var(--text-subtle)]">
+                            Updates with pixel size and {currentThickness.expansionEnabled ? `${currentThickness.expansionFactor}× EF` : 'EF setting (currently off)'}.
+                          </p>
+                          {currentMeasurementSampleCount !== null && (
+                            <p className="mt-1 text-[10px] text-[var(--text-subtle)]">
+                              {currentMeasurementSampleCount} sample{currentMeasurementSampleCount === 1 ? '' : 's'}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                      {currentMeasurementMatches && currentModelMeasurement?.status === 'ready' && !currentThickness && (
+                        <p className="text-[11px] leading-snug text-red-300">The server returned a result without an average thickness value.</p>
+                      )}
+                      {currentMeasurementMatches && currentModelMeasurement?.status === 'error' && (
+                        <p className="text-[11px] leading-snug text-red-300">{currentModelMeasurement.error}</p>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             )}

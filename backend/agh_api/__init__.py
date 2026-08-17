@@ -6,6 +6,8 @@ from flask import Flask, g, jsonify, request, send_file
 from werkzeug.exceptions import HTTPException
 
 from .annotation_service import AnnotationService
+from .analysis_routes import register_analysis_routes
+from .analysis_store import AnalysisStore
 from .audit import audit_event, install_audit
 from .auth import ROLES, UserError, has_permission, install_auth
 from .collaboration_service import CollaborationService, collaboration_actor
@@ -18,7 +20,7 @@ from .tiff_service import RawChannelCache, get_metadata, render_preview_png, ren
 
 
 log = logging.getLogger(__name__)
-VERSION = "1.3.0"
+VERSION = "1.5.0"
 
 
 def create_app(config: Optional[Config] = None):
@@ -29,6 +31,8 @@ def create_app(config: Optional[Config] = None):
     annotations = AnnotationService(cfg.ann_root)
     collaboration = CollaborationService(cfg.collaboration_state_file)
     raw_channel_cache = RawChannelCache(cfg.raw_channel_cache_bytes)
+    analysis_store = AnalysisStore(cfg.analysis_db, cfg.analysis_lease_seconds)
+    app.extensions["agh_analysis"] = {"store": analysis_store}
 
     @app.errorhandler(APIError)
     def handle_api_error(exc):
@@ -462,6 +466,7 @@ def create_app(config: Optional[Config] = None):
         )
         return jsonify({"ok": True})
 
+    register_analysis_routes(app, cfg, analysis_store)
     register_ef_routes(app, cfg, raw_channel_cache)
 
     return app

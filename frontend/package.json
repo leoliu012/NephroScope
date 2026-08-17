@@ -1,11 +1,12 @@
 {
   "name": "agh-viewer",
-  "version": "1.3.0",
+  "version": "1.5.0",
   "type": "module",
   "private": true,
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test:model": "node src/modelAnalysis.selftest.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

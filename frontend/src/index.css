@@ -2,6 +2,15 @@
 @tailwind components;
 @tailwind utilities;
 
+.model-mask-overlay {
+  transition: opacity 120ms ease;
+  user-select: none;
+}
+
+.model-roi-layer {
+  user-select: none;
+}
+
 :root {
   color-scheme: dark;
   --app-bg: #101317;
@@ -739,6 +748,39 @@ button { -webkit-tap-highlight-color: transparent; }
   font-weight: 700;
   line-height: 13px;
   text-align: center;
+}
+.viewer-z-model-pin {
+  position: absolute;
+  z-index: 2;
+  display: inline-flex;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 7px;
+  transform: translateX(-50%);
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-1) 88%, transparent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 18px;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+}
+.viewer-z-model-pin-running {
+  color: var(--accent);
+}
+.viewer-z-model-pin-segmented {
+  color: #4ade80;
+}
+.viewer-z-model-pin:hover,
+.viewer-z-model-pin:focus-visible {
+  color: #ffffff;
+  outline: none;
+  transform: translateX(-50%) scale(1.06);
 }
 .viewer-z-load-status {
   width: 96px;

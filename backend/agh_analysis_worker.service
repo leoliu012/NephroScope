@@ -1,0 +1,21 @@
+[Unit]
+Description=AGH MorphoGBM analysis worker
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/agh-viewer/backend
+Environment="AGH_DATA_ROOT=/data/AGH_APP"
+Environment="AGH_ANN_ROOT=/data/agh_annotations"
+Environment="AGH_STATE_DIR=/home/ubuntu/agh-viewer/state"
+Environment="AGH_MODEL_CHECKPOINT=/home/ubuntu/agh-viewer/backend/models/morphogbm_v10_topology_robust_inference.pt"
+Environment="AGH_INFERENCE_DEVICE=auto"
+Environment="PATH=/home/ubuntu/agh-viewer/inference-venv/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/ubuntu/agh-viewer/inference-venv/bin/python /home/ubuntu/agh-viewer/backend/worker.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

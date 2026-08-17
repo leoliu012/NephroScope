@@ -227,6 +227,75 @@ def render_raw_channel_bytes(filepath: Path, channel_index: int, z_index: int = 
     buf.seek(0)
     return buf
 
+
+def choose_z_window(z_index: int, z_count: int, mip_z: int = 5) -> tuple[int, ...]:
+    """Return a shifted, adjacent Z window containing ``z_index``.
+
+    Five planes are used when available. Short stacks use every available
+    plane; near either edge a full-sized window shifts inward instead of
+    shrinking. This matches the supplied ``nd2_mip_5z.py`` edge behavior while
+    making 2--4 plane TIFF/ND2 stacks useful in the viewer.
+    """
+    z_index = _strict_non_negative_index(z_index, "z index")
+    z_count = _strict_positive_count(z_count, "z count")
+    mip_z = _strict_positive_count(mip_z, "MIP Z count")
+    if z_index >= z_count:
+        raise BadRequest(f"z index must be between 0 and {z_count - 1}")
+
+    window_size = min(mip_z, z_count)
+    slices_before = (window_size - 1) // 2
+    start = min(max(z_index - slices_before, 0), z_count - window_size)
+    return tuple(range(start, start + window_size))
+
+
+def read_channel_plane(filepath: Path, channel_index: int, z_index: int = 0):
+    """Read one raw 2-D channel plane without display preprocessing."""
+    channel_index = _strict_non_negative_index(channel_index, "channel index")
+    z_index = _strict_non_negative_index(z_index, "z index")
+    path = Path(filepath)
+    if _is_nd2(path):
+        return _raw_channel_array(_nd2_channel_plane(path, channel_index, z_index))
+
+    with tifffile.TiffFile(path) as tf:
+        series = _display_series(tf)
+        axes = _z_display_axes(series.shape, _axes_for_shape(series.shape, series.axes))
+        plane = _read_raw_channel_plane(series, axes, channel_index, z_index)
+    return _raw_channel_array(plane)
+
+
+def read_z_mip(filepath: Path, channel_index: int, z_index: int, mip_z: int = 5):
+    """Return ``(projection, z_indices)`` for a raw adjacent-slice Z MIP.
+
+    Only Z is projected. Channel selection is zero-based, all other non-spatial
+    axes use their first position, and source unsigned 8/16-bit values are
+    preserved exactly.
+    """
+    channel_index = _strict_non_negative_index(channel_index, "channel index")
+    z_index = _strict_non_negative_index(z_index, "z index")
+    mip_z = _strict_positive_count(mip_z, "MIP Z count")
+    path = Path(filepath)
+    if _is_nd2(path):
+        return _read_nd2_z_mip(path, channel_index, z_index, mip_z)
+
+    with tifffile.TiffFile(path) as tf:
+        series = _display_series(tf)
+        axes = _z_display_axes(series.shape, _axes_for_shape(series.shape, series.axes))
+        channel_count = _channel_count(series.shape, axes)
+        if channel_index >= channel_count:
+            raise BadRequest(f"channel index must be between 0 and {channel_count - 1}")
+        z_indices = choose_z_window(z_index, _z_count(series.shape, axes), mip_z)
+        projection = None
+        for selected_z in z_indices:
+            plane = _raw_channel_array(
+                _read_raw_channel_plane(series, axes, channel_index, selected_z)
+            )
+            if projection is None:
+                projection = np.array(plane, copy=True)
+            else:
+                np.maximum(projection, plane, out=projection)
+    return np.ascontiguousarray(projection), z_indices
+
+
 def render_preview_png(filepath: Path, max_size: int = DEFAULT_PREVIEW_MAX_SIZE, z_index: int = 0):
     """Render a bounded display preview for browsing over slower connections."""
     max_size = _preview_max_size(max_size)
@@ -346,6 +415,24 @@ def _z_index(value):
         number = 0
     if number < 0:
         raise BadRequest("z index must be a non-negative integer")
+    return number
+
+
+def _strict_non_negative_index(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise BadRequest(f"{label} must be a non-negative integer")
+    number = int(value)
+    if number < 0:
+        raise BadRequest(f"{label} must be a non-negative integer")
+    return number
+
+
+def _strict_positive_count(value, label):
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+        raise BadRequest(f"{label} must be a positive integer")
+    number = int(value)
+    if number < 1:
+        raise BadRequest(f"{label} must be a positive integer")
     return number
 
 
@@ -479,6 +566,33 @@ def _nd2_channel_plane(filepath: Path, channel_index: int, z_index: int = 0):
         frame = np.asarray(ndfile.read_frame(frame_index))
         plane = _nd2_plane_from_frame(frame, sizes, channel_index, _nd2_channel_is_looped(ndfile))
         return np.array(plane, copy=True)
+
+
+def _read_nd2_z_mip(filepath: Path, channel_index: int, z_index: int, mip_z: int):
+    _require_nd2()
+    with nd2.ND2File(filepath) as ndfile:
+        sizes = dict(ndfile.sizes)
+        channel_count = int(sizes.get("C") or 1)
+        z_count = int(sizes.get("Z") or 1)
+        if channel_index >= channel_count:
+            raise BadRequest(f"channel index must be between 0 and {channel_count - 1}")
+        z_indices = choose_z_window(z_index, z_count, mip_z)
+        channel_looped = _nd2_channel_is_looped(ndfile)
+        projection = None
+        for selected_z in z_indices:
+            frame_index = _nd2_frame_index(ndfile, channel_index, selected_z)
+            frame = np.asarray(ndfile.read_frame(frame_index))
+            plane = _raw_channel_array(
+                np.array(
+                    _nd2_plane_from_frame(frame, sizes, channel_index, channel_looped),
+                    copy=True,
+                )
+            )
+            if projection is None:
+                projection = np.array(plane, copy=True)
+            else:
+                np.maximum(projection, plane, out=projection)
+    return np.ascontiguousarray(projection), z_indices
 
 
 def _nd2_channel_is_looped(ndfile):

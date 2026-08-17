@@ -1,50 +1,97 @@
 # Architecture
 
-AGH Image Viewer is a single-server research tool. The first professionalization step is to harden the simple architecture rather than replace it with a distributed system.
+AGH Image Viewer is a single-server research tool. Its image-serving and model
+paths are deliberately separated so ordinary viewing stays source-preserving
+and long-running inference cannot tie up the web process.
 
 ## Components
 
 ```text
-apps/web equivalent: frontend/
+frontend/
   React + Vite viewer served as static files under /agh/
 
-apps/api equivalent: backend/
-  Flask application factory in agh_api/
-  Gunicorn binds to 127.0.0.1:5055
+backend/agh_api/
+  Flask API; Gunicorn binds to 127.0.0.1:5055
 
-sync-agent equivalent: backend/sync_images.py
-  Runs beside the backend and reads the mounted remote image folder
-  Mirrors final TIFF/ND2 files into the local AGH_DATA_ROOT cache
-  Tracks file identities in SQLite so remote renames are local renames
+backend/sync_images.py
+  Mirrors finalized TIFF/ND2 files from the mounted source into AGH_DATA_ROOT
+
+backend/worker.py
+  Single-process MorphoGBM worker; claims durable SQLite jobs and atomically
+  publishes immutable masks
 
 infra/
-  Apache and systemd configuration owned by the repo
+  Apache and systemd configuration owned by the repository
 ```
 
 ## API Responsibilities
 
-- `path_guard.py`: validates case and filename boundaries.
-- `tiff_service.py`: reads TIFF metadata and physical pixel calibration, transcodes the first source plane to browser-viewable PNG, and exposes selected immutable raw channel planes for browser-side display controls without MIP or scientific intensity preprocessing.
-- `annotation_service.py`: validates, revision-checks, and atomically writes annotation JSON.
-- `file_lock.py`: provides `fcntl.flock()` based locks for annotation writes on a single Linux server.
-- `__init__.py`: application factory and route wiring.
+- `path_guard.py` validates case and image boundaries;
+  `analysis_artifacts.py` separately confines UUID run artifacts.
+- `tiff_service.py` reads TIFF/ND2 metadata and physical calibration, exposes
+  immutable planes for browser display, and provides explicit channel/Z-MIP
+  extraction only for queued model runs.
+- `annotation_service.py` validates, revision-checks, and atomically writes
+  annotation JSON.
+- `analysis_store.py` implements the SQLite queue, leases, duplicate-run reuse,
+  progress, and immutable terminal records.
+- `analysis_routes.py` exposes authenticated run, mask, and ROI-thickness APIs.
+- `morphogbm_v10.py` reconstructs the supplied checkpoint and implements the
+  selected v13 halo/D4 whole-image inference contract around that v10 model.
+- `gbm_thickness.py` implements full-mask skeleton and Euclidean-distance ROI
+  thickness.
+- `file_lock.py` provides `fcntl.flock()` locks for single-server writes.
+- `__init__.py` is the application factory and route wiring.
+
+## Model Data Flow
+
+```text
+source TIFF/ND2 (read-only)
+  -> selected NHS-ester channel
+  -> current plane, or up-to-five-plane shifted Z-MIP
+  -> supplied 1st/99.7th-percentile uint8 contrast stretch
+  -> raw/log1p/sqrt standardized model channels
+  -> v10 ConvNeXt-Pico residual U-Net
+  -> 32 px halo + 576 px overlapping cores + D4 mean + Gaussian stitching
+  -> v13-selected low/high hysteresis mask
+  -> immutable binary PNG + cached thickness geometry
+  -> client-side color/opacity overlay and polygon ROI sampling
+```
+
+The checkpoint, source identity, channel, actual Z window, preprocessing
+version, inference settings, and postprocessing rule are recorded with each
+successful run.
 
 ## Data Safety
 
-The API does not trust URL paths. Cases must be direct children of `AGH_DATA_ROOT`; files must be direct TIFF files inside a known case. Annotation writes are protected by per-image file locks and use `os.replace()` so interrupted writes do not leave half-written JSON as the active file.
+The API does not trust URL paths. Cases must be direct children of
+`AGH_DATA_ROOT`; files must be supported direct image files inside a known case.
+Annotation writes use file locks and `os.replace()`. Model artifacts are
+confined to UUID run directories and are atomically published before a run can
+be marked successful. Source images are never rewritten.
 
 ## Performance
 
-Metadata is read from TIFF series metadata when possible and does not require loading all pixel data. Physical pixel size is read from OME-XML, ImageJ metadata, or TIFF resolution tags when available; otherwise the API reports the explicit default `0.106872 µm/px`. Image display uses the source TIFF as the authority. The case-browser preview and the opened-image viewer both retrieve immutable 8-bit or 16-bit raw channel planes. The browser applies the same automatic min/max windowing and reversible viewer-only marker colors, brightness, contrast, visibility, and polarity inversion in both contexts. The backend does not apply MIP, normalization, percentile stretch, contrast enhancement, or pseudocolor mapping. Unsupported formats are rejected rather than silently converted.
+Metadata reads avoid full pixel loads where possible. Browser display retrieves
+immutable raw planes and applies reversible colors/windowing locally. Model
+preprocessing occurs only after a user queues a run. A dedicated worker keeps
+PyTorch memory and tiled D4 inference outside the two-worker Gunicorn process.
+SQLite WAL mode allows status polling while that worker writes progress.
 
 ## Access Control
 
-Authentication is enforced by the Flask API (per-user accounts, session cookies, CSRF), not by Apache Basic Auth. The API listens on `127.0.0.1:5055` behind Apache; it should not be directly exposed.
+Authentication is enforced by Flask using per-user sessions and CSRF, not by
+Apache Basic Auth. Viewing, queuing a model run, retrieving its mask, and making
+a local ROI measurement require the existing `view` permission. Actor identity
+comes from the authenticated session and run/measurement events are audited.
+The API listens only on `127.0.0.1:5055` behind Apache.
 
+## Deliberately Narrow Analysis Scope
 
+The app contains only the supplied MorphoGBM v10 GBM mask and its
+notebook-defined ROI thickness method. It does not restore the older generic
+MagnifySeg/TensorFlow stack, stain profiles, watershed/degrouping, arbitrary
+model registries, or general-purpose processing controls.
 
-## Deliberately Excluded Features
-
-The active application does not include model inference, segmentation, derived metrics, watershed processing, preprocessing controls, an analysis queue, or an analysis worker. Those concerns belong in a separate analysis application if they are needed again later.
-
-Run `make viewer-only-check` before committing. The guard rejects known legacy analysis files and active-source references so those concerns do not drift back into this repository.
+Run `make app-scope-check` before committing. The guard verifies the exact
+checkpoint checksum and rejects known legacy analysis code.

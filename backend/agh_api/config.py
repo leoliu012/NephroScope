@@ -41,10 +41,26 @@ class Config:
     sync_interval_seconds: int = 24 * 60 * 60
     sync_poll_seconds: int = 15
     sync_fingerprint_bytes: int = 4 * 1024 * 1024
+    # --- MorphoGBM segmentation jobs ----------------------------------------
+    # The API only writes queue records and serves completed artifacts.  A
+    # separate single-process worker owns the heavyweight PyTorch runtime.
+    analysis_root: Optional[Path] = None
+    analysis_db: Optional[Path] = None
+    model_checkpoint: Path = field(default_factory=lambda: _default_model_checkpoint())
+    analysis_lease_seconds: int = 60 * 60
+    analysis_poll_seconds: float = 1.0
+    inference_device: str = "auto"
+
+    def __post_init__(self):
+        analysis_root = self.analysis_root or (Path(self.users_file).parent / "analysis")
+        analysis_db = self.analysis_db or (Path(analysis_root) / "jobs.sqlite3")
+        object.__setattr__(self, "analysis_root", Path(analysis_root))
+        object.__setattr__(self, "analysis_db", Path(analysis_db))
 
     @classmethod
     def from_env(cls):
         state_dir = _env_path("AGH_STATE_DIR", str(Path.home() / ".agh-viewer"))
+        analysis_root = _env_path("AGH_ANALYSIS_ROOT", str(state_dir / "analysis"))
         return cls(
             data_root=_env_path("AGH_DATA_ROOT", "/data/AGH_APP"),
             ann_root=_env_path("AGH_ANN_ROOT", "/data/agh_annotations"),
@@ -74,12 +90,19 @@ class Config:
             sync_interval_seconds=max(60, _env_int("AGH_SYNC_INTERVAL_SECONDS", 24 * 60 * 60)),
             sync_poll_seconds=max(1, _env_int("AGH_SYNC_POLL_SECONDS", 15)),
             sync_fingerprint_bytes=max(1024, _env_int("AGH_SYNC_FINGERPRINT_MB", 4) * 1024 * 1024),
+            analysis_root=analysis_root,
+            analysis_db=_env_path("AGH_ANALYSIS_DB", str(analysis_root / "jobs.sqlite3")),
+            model_checkpoint=_env_path("AGH_MODEL_CHECKPOINT", str(_default_model_checkpoint())),
+            analysis_lease_seconds=max(60, _env_int("AGH_ANALYSIS_LEASE_SECONDS", 60 * 60)),
+            analysis_poll_seconds=max(0.1, _env_float("AGH_ANALYSIS_POLL_SECONDS", 1.0)),
+            inference_device=(os.environ.get("AGH_INFERENCE_DEVICE", "auto") or "auto").strip().lower(),
         )
 
     @classmethod
     def local_dev(cls, backend_dir: Path):
         base = Path(backend_dir) / ".local_data"
         state_dir = _env_path("AGH_STATE_DIR", str(base / "state"))
+        analysis_root = _env_path("AGH_ANALYSIS_ROOT", str(state_dir / "analysis"))
         return cls(
             data_root=base / "AGH_APP",
             ann_root=base / "agh_annotations",
@@ -111,6 +134,12 @@ class Config:
             sync_interval_seconds=max(60, _env_int("AGH_SYNC_INTERVAL_SECONDS", 24 * 60 * 60)),
             sync_poll_seconds=max(1, _env_int("AGH_SYNC_POLL_SECONDS", 15)),
             sync_fingerprint_bytes=max(1024, _env_int("AGH_SYNC_FINGERPRINT_MB", 4) * 1024 * 1024),
+            analysis_root=analysis_root,
+            analysis_db=_env_path("AGH_ANALYSIS_DB", str(analysis_root / "jobs.sqlite3")),
+            model_checkpoint=_env_path("AGH_MODEL_CHECKPOINT", str(_default_model_checkpoint())),
+            analysis_lease_seconds=max(60, _env_int("AGH_ANALYSIS_LEASE_SECONDS", 60 * 60)),
+            analysis_poll_seconds=max(0.1, _env_float("AGH_ANALYSIS_POLL_SECONDS", 1.0)),
+            inference_device=(os.environ.get("AGH_INFERENCE_DEVICE", "auto") or "auto").strip().lower(),
         )
 
     def ensure_directories(self):
@@ -138,6 +167,8 @@ class Config:
             (Path(self.audit_log_file).parent, 0o700),
             (Path(self.collaboration_state_file).parent, 0o700),
             (self.ef_upload_root, 0o700),
+            (self.analysis_root, 0o700),
+            (Path(self.analysis_db).parent, 0o700),
         ):
             try:
                 path.mkdir(parents=True, exist_ok=True)
@@ -171,6 +202,14 @@ def _env_int(name, default):
     return max(0, value)
 
 
+def _env_float(name, default):
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        return float(default)
+    return max(0.0, value)
+
+
 def _env_bool(name, default):
     raw = os.environ.get(name)
     if raw is None:
@@ -188,3 +227,7 @@ def _env_auth_required():
 
 def _env_mb(name, default):
     return _env_int(name, default) * 1024 * 1024
+
+
+def _default_model_checkpoint():
+    return Path(__file__).resolve().parents[1] / "models" / "morphogbm_v10_topology_robust_inference.pt"

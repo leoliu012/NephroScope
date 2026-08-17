@@ -11,10 +11,13 @@ export AGH_DEPLOY_REMOTE=ubuntu@example.org
 export AGH_SSH_KEY_PATH=$HOME/.ssh/agh-deploy.pem
 export AGH_STRICT_HOST_KEY_CHECKING=yes
 export AGH_STATE_DIR=/home/ubuntu/agh-viewer/state   # optional; this is the default
+# Optional: choose the matching official CUDA index on a supported GPU host.
+export AGH_PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
 ```
 
 Replace every placeholder with real values before deploying. `deploy.py`
-deploys **code only** — it never handles passwords. Accounts are created
+deploys application code plus the repository-owned inference checkpoint; it
+never handles passwords. Accounts are created
 separately with `manage_users.py` (see below), so no credential ever passes
 through the deploy or the process table.
 
@@ -29,13 +32,17 @@ The script:
 1. uploads frontend source;
 2. runs `npm ci` or `npm install` on the server;
 3. copies the Vite build to `/var/www/html/agh`;
-4. uploads backend code (including `manage_users.py`);
+4. uploads backend code, the worker service, and the checksum-verified v10
+   inference checkpoint;
 5. installs locked Python dependencies into `/home/ubuntu/agh-viewer/venv`;
-6. creates the auth state directory (`$AGH_STATE_DIR`, mode 700);
-7. restarts `agh_backend`;
-8. installs `infra/apache/agh-viewer.conf`;
-9. runs `apache2ctl configtest`;
-10. reloads Apache.
+6. installs PyTorch/timm/scientific inference dependencies into the separate
+   `/home/ubuntu/agh-viewer/inference-venv`;
+7. creates the auth and segmentation state directories (`$AGH_STATE_DIR`,
+   mode 700);
+8. restarts `agh_backend`, `agh_analysis_worker`, and the configured image-sync
+   service;
+9. installs `infra/apache/agh-viewer.conf`, runs `apache2ctl configtest`, and
+   reloads Apache.
 
 ## Creating Accounts
 
@@ -105,7 +112,15 @@ The API should run as:
 
 ```text
 Apache (TLS) -> Gunicorn on 127.0.0.1:5055 -> Flask agh_api
+                                              |
+                                              +-> SQLite model-run queue
+
+agh_analysis_worker (single process) -> MorphoGBM v10 checkpoint -> run artifacts
 ```
+
+Gunicorn serves status, mask, and ROI-measurement requests but never imports
+PyTorch. The dedicated worker owns one model instance and survives API restarts
+through the durable queue under `$AGH_STATE_DIR/analysis`.
 
 Do not expose port `5055` directly to the public internet.
 

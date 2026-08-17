@@ -69,7 +69,7 @@ export AGH_STATE_DIR=/home/ubuntu/agh-viewer/state   # optional; this is the def
 
 Replace `ubuntu@example.org` and the key path with real values. The deploy
 script exits early if these are still placeholders or if the key file does not
-exist. It deploys code only — accounts are created separately with
+exist. It deploys application and model assets only — accounts are created separately with
 `manage_users.py` (see Accounts below), so no password passes through the
 deploy.
 
@@ -86,6 +86,28 @@ python app.py
 ```
 
 When `python app.py` is run directly without `AGH_DATA_ROOT`, it uses writable local development folders under `backend/.local_data/`. Production remains configured by systemd environment variables and uses `/data/...`.
+
+Model runs need the separate inference dependency set and worker. For local
+development it is fine to install both sets into the same project virtualenv,
+then keep the API and worker in separate terminals:
+
+```bash
+cd backend
+. .venv/bin/activate
+pip install torch==2.12.1 torchvision==0.27.1 \
+  --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements-inference.txt
+AGH_LOCAL_DEV=1 python app.py
+
+# second terminal, same virtualenv
+cd backend
+AGH_LOCAL_DEV=1 python worker.py
+```
+
+Production deployment creates `venv` for the web API and `inference-venv` for
+the single model worker so Gunicorn never imports PyTorch. Deployment uses the
+official CPU wheel index by default; set `AGH_PYTORCH_INDEX_URL` to the matching
+official CUDA index when the worker host has a supported NVIDIA GPU.
 
 If you previously exported production paths in the same terminal and see a `/data` permission error, clear them or force local mode:
 
@@ -192,14 +214,17 @@ python deploy.py
 
 Those values are placeholders. Use the real server address and the real SSH key path from your Lightsail setup.
 
-The script uploads the frontend source, builds it on the server, uploads the backend package (including `manage_users.py` and `sync_images.py`), installs locked backend dependencies into `/home/ubuntu/agh-viewer/venv`, creates the auth state directory, installs the API and image-sync services, installs `infra/apache/agh-viewer.conf`, runs `apache2ctl configtest`, and reloads Apache. Create accounts afterwards with `manage_users.py` (see `docs/security.md`).
+The script uploads and builds the frontend, uploads the backend and verified v10
+checkpoint, installs the web and inference virtualenvs, prepares application
+state, installs the API/model/image-sync services, validates Apache, and reloads
+it. Create accounts afterwards with `manage_users.py` (see `docs/security.md`).
 
 ## Tests
 
-Viewer-only source guard:
+Application-scope and model-checksum guard:
 
 ```bash
-make viewer-only-check
+make app-scope-check
 ```
 
 Backend tests:
@@ -231,9 +256,34 @@ make test
 - Pixel calibration from image metadata with a visible `0.106872 µm/px` fallback
 - Revisioned annotation save with conflict detection
 - PDF export with or without annotation overlay
+- MorphoGBM v10 GBM segmentation for the current Z view, with a five-plane
+  Z-MIP for stacks and the supplied fluorescence contrast enhancement
+- Client-adjustable segmentation overlay color, visibility, and opacity
+- Persistent per-Z predictions with running/segmented Z labels and explicit
+  per-slice deletion
+- Polygon ROI measurement of average GBM thickness using full-mask
+  skeleton/Euclidean-distance geometry, showing both observed and
+  EF-adjusted values that follow the current pixel-size/EF settings
 
-## Raw Display Contract
+## Raw Display and Model Analysis Contract
 
-This repository is intentionally viewer-only. It does not contain segmentation, model inference, metrics, watershed processing, or analysis-worker code.
+Normal image display remains source-preserving: opening or adjusting an image
+never modifies the TIFF/ND2 source. Model runs are explicit, asynchronous
+research operations. They read one chosen source channel, form an up-to-five
+slice Z-MIP around the current Z for stacks, and apply the supplied per-image
+1st/99.7th-percentile uint8 contrast stretch only to the inference copy.
+
+The deployed checkpoint is MorphoGBM v10. Whole-image prediction follows the
+validated v13 notebook teacher path around that v10 model: 32-pixel halo
+context, overlapping 576-pixel cores, D4 test-time averaging, Gaussian
+stitching, and the v13-selected hysteresis rule. A dedicated single worker owns
+the PyTorch model so web requests do not load duplicate models or time out.
+Every successful run records its source version, channel/Z window,
+preprocessing contract, model checksum, and inference settings.
+See [`docs/model-inference.md`](docs/model-inference.md) for the exact mapping
+from the supplied notebooks/scripts to the deployed pipeline.
 
 The backend retains a simple raw PNG endpoint for compatibility. The case browser now uses a bounded, versioned PNG preview so remote users do not download every full-resolution raw channel just by selecting an image. Opening the editor still loads immutable raw channel planes and applies reversible display-only controls without changing the TIFF. Supported raw channel formats are 8-bit or 16-bit unsigned grayscale planes. Files that would require intensity conversion are rejected with an explicit error rather than silently normalized.
+
+Segmentation and thickness values are for research use only and are not
+validated for clinical diagnosis or treatment decisions.

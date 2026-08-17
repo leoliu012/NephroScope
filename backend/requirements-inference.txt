@@ -1,0 +1,10 @@
+-r requirements.lock.txt
+
+# MorphoGBM v10 inference. Keep the official PyTorch/torchvision release pair
+# together; deployment selects its CPU or CUDA index with
+# AGH_PYTORCH_INDEX_URL. timm is the version used by the supplied notebooks.
+torch==2.12.1
+torchvision==0.27.1
+timm==1.0.28
+scipy>=1.13,<2
+scikit-image>=0.24,<1
