@@ -17,6 +17,7 @@ from .analysis_artifacts import (
     thickness_geometry_path,
     write_manifest_atomic,
     write_mask_atomic,
+    write_skeleton_atomic,
     write_thickness_geometry_atomic,
 )
 from .errors import BadRequest, Conflict
@@ -181,6 +182,7 @@ def execute_segmentation(
         "mipZ": len(actual_window),
         "channelIndex": int(request_payload["channelIndex"]),
         "maskUrl": f"/agh/api/analysis-runs/{job['runId']}/mask",
+        "skeletonUrl": f"/agh/api/analysis-runs/{job['runId']}/skeleton",
         "modelId": "morphogbm-v10-topology-robust",
         "modelSha256": (request_payload.get("model") or {}).get("sha256"),
         "pipelineVersion": PIPELINE_VERSION,
@@ -207,6 +209,14 @@ def execute_segmentation(
             config.analysis_root,
             job["runId"],
             thickness_arrays,
+            attempt=artifact_attempt,
+        )
+        write_skeleton_atomic(
+            config.analysis_root,
+            job["runId"],
+            thickness_arrays["skeleton_y"],
+            thickness_arrays["skeleton_x"],
+            thickness_arrays["shape"],
             attempt=artifact_attempt,
         )
     write_manifest_atomic(

@@ -259,6 +259,8 @@ make test
 - MorphoGBM v10 GBM segmentation for the current Z view, with a five-plane
   Z-MIP for stacks and the supplied fluorescence contrast enhancement
 - Client-adjustable segmentation overlay color, visibility, and opacity
+- Exact saved GBM thickness-skeleton overlay with independent visibility,
+  color, and rendered line-width controls
 - Persistent per-Z predictions with running/segmented Z labels and explicit
   per-slice deletion
 - Polygon ROI measurement of average GBM thickness using full-mask

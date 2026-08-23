@@ -85,7 +85,7 @@ class AnnotationApiTests(unittest.TestCase):
         health_json = health.get_json()
         self.assertTrue(health_json["ok"])
         self.assertEqual(health_json["service"], "agh-viewer-api")
-        self.assertEqual(health_json["version"], "1.5.0")
+        self.assertEqual(health_json["version"], "1.6.0")
         self.assertNotIn("analysis", health_json)
         # With auth explicitly disabled for these endpoint tests, the session endpoint
         # reports an authenticated dev identity without any credential.

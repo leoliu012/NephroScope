@@ -3,4 +3,4 @@
 // constant so the application never reports conflicting version numbers.
 export const APP_NAME = 'AGH Image Viewer'
 export const APP_TAGLINE = 'Renal microscopy review'
-export const APP_VERSION = '1.5.0'
+export const APP_VERSION = '1.6.0'

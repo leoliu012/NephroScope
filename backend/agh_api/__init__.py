@@ -20,7 +20,7 @@ from .tiff_service import RawChannelCache, get_metadata, render_preview_png, ren
 
 
 log = logging.getLogger(__name__)
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 
 def create_app(config: Optional[Config] = None):

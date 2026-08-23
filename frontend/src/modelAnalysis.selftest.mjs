@@ -8,6 +8,7 @@ import {
   formatThicknessValue,
   indexModelRunsByZ,
   normalizeModelOverlaySettings,
+  normalizeModelSkeletonSettings,
   normalizePolygonRoi,
   polygonArea,
 } from './modelAnalysis.js'
@@ -18,6 +19,15 @@ test('normalizes model overlay settings', () => {
     color: '#abcdef',
     opacity: 1,
   })
+})
+
+test('normalizes model skeleton display settings', () => {
+  assert.deepEqual(normalizeModelSkeletonSettings({ visible: false, color: '#ABCDEF', thickness: 99 }), {
+    visible: false,
+    color: '#abcdef',
+    thickness: 12,
+  })
+  assert.equal(normalizeModelSkeletonSettings({ thickness: 2.4 }).thickness, 2)
 })
 
 test('clamps and validates polygon ROIs', () => {

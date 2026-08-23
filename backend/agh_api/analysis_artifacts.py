@@ -16,6 +16,7 @@ from .path_guard import resolve_under_root
 
 
 MASK_FILENAME = "mask.png"
+SKELETON_FILENAME = "skeleton.png"
 MANIFEST_FILENAME = "manifest.json"
 THICKNESS_GEOMETRY_FILENAME = "thickness_geometry.npz"
 
@@ -73,6 +74,21 @@ def mask_path(
     return path
 
 
+def skeleton_path(
+    analysis_root: Path,
+    run_id: str,
+    *,
+    attempt: int | None = None,
+    require: bool = True,
+) -> Path:
+    path = resolve_under_root(
+        attempt_directory(analysis_root, run_id, attempt), SKELETON_FILENAME
+    )
+    if require and not path.is_file():
+        raise NotFound("GBM skeleton overlay not found")
+    return path
+
+
 def manifest_path(
     analysis_root: Path,
     run_id: str,
@@ -123,6 +139,42 @@ def write_mask_atomic(
     payload = BytesIO()
     Image.fromarray(encoded, mode="L").save(payload, format="PNG", optimize=True)
     destination = mask_path(analysis_root, run_id, attempt=attempt, require=False)
+    _atomic_write_bytes(destination, payload.getvalue())
+    return destination
+
+
+def write_skeleton_atomic(
+    analysis_root: Path,
+    run_id: str,
+    skeleton_y,
+    skeleton_x,
+    shape,
+    *,
+    attempt: int | None = None,
+) -> Path:
+    """Publish the exact saved centerline samples as a one-pixel binary PNG."""
+    dimensions = np.asarray(shape, dtype=np.int64).reshape(-1)
+    if dimensions.size != 2 or np.any(dimensions < 1):
+        raise ValueError("Skeleton overlay shape must contain positive height and width")
+    height, width = int(dimensions[0]), int(dimensions[1])
+    y = np.asarray(skeleton_y, dtype=np.int64).reshape(-1)
+    x = np.asarray(skeleton_x, dtype=np.int64).reshape(-1)
+    if y.size != x.size:
+        raise ValueError("Skeleton X/Y coordinates have inconsistent lengths")
+    if y.size and (
+        np.any(y < 0)
+        or np.any(y >= height)
+        or np.any(x < 0)
+        or np.any(x >= width)
+    ):
+        raise ValueError("Skeleton overlay contains out-of-bounds coordinates")
+    encoded = np.zeros((height, width), dtype=np.uint8)
+    encoded[y, x] = 255
+    payload = BytesIO()
+    Image.fromarray(encoded, mode="L").save(payload, format="PNG", optimize=True)
+    destination = skeleton_path(
+        analysis_root, run_id, attempt=attempt, require=False
+    )
     _atomic_write_bytes(destination, payload.getvalue())
     return destination
 

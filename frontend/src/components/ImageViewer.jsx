@@ -40,6 +40,7 @@ import AnnotationLayer from './AnnotationLayer.jsx'
 import ChannelControls from './ChannelControls.jsx'
 import ModelMaskOverlay from './ModelMaskOverlay.jsx'
 import ModelRoiLayer from './ModelRoiLayer.jsx'
+import ModelSkeletonOverlay from './ModelSkeletonOverlay.jsx'
 import MultiChannelCanvas from './MultiChannelCanvas.jsx'
 import ZSliceSlider, { zIndexForAnnotation } from './ZSliceSlider.jsx'
 import { autoWindowChannelSettings, loadChannelSettings, normalizeChannelSettings, saveChannelSettings } from '../channelDisplay.js'
@@ -64,11 +65,15 @@ import {
   formatThicknessValue,
   indexModelRunsByZ,
   loadModelOverlaySettings,
+  loadModelSkeletonSettings,
   measureGbmThickness,
   modelMaskUrl,
+  modelSkeletonUrl,
   normalizeModelOverlaySettings,
+  normalizeModelSkeletonSettings,
   normalizeRunStatus,
   saveModelOverlaySettings,
+  saveModelSkeletonSettings,
   stableModelJson,
 } from '../modelAnalysis.js'
 
@@ -348,13 +353,6 @@ function modelProgressPercent(entry) {
   return entry?.status === 'SUBMITTING' ? 0 : null
 }
 
-function thicknessSampleCount(result) {
-  const source = result?.result && typeof result.result === 'object' ? result.result : result
-  const value = source?.sampleCount ?? source?.measurementCount ?? source?.pointCount ?? source?.points?.length
-  const number = Number(value)
-  return Number.isFinite(number) && number >= 0 ? Math.round(number) : null
-}
-
 export default function ImageViewer({
   caseId,
   filename,
@@ -382,6 +380,7 @@ export default function ImageViewer({
   const [modelRunsByZ, setModelRunsByZ] = useState({})
   const [modelInputChannel, setModelInputChannel] = useState(0)
   const [modelOverlaySettings, setModelOverlaySettings] = useState(() => loadModelOverlaySettings())
+  const [modelSkeletonSettings, setModelSkeletonSettings] = useState(() => loadModelSkeletonSettings())
   const [modelRoisByZ, setModelRoisByZ] = useState({})
   const [modelMeasurementsByZ, setModelMeasurementsByZ] = useState({})
   const [modelRoiMessage, setModelRoiMessage] = useState('')
@@ -611,6 +610,10 @@ export default function ImageViewer({
   }, [modelOverlaySettings])
 
   useEffect(() => {
+    saveModelSkeletonSettings(modelSkeletonSettings)
+  }, [modelSkeletonSettings])
+
+  useEffect(() => {
     if (!imgMeta || loadedImageKey !== imageKey || !channelSettings || !measurementSettings) return undefined
     if (applyingRemoteViewStateRef.current) return undefined
     if (suppressNextViewStatePublishRef.current) {
@@ -732,6 +735,7 @@ export default function ImageViewer({
                 error: status === 'FAILED' ? modelErrorText(latest.error, 'Model run failed') : '',
                 pollError: '',
                 maskStatus: status === 'SUCCEEDED' ? (entry.maskStatus || 'loading') : entry.maskStatus,
+                skeletonStatus: status === 'SUCCEEDED' ? (entry.skeletonStatus || 'loading') : entry.skeletonStatus,
               },
             }
           })
@@ -1257,6 +1261,10 @@ export default function ImageViewer({
     setModelOverlaySettings(current => normalizeModelOverlaySettings({ ...current, ...patch }))
   }, [])
 
+  const updateModelSkeletonSettings = useCallback((patch) => {
+    setModelSkeletonSettings(current => normalizeModelSkeletonSettings({ ...current, ...patch }))
+  }, [])
+
   const startModelRun = useCallback(async () => {
     if (!modelPlaneReady || modelBusy || !imgMeta) return
     const requestedZIndex = zIndex
@@ -1295,6 +1303,7 @@ export default function ImageViewer({
         error: '',
         pollError: '',
         maskStatus: null,
+        skeletonStatus: null,
       },
     }))
 
@@ -1311,6 +1320,18 @@ export default function ImageViewer({
         || requestImageKey !== imageKey
       ) return
       const status = normalizeRunStatus(created?.status || 'QUEUED')
+      let runPayload = created
+      if (status === 'SUCCEEDED') {
+        try {
+          runPayload = await fetchModelRun(runId, { signal: controller.signal })
+        } catch (error) {
+          if (error.name === 'AbortError') throw error
+          // The mask/skeleton endpoints need only the run id. A transient
+          // detail-fetch failure should not relabel a completed run as failed.
+          runPayload = created
+        }
+        if (controller.signal.aborted || requestEpoch !== modelRequestEpochRef.current || requestImageKey !== imageKey) return
+      }
       setModelRunsByZ(current => {
         const entry = current[zKey]
         if (!entry || entry.imageKey !== requestImageKey || entry.status !== 'SUBMITTING') return current
@@ -1318,13 +1339,14 @@ export default function ImageViewer({
           ...current,
           [zKey]: {
             ...entry,
-            ...created,
+            ...runPayload,
             runId,
             status,
             requestedZIndex,
             channelIndex: requestedChannelIndex,
             imageKey: requestImageKey,
             maskStatus: status === 'SUCCEEDED' ? 'loading' : null,
+            skeletonStatus: status === 'SUCCEEDED' ? 'loading' : null,
           },
         }
       })
@@ -1413,6 +1435,33 @@ export default function ImageViewer({
           ...entry,
           maskStatus: 'error',
           maskError: modelErrorText(message, 'Unable to load the model mask'),
+        },
+      }
+    })
+  }, [currentModelRun?.runId, imageKey, zIndex])
+
+  const handleModelSkeletonReady = useCallback(() => {
+    const zKey = String(zIndex)
+    const runId = currentModelRun?.runId
+    setModelRunsByZ(current => {
+      const entry = current[zKey]
+      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
+      return { ...current, [zKey]: { ...entry, skeletonStatus: 'ready', skeletonError: '' } }
+    })
+  }, [currentModelRun?.runId, imageKey, zIndex])
+
+  const handleModelSkeletonError = useCallback((message) => {
+    const zKey = String(zIndex)
+    const runId = currentModelRun?.runId
+    setModelRunsByZ(current => {
+      const entry = current[zKey]
+      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
+      return {
+        ...current,
+        [zKey]: {
+          ...entry,
+          skeletonStatus: 'error',
+          skeletonError: modelErrorText(message, 'Unable to load the GBM skeleton'),
         },
       }
     })
@@ -1668,11 +1717,8 @@ export default function ImageViewer({
   const displayedMeasurementSettings = measurementSettings || defaultMeasurementSettings(imgMeta, caseId)
   const expansionEnabled = displayedMeasurementSettings.expansionEnabled !== false
   const expansionFactor = Number(displayedMeasurementSettings.expansionFactor) || DEFAULT_EXPANSION_FACTOR
-  const currentModelError = currentModelRun?.maskError || currentModelRun?.error || currentModelRun?.pollError || ''
+  const currentModelError = currentModelRun?.maskError || (modelSkeletonSettings.visible ? currentModelRun?.skeletonError : '') || currentModelRun?.error || currentModelRun?.pollError || ''
   const currentModelProgressPercent = modelProgressPercent(currentModelRun)
-  const currentMeasurementSampleCount = currentMeasurementResult
-    ? thicknessSampleCount(currentMeasurementResult)
-    : null
   const exportFloatingRight = sidebarCollapsed ? 18 : 338
   const exportFloatingBottom = zCount > 1 ? 108 : 64
   const exportFloatingStyle = {
@@ -1923,6 +1969,22 @@ export default function ImageViewer({
                   visible={modelOverlaySettings.visible}
                   onReady={handleModelMaskReady}
                   onError={handleModelMaskError}
+                />
+              )}
+              {modelOverlayAligned
+                && currentModelRun?.runId
+                && modelSkeletonSettings.visible
+                && currentModelRun?.result?.thicknessGeometryAvailable !== false && (
+                <ModelSkeletonOverlay
+                  key={`${imageKey}:${currentModelRun.runId}:skeleton`}
+                  skeletonUrl={modelSkeletonUrl(currentModelRun.runId)}
+                  width={imgMeta?.width}
+                  height={imgMeta?.height}
+                  color={modelSkeletonSettings.color}
+                  thickness={modelSkeletonSettings.thickness}
+                  visible={modelSkeletonSettings.visible}
+                  onReady={handleModelSkeletonReady}
+                  onError={handleModelSkeletonError}
                 />
               )}
               {imgMeta && (
@@ -2250,7 +2312,7 @@ export default function ImageViewer({
                 <div className="ux-card space-y-3 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2 text-[12px] font-semibold text-[var(--text)]">
-                      <ScanLine size={13} /> MorphoGBM v10
+                      <ScanLine size={13} /> Morpho GBM detector
                     </div>
                     <span className="ux-badge">Z {zIndex + 1}</span>
                   </div>
@@ -2380,6 +2442,44 @@ export default function ImageViewer({
                         className="w-full"
                       />
                     </label>
+                    <div className="space-y-3 border-t border-[var(--border)] pt-3">
+                      <label className="flex items-center justify-between gap-3">
+                        <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
+                          {modelSkeletonSettings.visible ? <Eye size={13} /> : <EyeOff size={13} />}
+                          Show thickness skeleton
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={modelSkeletonSettings.visible}
+                          onChange={event => updateModelSkeletonSettings({ visible: event.currentTarget.checked })}
+                        />
+                      </label>
+                      <label className="flex items-center justify-between gap-3">
+                        <span className="text-[12px] text-[var(--text-muted)]">Skeleton color</span>
+                        <input
+                          type="color"
+                          value={modelSkeletonSettings.color}
+                          onChange={event => updateModelSkeletonSettings({ color: event.currentTarget.value })}
+                          className="h-7 w-12 cursor-pointer rounded border border-[var(--border)] bg-transparent p-0.5"
+                          aria-label="GBM skeleton color"
+                        />
+                      </label>
+                      <label className="block">
+                        <span className="mb-1 flex items-center justify-between gap-2 text-[12px] text-[var(--text-muted)]">
+                          <span>Skeleton thickness</span>
+                          <span className="font-mono text-[var(--text)]">{modelSkeletonSettings.thickness}px</span>
+                        </span>
+                        <input
+                          type="range"
+                          min="1"
+                          max="12"
+                          step="1"
+                          value={modelSkeletonSettings.thickness}
+                          onChange={event => updateModelSkeletonSettings({ thickness: Number(event.currentTarget.value) })}
+                          className="w-full"
+                        />
+                      </label>
+                    </div>
                   </div>
 
                   {currentMaskReady && (
@@ -2427,14 +2527,6 @@ export default function ImageViewer({
                             <span className="text-[var(--text-subtle)]">Before EF adjustment</span>
                             <span className="font-mono font-semibold text-[var(--text)]">{formatThicknessValue(currentThickness.before)}</span>
                           </div>
-                          <p className="mt-1 text-[10px] text-[var(--text-subtle)]">
-                            Updates with pixel size and {currentThickness.expansionEnabled ? `${currentThickness.expansionFactor}× EF` : 'EF setting (currently off)'}.
-                          </p>
-                          {currentMeasurementSampleCount !== null && (
-                            <p className="mt-1 text-[10px] text-[var(--text-subtle)]">
-                              {currentMeasurementSampleCount} sample{currentMeasurementSampleCount === 1 ? '' : 's'}
-                            </p>
-                          )}
                         </div>
                       )}
                       {currentMeasurementMatches && currentModelMeasurement?.status === 'ready' && !currentThickness && (

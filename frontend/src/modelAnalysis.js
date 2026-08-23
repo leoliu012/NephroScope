@@ -6,7 +6,14 @@ export const DEFAULT_MODEL_OVERLAY_SETTINGS = Object.freeze({
   opacity: 0.5,
 })
 
+export const DEFAULT_MODEL_SKELETON_SETTINGS = Object.freeze({
+  visible: true,
+  color: '#ffd166',
+  thickness: 2,
+})
+
 const MODEL_OVERLAY_STORAGE_KEY = 'agh-viewer:model-overlay-settings:v1'
+const MODEL_SKELETON_STORAGE_KEY = 'agh-viewer:model-skeleton-settings:v1'
 const HEX_COLOR = /^#[0-9a-f]{6}$/i
 const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED'])
 
@@ -68,6 +75,31 @@ export function saveModelOverlaySettings(settings) {
   }
 }
 
+export function normalizeModelSkeletonSettings(raw) {
+  const thickness = finiteNumber(raw?.thickness, DEFAULT_MODEL_SKELETON_SETTINGS.thickness)
+  return {
+    visible: typeof raw?.visible === 'boolean' ? raw.visible : DEFAULT_MODEL_SKELETON_SETTINGS.visible,
+    color: HEX_COLOR.test(raw?.color || '') ? raw.color.toLowerCase() : DEFAULT_MODEL_SKELETON_SETTINGS.color,
+    thickness: Math.round(clamp(thickness, 1, 12)),
+  }
+}
+
+export function loadModelSkeletonSettings() {
+  try {
+    return normalizeModelSkeletonSettings(JSON.parse(localStorage.getItem(MODEL_SKELETON_STORAGE_KEY) || 'null'))
+  } catch {
+    return { ...DEFAULT_MODEL_SKELETON_SETTINGS }
+  }
+}
+
+export function saveModelSkeletonSettings(settings) {
+  try {
+    localStorage.setItem(MODEL_SKELETON_STORAGE_KEY, JSON.stringify(normalizeModelSkeletonSettings(settings)))
+  } catch {
+    // Skeleton controls remain usable when browser storage is unavailable.
+  }
+}
+
 export function normalizeRunStatus(value) {
   const status = String(value || '').trim().toUpperCase()
   if (status === 'QUEUED' || status === 'RUNNING' || status === 'SUCCEEDED' || status === 'FAILED') return status
@@ -123,6 +155,7 @@ export function indexModelRunsByZ(runs, imageKey) {
       channelIndex: Number(run?.request?.channelIndex) || 0,
       imageKey,
       maskStatus: status === 'SUCCEEDED' ? 'loading' : null,
+      skeletonStatus: status === 'SUCCEEDED' ? 'loading' : null,
       error: status === 'FAILED'
         ? String(run?.error?.message || run?.error || 'Model run failed')
         : '',
@@ -134,6 +167,10 @@ export function indexModelRunsByZ(runs, imageKey) {
 
 export function modelMaskUrl(runId) {
   return `/agh/api/analysis-runs/${encodeURIComponent(runId)}/mask`
+}
+
+export function modelSkeletonUrl(runId) {
+  return `/agh/api/analysis-runs/${encodeURIComponent(runId)}/skeleton`
 }
 
 export async function measureGbmThickness(runId, { roi, calibration }, options = {}) {

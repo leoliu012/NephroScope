@@ -7,6 +7,11 @@
   user-select: none;
 }
 
+.model-skeleton-overlay {
+  transition: opacity 120ms ease;
+  user-select: none;
+}
+
 .model-roi-layer {
   user-select: none;
 }

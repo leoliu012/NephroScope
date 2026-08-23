@@ -14,6 +14,7 @@ from agh_api import create_app
 from agh_api.analysis_artifacts import (
     manifest_path,
     read_mask,
+    skeleton_path,
     thickness_geometry_path,
     write_mask_atomic,
     write_thickness_geometry_atomic,
@@ -209,9 +210,15 @@ class AnalysisApiTests(unittest.TestCase):
         fake_model.segment_plane = fake_segment
         fake_thickness = types.ModuleType("agh_api.gbm_thickness")
         fake_thickness.prepare_thickness_geometry = lambda mask: {"mask": mask}
-        fake_thickness.thickness_geometry_to_arrays = lambda geometry: {
-            "placeholder": np.asarray([int(np.sum(geometry["mask"]))], dtype=np.int32)
-        }
+        def fake_geometry_arrays(geometry):
+            skeleton_y, skeleton_x = np.nonzero(geometry["mask"])
+            return {
+                "shape": np.asarray(geometry["mask"].shape, dtype=np.int64),
+                "skeleton_y": skeleton_y.astype(np.int32),
+                "skeleton_x": skeleton_x.astype(np.int32),
+            }
+
+        fake_thickness.thickness_geometry_to_arrays = fake_geometry_arrays
 
         with patch.dict(
             sys.modules,
@@ -247,6 +254,13 @@ class AnalysisApiTests(unittest.TestCase):
                 attempt=result["artifactAttempt"],
             ).is_file()
         )
+        self.assertTrue(
+            skeleton_path(
+                self.config.analysis_root,
+                job["runId"],
+                attempt=result["artifactAttempt"],
+            ).is_file()
+        )
         self.assertEqual(
             int(
                 read_mask(
@@ -257,6 +271,17 @@ class AnalysisApiTests(unittest.TestCase):
             ),
             4,
         )
+        self.store.mark_succeeded(job["runId"], "worker-a", result)
+        skeleton_response = self.client.get(
+            f"/agh/api/analysis-runs/{job['runId']}/skeleton"
+        )
+        self.assertEqual(skeleton_response.status_code, 200)
+        self.assertEqual(skeleton_response.mimetype, "image/png")
+        self.assertIn("immutable", skeleton_response.headers["Cache-Control"])
+        skeleton_payload = skeleton_response.data
+        skeleton_response.close()
+        skeleton = np.asarray(Image.open(BytesIO(skeleton_payload)).convert("L")) > 0
+        self.assertEqual(int(skeleton.sum()), 4)
 
     def test_completed_mask_is_immutable_png_endpoint(self):
         response = self.client.post(
@@ -285,6 +310,24 @@ class AnalysisApiTests(unittest.TestCase):
             self.config.analysis_root,
             run_id,
             mask,
+            attempt=reclaimed["attempts"],
+        )
+        write_thickness_geometry_atomic(
+            self.config.analysis_root,
+            run_id,
+            {
+                "schema_version": np.asarray([1], dtype=np.int16),
+                "shape": np.asarray([4, 5], dtype=np.int64),
+                "skeleton_y": np.asarray([1], dtype=np.int32),
+                "skeleton_x": np.asarray([2], dtype=np.int32),
+                "local_thickness_pixels": np.asarray([2.0]),
+                "nearest_background_dy_pixels": np.asarray([1], dtype=np.int32),
+                "nearest_background_dx_pixels": np.asarray([0], dtype=np.int32),
+                "skeleton_degree": np.asarray([0], dtype=np.uint8),
+                "skeleton_component": np.asarray([1], dtype=np.int32),
+                "border_components": np.asarray([], dtype=np.int32),
+                "total_component_count": np.asarray([1], dtype=np.int32),
+            },
             attempt=reclaimed["attempts"],
         )
         # The stale attempt may finish publishing later, but its immutable
@@ -320,6 +363,23 @@ class AnalysisApiTests(unittest.TestCase):
             ),
             mask > 0,
         )
+        # Older successful runs have geometry but no pre-rendered skeleton;
+        # the API materializes the exact saved centerline on first request.
+        self.assertFalse(
+            skeleton_path(
+                self.config.analysis_root,
+                run_id,
+                attempt=reclaimed["attempts"],
+                require=False,
+            ).exists()
+        )
+        skeleton_response = self.client.get(f"/agh/api/analysis-runs/{run_id}/skeleton")
+        self.assertEqual(skeleton_response.status_code, 200)
+        skeleton_payload = skeleton_response.data
+        skeleton_response.close()
+        skeleton = np.asarray(Image.open(BytesIO(skeleton_payload)).convert("L")) > 0
+        self.assertEqual(int(skeleton.sum()), 1)
+        self.assertTrue(skeleton[1, 2])
 
     def test_thickness_endpoint_uses_saved_geometry_and_frontend_schema(self):
         response = self.client.post(

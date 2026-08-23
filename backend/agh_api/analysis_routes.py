@@ -5,7 +5,14 @@ import logging
 
 from flask import g, jsonify, request, send_file
 
-from .analysis_artifacts import ensure_run_id, mask_path, remove_run_artifacts
+from .analysis_artifacts import (
+    ensure_run_id,
+    mask_path,
+    remove_run_artifacts,
+    skeleton_path,
+    thickness_geometry_path,
+    write_skeleton_atomic,
+)
 from .analysis_store import public_run
 from .audit import audit_event
 from .auth import has_permission
@@ -176,6 +183,54 @@ def register_analysis_routes(app, config, store):
             max_age=config.versioned_response_cache_seconds,
         )
         response.set_etag(f"analysis-mask-{run['cacheKey']}")
+        response.headers["Cache-Control"] = (
+            f"private, max-age={config.versioned_response_cache_seconds}, immutable"
+        )
+        return response.make_conditional(request)
+
+    @app.route("/agh/api/analysis-runs/<run_id>/skeleton", methods=["GET"])
+    def get_analysis_skeleton(run_id):
+        denied = require_view()
+        if denied:
+            return denied
+        run_id = ensure_run_id(run_id)
+        run = store.get_run(run_id)
+        if run["status"] == "FAILED":
+            raise Conflict("Segmentation run failed")
+        if run["status"] != "SUCCEEDED":
+            raise Conflict("Segmentation run is not finished")
+        result = run.get("result") or {}
+        if result.get("thicknessGeometryAvailable") is False:
+            raise Conflict("Segmentation contains no GBM skeleton geometry")
+        attempt = result.get("artifactAttempt")
+        path = skeleton_path(
+            config.analysis_root, run_id, attempt=attempt, require=False
+        )
+        if not path.is_file():
+            # Runs completed before skeleton.png was introduced still contain
+            # the exact centerline arrays used by thickness measurement.
+            from .gbm_thickness import load_thickness_geometry
+
+            geometry = load_thickness_geometry(
+                thickness_geometry_path(
+                    config.analysis_root, run_id, attempt=attempt
+                )
+            )
+            path = write_skeleton_atomic(
+                config.analysis_root,
+                run_id,
+                geometry.skeleton_y,
+                geometry.skeleton_x,
+                geometry.shape,
+                attempt=attempt,
+            )
+        response = send_file(
+            path,
+            mimetype="image/png",
+            conditional=True,
+            max_age=config.versioned_response_cache_seconds,
+        )
+        response.set_etag(f"analysis-skeleton-{run['cacheKey']}")
         response.headers["Cache-Control"] = (
             f"private, max-age={config.versioned_response_cache_seconds}, immutable"
         )

@@ -90,6 +90,14 @@ Endpoint, junction, border-component, sample-count, median, standard deviation,
 and 5th/95th-percentile values are returned for quality control. The ROI is
 transient viewer state and is not written into the user's annotations.
 
+The full saved centerline is available as a separate viewer overlay. It is the
+same `skeleton_y`/`skeleton_x` geometry from which ROI samples are selected,
+not a separately recomputed display approximation. Users can hide it or change
+its color and rendered thickness; those controls never alter measurement data.
+New jobs publish a one-pixel binary `skeleton.png` with the other immutable
+artifacts. For an older saved job, the API creates that PNG on first request
+from its existing schema-v1 thickness geometry.
+
 The viewer presents the observed (before-EF) average and the EF-adjusted
 average together. The adjusted value is the primary result. Because the saved
 measurement includes its pixel-domain mean diameter, both displayed values
