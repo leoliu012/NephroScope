@@ -7,7 +7,7 @@ Use this when the app code changes and you want the most complete restart/reload
 From the project root:
 
 ```bash
-cd ~/AGH-Viewer
+cd ~/NephroScope
 pkill -f "python app.py" || true
 cd backend
 AGH_LOCAL_DEV=1 \
@@ -32,7 +32,7 @@ sudo systemctl restart agh_backend
 Use this when users access the app through Apache at `/agh/`.
 
 ```bash
-cd ~/AGH-Viewer/frontend
+cd ~/NephroScope/frontend
 npm run build
 sudo rsync -a --delete dist/ /var/www/html/agh/
 sudo apache2ctl configtest
@@ -58,7 +58,7 @@ Empty Cache and Hard Reload
 Run the backend command in one terminal:
 
 ```bash
-cd ~/AGH-Viewer
+cd ~/NephroScope
 pkill -f "python app.py" || true
 cd backend
 AGH_LOCAL_DEV=1 \
@@ -70,7 +70,7 @@ AGH_BASIC_AUTH_PASSWORD='choose-a-real-password' \
 Run the frontend/Apache command in another terminal:
 
 ```bash
-cd ~/AGH-Viewer/frontend
+cd ~/NephroScope/frontend
 npm run build
 sudo rsync -a --delete dist/ /var/www/html/agh/
 sudo apache2ctl configtest

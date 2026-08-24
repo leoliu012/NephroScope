@@ -1,6 +1,6 @@
 # Architecture
 
-AGH Image Viewer is a single-server research tool. Its image-serving and model
+NephroScope is a single-server research tool. Its image-serving and model
 paths are deliberately separated so ordinary viewing stays source-preserving
 and long-running inference cannot tie up the web process.
 

@@ -1,6 +1,6 @@
 # Security & Accounts
 
-This document describes how the AGH Viewer authenticates people and how to
+This document describes how NephroScope authenticates people and how to
 manage accounts.
 
 ## Model at a glance

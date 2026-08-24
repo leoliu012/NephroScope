@@ -1,6 +1,6 @@
-# AGH Image Viewer
+# NephroScope
 
-Web-based microscopy image viewer for AGH TIFF images and JSON annotations.
+Web-based renal microscopy image viewer for TIFF images and JSON annotations.
 
 The viewer supports adjustable annotation color and stroke thickness, editable text annotations with font sizing, and calibrated ruler measurements. Pixel size is read from TIFF metadata when available; otherwise the viewer uses the explicit default calibration `0.106872 µm/px` and marks it as a default in the bottom status bar.
 
