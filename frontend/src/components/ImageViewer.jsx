@@ -53,8 +53,20 @@ import {
   formatPixelSizeInput,
 } from '../measurement.js'
 import { normalizeAnnotationForStorage, normalizedAnnotationType } from '../annotationTypes.js'
+import {
+  DEFAULT_ANNOTATION_STROKE_WIDTH,
+  DEFAULT_ARROW_STROKE_WIDTH,
+  MAX_ANNOTATION_STROKE_WIDTH,
+  resolveAnnotationStrokeWidth,
+} from '../annotationStyles.js'
 import { authFetch, currentProfile, currentUser, rememberProfile } from '../auth.js'
 import { fetchViewState, updateViewState } from '../collaboration.js'
+import {
+  DEFAULT_EXPORT_FORMAT,
+  EXPORT_FORMAT_OPTIONS,
+  exportFilename,
+  exportFormatOption,
+} from '../exportOptions.js'
 import {
   calibrationPayload,
   createModelRun,
@@ -256,10 +268,11 @@ function loadImage(src) {
   })
 }
 
-async function annotationOverlayImage(svg, width, height) {
+async function annotationOverlayImage(svg, width, height, includeNames = true) {
   if (!svg) return null
   const clone = svg.cloneNode(true)
   clone.querySelectorAll('.annotation-selection-overlay, .annotation-preview-overlay').forEach(node => node.remove())
+  if (!includeNames) clone.querySelectorAll('.annotation-name-tag').forEach(node => node.remove())
   clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
   clone.setAttribute('width', String(width))
   clone.setAttribute('height', String(height))
@@ -280,8 +293,13 @@ async function annotationOverlayImage(svg, width, height) {
   }
 }
 
-async function exportCanvasFromViewer(sourceCanvas, svg, withAnnotations) {
+async function exportCanvasFromViewer(sourceCanvas, svg, {
+  includeAnnotations = true,
+  includeAnnotationNames = true,
+  predictionLayers = [],
+} = {}) {
   if (!sourceCanvas) throw new Error('Image is not ready to export')
+  await nextFrame()
   await nextFrame()
 
   const width = Number(sourceCanvas.width) || 1
@@ -291,14 +309,22 @@ async function exportCanvasFromViewer(sourceCanvas, svg, withAnnotations) {
   output.height = height
 
   const context = output.getContext('2d', { alpha: false })
-  if (!context) throw new Error('The browser could not create a PDF export canvas')
+  if (!context) throw new Error('The browser could not create an export canvas')
   context.imageSmoothingEnabled = false
   context.fillStyle = '#000'
   context.fillRect(0, 0, width, height)
   context.drawImage(sourceCanvas, 0, 0, width, height)
 
-  if (withAnnotations) {
-    const overlay = await annotationOverlayImage(svg, width, height)
+  predictionLayers.forEach(({ canvas, opacity = 1 }) => {
+    if (!canvas || !Number(canvas.width) || !Number(canvas.height)) return
+    context.save()
+    context.globalAlpha = Math.max(0, Math.min(1, Number(opacity) || 0))
+    context.drawImage(canvas, 0, 0, width, height)
+    context.restore()
+  })
+
+  if (includeAnnotations) {
+    const overlay = await annotationOverlayImage(svg, width, height, includeAnnotationNames)
     if (overlay) {
       try {
         context.drawImage(overlay.image, 0, 0, width, height)
@@ -309,6 +335,40 @@ async function exportCanvasFromViewer(sourceCanvas, svg, withAnnotations) {
   }
 
   return output
+}
+
+function canvasBlob(canvas, mimeType, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(blob => {
+      if (blob) resolve(blob)
+      else reject(new Error('The browser could not create the export file'))
+    }, mimeType, quality)
+  })
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+async function waitForRenderedPredictionCanvas(container, selector, sourceCanvas) {
+  for (let frame = 0; frame < 10; frame += 1) {
+    const canvas = container?.querySelector(selector)
+    if (
+      canvas?.dataset.predictionReady === 'true'
+      && Number(canvas.width) === Number(sourceCanvas?.width)
+      && Number(canvas.height) === Number(sourceCanvas?.height)
+    ) return canvas
+    await nextFrame()
+  }
+  return null
 }
 
 function modelErrorText(value, fallback = 'Model run failed') {
@@ -407,7 +467,11 @@ export default function ImageViewer({
   const [lastSavedAt, setLastSavedAt] = useState(null)
   const [activeTool, setActiveTool] = useState('select')
   const [annColor, setAnnColor] = useState('#000000')
-  const [strokeWidth, setStrokeWidth] = useState(2)
+  const [strokeWidth, setStrokeWidth] = useState(DEFAULT_ANNOTATION_STROKE_WIDTH)
+  const strokeWidthPreferencesRef = useRef({
+    annotation: DEFAULT_ANNOTATION_STROKE_WIDTH,
+    arrow: DEFAULT_ARROW_STROKE_WIDTH,
+  })
   const [fontSize, setFontSize] = useState(18)
   const initialProfile = currentProfile()
   const [annotatorProfile, setAnnotatorProfile] = useState({
@@ -436,6 +500,10 @@ export default function ImageViewer({
   const [exporting, setExporting] = useState(false)
   const [exportError, setExportError] = useState(null)
   const [exportPanelOpen, setExportPanelOpen] = useState(initialTab === 'report')
+  const [exportFormat, setExportFormat] = useState(DEFAULT_EXPORT_FORMAT)
+  const [includeAnnotations, setIncludeAnnotations] = useState(true)
+  const [includeAnnotationNames, setIncludeAnnotationNames] = useState(true)
+  const [includeSegmentationPredictions, setIncludeSegmentationPredictions] = useState(true)
   const canAnnotate = role !== 'viewer'
 
   const imageRef = useRef(null)
@@ -917,6 +985,14 @@ export default function ImageViewer({
     }
   }, [canAnnotate, annotations])
 
+  const handleCanvasAnnotationSelect = useCallback((id) => {
+    setSelectedId(id)
+    if (!canAnnotate) return
+    setEditingTextId(null)
+    setActiveTool('select')
+    setAnnotationToolsOpen(true)
+  }, [canAnnotate])
+
   const currentFileIndex = useMemo(() => files.findIndex(item => item === filename), [files, filename])
   const previousFile = currentFileIndex > 0 ? files[currentFileIndex - 1] : null
   const nextFile = currentFileIndex >= 0 && currentFileIndex < files.length - 1 ? files[currentFileIndex + 1] : null
@@ -1110,7 +1186,7 @@ export default function ImageViewer({
     setAnnsAndDirty(prev => prev.map(a => a.id === selectedId ? { ...a, ...patch } : a))
   }, [canAnnotate, selectedId, setAnnsAndDirty])
 
-  const insertCenteredText = useCallback(() => {
+  const insertCenteredText = useCallback((preferredStrokeWidth = strokeWidth) => {
     if (!canAnnotate) return
     if (!imgMeta || !viewportRef.current) return
     const rect = viewportRef.current.getBoundingClientRect()
@@ -1124,7 +1200,7 @@ export default function ImageViewer({
       annotator,
       timestamp: new Date().toISOString(),
       color: annColor,
-      strokeWidth,
+      strokeWidth: resolveAnnotationStrokeWidth(preferredStrokeWidth, 'text'),
       fontSize,
       ...(zCount > 1 ? { zIndex } : {}),
     }
@@ -1160,48 +1236,6 @@ export default function ImageViewer({
     }
   }, [annotatorDraft, canAnnotate, onProfileChange])
 
-  const exportPDF = useCallback(async (withAnnotations) => {
-    setExporting(true)
-    setExportError(null)
-    try {
-      const cvs = await exportCanvasFromViewer(imageRef.current, svgRef.current, withAnnotations)
-      const imgData = cvs.toDataURL('image/png')
-      const orientation = cvs.width >= cvs.height ? 'landscape' : 'portrait'
-      const pdf = new jsPDF({ orientation, unit: 'px', format: [cvs.width, cvs.height], compress: false })
-      pdf.addImage(imgData, 'PNG', 0, 0, cvs.width, cvs.height, undefined, 'NONE')
-
-      if (withAnnotations && annotations.length) {
-        pdf.addPage()
-        pdf.setFontSize(10)
-        pdf.text('Annotations', 20, 20)
-        annotations.forEach((a, i) => {
-          const type = normalizedAnnotationType(a)
-          const ts = a.timestamp ? new Date(a.timestamp).toLocaleString() : ''
-          const details = type === 'measure'
-            ? formatMeasurement(a.coords, a, measurementMeta)
-            : a.label || ''
-          pdf.text(`${i+1}. [${type}] ${details} - ${a.annotator || 'unknown'} @ ${ts}`, 20, 35 + i * 14)
-        })
-      }
-
-      pdf.setFontSize(10)
-      pdf.setTextColor(180, 30, 30)
-      pdf.text(RESEARCH_USE_NOTICE, 20, Math.max(20, cvs.height - 20))
-      await authFetch(`${API}/audit/export-pdf`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ caseId, filename, withAnnotations }),
-      }).catch(() => {})
-
-      const safeName = filename.replace(/\.[^.]+$/, '')
-      pdf.save(`${safeName}${withAnnotations ? '_annotated' : ''}.pdf`)
-    } catch (error) {
-      setExportError(error.message || 'Unable to export PDF')
-    } finally {
-      setExporting(false)
-    }
-  }, [caseId, filename, annotations, measurementMeta])
-
   const imageReady = loadedImageKey === imageKey && imgMeta && channelSettings
   const displayedZIndex = sliceLoadState.displayedZIndex !== null
     && Number.isInteger(Number(sliceLoadState.displayedZIndex))
@@ -1230,6 +1264,7 @@ export default function ImageViewer({
     && sliceLoadState.status === 'ready',
   )
   const currentMaskReady = modelOverlayAligned && currentModelRun?.maskStatus === 'ready'
+  const currentSkeletonAvailable = currentModelRun?.result?.thicknessGeometryAvailable !== false
   const currentRoiRecord = modelRoisByZ[String(zIndex)] || null
   const currentModelRoi = modelOverlayAligned
     && currentRoiRecord?.runId === currentModelRun?.runId
@@ -1256,6 +1291,113 @@ export default function ImageViewer({
     || ['QUEUED', 'RUNNING'].includes(normalizeRunStatus(currentModelRun.status))
   ))
   const modelCanRun = modelPlaneReady && !modelBusy
+
+  const exportImage = useCallback(async () => {
+    setExporting(true)
+    setExportError(null)
+    const expectedImageKey = imageKey
+    const expectedZIndex = zIndex
+    try {
+      const sourceCanvas = imageRef.current
+      const predictionLayers = []
+      const canvasContainer = sourceCanvas?.closest('.viewer-canvas-container')
+
+      if (includeSegmentationPredictions && modelOverlayAligned) {
+        if (modelOverlaySettings.visible && modelOverlaySettings.opacity > 0) {
+          const maskCanvas = await waitForRenderedPredictionCanvas(canvasContainer, '.model-mask-overlay', sourceCanvas)
+          if (!maskCanvas) throw new Error('The GBM overlay is not ready yet')
+          predictionLayers.push({ canvas: maskCanvas, opacity: modelOverlaySettings.opacity })
+        }
+
+        if (modelSkeletonSettings.visible && currentSkeletonAvailable) {
+          const skeletonCanvas = await waitForRenderedPredictionCanvas(canvasContainer, '.model-skeleton-overlay', sourceCanvas)
+          if (!skeletonCanvas) throw new Error('The GBM skeleton is not ready yet')
+          predictionLayers.push({ canvas: skeletonCanvas, opacity: 1 })
+        }
+      }
+
+      const canvas = await exportCanvasFromViewer(sourceCanvas, svgRef.current, {
+        includeAnnotations,
+        includeAnnotationNames,
+        predictionLayers,
+      })
+      if (
+        modelViewRef.current.imageKey !== expectedImageKey
+        || modelViewRef.current.zIndex !== expectedZIndex
+      ) {
+        throw new Error('The image changed during export. Please export again.')
+      }
+
+      const option = exportFormatOption(exportFormat)
+      const outputFilename = exportFilename(filename, option.id, includeAnnotations)
+      if (option.id === 'pdf') {
+        const imageData = canvas.toDataURL('image/png')
+        const orientation = canvas.width >= canvas.height ? 'landscape' : 'portrait'
+        const pdf = new jsPDF({ orientation, unit: 'px', format: [canvas.width, canvas.height], compress: false })
+        pdf.addImage(imageData, 'PNG', 0, 0, canvas.width, canvas.height, undefined, 'NONE')
+
+        const exportedAnnotations = annotations.filter(annotation => (
+          zIndexForAnnotation(annotation, zCount) === zIndex
+        ))
+        if (includeAnnotations && exportedAnnotations.length) {
+          pdf.addPage()
+          pdf.setFontSize(10)
+          pdf.text('Annotations', 20, 20)
+          exportedAnnotations.forEach((annotation, index) => {
+            const type = normalizedAnnotationType(annotation)
+            const timestamp = annotation.timestamp ? new Date(annotation.timestamp).toLocaleString() : ''
+            const details = type === 'measure'
+              ? formatMeasurement(annotation.coords, annotation, measurementMeta)
+              : annotation.label || ''
+            pdf.text(`${index + 1}. [${type}] ${details} - ${annotation.annotator || 'unknown'} @ ${timestamp}`, 20, 35 + index * 14)
+          })
+        }
+
+        pdf.setFontSize(10)
+        pdf.setTextColor(180, 30, 30)
+        pdf.text(RESEARCH_USE_NOTICE, 20, Math.max(20, canvas.height - 20))
+        pdf.save(outputFilename)
+      } else {
+        const quality = option.id === 'jpeg' ? 0.92 : undefined
+        const blob = await canvasBlob(canvas, option.mimeType, quality)
+        downloadBlob(blob, outputFilename)
+      }
+
+      await authFetch(`${API}/audit/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          caseId,
+          filename,
+          format: option.id,
+          includeAnnotations,
+          includeAnnotationNames: includeAnnotations && includeAnnotationNames,
+          includeSegmentationPredictions,
+        }),
+      }).catch(() => {})
+    } catch (error) {
+      setExportError(error.message || 'Unable to export image')
+    } finally {
+      setExporting(false)
+    }
+  }, [
+    annotations,
+    caseId,
+    currentSkeletonAvailable,
+    exportFormat,
+    filename,
+    imageKey,
+    includeAnnotationNames,
+    includeAnnotations,
+    includeSegmentationPredictions,
+    measurementMeta,
+    modelOverlayAligned,
+    modelOverlaySettings.opacity,
+    modelOverlaySettings.visible,
+    modelSkeletonSettings.visible,
+    zCount,
+    zIndex,
+  ])
 
   const updateModelOverlaySettings = useCallback((patch) => {
     setModelOverlaySettings(current => normalizeModelOverlaySettings({ ...current, ...patch }))
@@ -1589,7 +1731,7 @@ export default function ImageViewer({
   useEffect(() => {
     if (!selectedAnn) return
     if (selectedAnn.color) setAnnColor(selectedAnn.color)
-    if (Number.isFinite(Number(selectedAnn.strokeWidth))) setStrokeWidth(Number(selectedAnn.strokeWidth))
+    setStrokeWidth(resolveAnnotationStrokeWidth(selectedAnn.strokeWidth, normalizedAnnotationType(selectedAnn)))
     if (normalizedAnnotationType(selectedAnn) === 'text' && Number.isFinite(Number(selectedAnn.fontSize))) setFontSize(Number(selectedAnn.fontSize))
   }, [selectedAnn?.id])
 
@@ -1606,10 +1748,21 @@ export default function ImageViewer({
   }, [selectedId, updateSelectedAnnotation])
 
   const changeStrokeWidth = useCallback((value) => {
-    const next = Math.max(1, Math.min(12, Number(value) || 2))
+    const targetType = normalizedAnnotationType(selectedAnn) || activeTool
+    const next = resolveAnnotationStrokeWidth(value, targetType)
+    const preference = targetType === 'arrow' ? 'arrow' : 'annotation'
+    strokeWidthPreferencesRef.current[preference] = next
     setStrokeWidth(next)
     if (selectedId) updateSelectedAnnotation({ strokeWidth: next })
-  }, [selectedId, updateSelectedAnnotation])
+  }, [activeTool, selectedAnn, selectedId, updateSelectedAnnotation])
+
+  const activateAnnotationTool = useCallback((id) => {
+    const preference = id === 'arrow' ? 'arrow' : 'annotation'
+    setStrokeWidth(strokeWidthPreferencesRef.current[preference])
+    setSelectedId(null)
+    setEditingTextId(null)
+    setActiveTool(id)
+  }, [])
 
   const changeFontSize = useCallback((value) => {
     const next = Math.max(10, Math.min(72, Number(value) || 18))
@@ -1875,7 +2028,15 @@ export default function ImageViewer({
                     key={id}
                     type="button"
                     title={label}
-                    onClick={() => id === 'text' ? insertCenteredText() : setActiveTool(id)}
+                    onClick={() => {
+                      if (id === 'text') {
+                        const nextWidth = strokeWidthPreferencesRef.current.annotation
+                        setStrokeWidth(nextWidth)
+                        insertCenteredText(nextWidth)
+                        return
+                      }
+                      activateAnnotationTool(id)
+                    }}
                     className={`annotation-floating-tool ${activeTool === id ? 'annotation-floating-tool-active' : ''}`}
                   >
                     <Icon size={15} />
@@ -1908,7 +2069,7 @@ export default function ImageViewer({
                 <input
                   type="range"
                   min="1"
-                  max="12"
+                  max={MAX_ANNOTATION_STROKE_WIDTH}
                   step="1"
                   value={strokeWidth}
                   onChange={event => changeStrokeWidth(event.currentTarget.value)}
@@ -1930,6 +2091,32 @@ export default function ImageViewer({
                   />
                   <span className="annotation-floating-value">{fontSize}px</span>
                 </label>
+              )}
+              {selectedAnn && (
+                <>
+                  <div className="annotation-floating-divider" />
+                  <div className="annotation-floating-group" aria-label="Selected annotation actions">
+                    {normalizedAnnotationType(selectedAnn) === 'text' && (
+                      <button
+                        type="button"
+                        title="Edit selected text"
+                        onClick={() => handleEditAnnotation(selectedAnn.id)}
+                        className="annotation-floating-tool"
+                      >
+                        <Pencil size={15} />
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      title="Delete selected annotation"
+                      aria-label="Delete selected annotation"
+                      onClick={deleteSelected}
+                      className="annotation-floating-tool text-[var(--danger)]"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                </>
               )}
             </div>
           )}
@@ -1967,13 +2154,13 @@ export default function ImageViewer({
                   color={modelOverlaySettings.color}
                   opacity={modelOverlaySettings.opacity}
                   visible={modelOverlaySettings.visible}
+                  displayMode={modelOverlaySettings.displayMode}
                   onReady={handleModelMaskReady}
                   onError={handleModelMaskError}
                 />
               )}
               {modelOverlayAligned
                 && currentModelRun?.runId
-                && modelSkeletonSettings.visible
                 && currentModelRun?.result?.thicknessGeometryAvailable !== false && (
                 <ModelSkeletonOverlay
                   key={`${imageKey}:${currentModelRun.runId}:skeleton`}
@@ -2001,6 +2188,7 @@ export default function ImageViewer({
                   fontSize={fontSize}
                   selectedId={selectedId}
                   setSelectedId={setSelectedId}
+                  onSelectAnnotation={handleCanvasAnnotationSelect}
                   onEditAnnotation={handleEditAnnotation}
                   editingTextId={editingTextId}
                   setEditingTextId={setEditingTextId}
@@ -2200,7 +2388,8 @@ export default function ImageViewer({
                               onClick={() => {
                                 const targetZIndex = zIndexForAnnotation(annotation, zCount)
                                 if (targetZIndex !== zIndex) commitZSlice(targetZIndex)
-                                setSelectedId(annotation.id === selectedId ? null : annotation.id)
+                                if (annotation.id === selectedId) setSelectedId(null)
+                                else handleCanvasAnnotationSelect(annotation.id)
                               }}
                               className={`annotation-list-item ${annotation.id === selectedId ? 'annotation-list-item-selected' : ''}`}>
                               <span className="annotation-list-color" style={{ background: annotation.color }} />
@@ -2329,16 +2518,6 @@ export default function ImageViewer({
                         <option key={index} value={index}>{modelChannelLabel(channelSettings, index)}</option>
                       ))}
                     </select>
-                    <span className="mt-1 block text-[10px] leading-snug text-[var(--text-subtle)]">
-                      {modelChannelCount > 1
-                        ? 'Channel 2 is selected by default for multi-channel images.'
-                        : 'This image has one input channel.'}
-                    </span>
-                    {zCount > 1 && (
-                      <span className="mt-1 block text-[10px] leading-snug text-[var(--text-subtle)]">
-                        The model uses an up-to-five-plane Z MIP around the displayed slice.
-                      </span>
-                    )}
                   </label>
 
                   <button
@@ -2418,6 +2597,16 @@ export default function ImageViewer({
                       />
                     </label>
                     <label className="flex items-center justify-between gap-3">
+                      <span className="text-[12px] text-[var(--text-muted)]">Contour only</span>
+                      <input
+                        type="checkbox"
+                        checked={modelOverlaySettings.displayMode === 'contour'}
+                        onChange={event => updateModelOverlaySettings({
+                          displayMode: event.currentTarget.checked ? 'contour' : 'filled',
+                        })}
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-3">
                       <span className="text-[12px] text-[var(--text-muted)]">Overlay color</span>
                       <input
                         type="color"
@@ -2486,9 +2675,6 @@ export default function ImageViewer({
                     <div className="space-y-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] p-3">
                       <div>
                         <p className="text-[12px] font-semibold text-[var(--text)]">ROI thickness</p>
-                        <p className="mt-1 text-[10px] leading-snug text-[var(--text-subtle)]">
-                          Draw a freehand polygon on this Z slice. The ROI is temporary and is not saved as an annotation.
-                        </p>
                       </div>
                       <div className="grid grid-cols-2 gap-2">
                         <button type="button" onClick={activateModelRoi} className="ux-button ux-button-secondary min-h-0 px-2 py-1.5 text-[11px]">
@@ -2557,18 +2743,21 @@ export default function ImageViewer({
 
       {exportPanelOpen && (
         <div
+          role="dialog"
+          aria-labelledby="image-export-title"
           className="fixed z-[56] w-[360px] overflow-y-auto rounded-lg border border-[var(--border-strong)] bg-[var(--surface-1)] p-4 shadow-2xl"
           style={exportPanelFloatingStyle}
         >
           <div className="mb-4 flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <p className="text-sm font-semibold text-[var(--text)]">Export</p>
-              <p className="mt-1 text-[12px] leading-snug text-[var(--text-muted)]">Image notes and annotation export.</p>
+              <p id="image-export-title" className="text-sm font-semibold text-[var(--text)]">Export</p>
+              <p className="mt-1 text-[12px] leading-snug text-[var(--text-muted)]">Choose a format and what to include.</p>
             </div>
             <button
               type="button"
               onClick={() => setExportPanelOpen(false)}
               className="ux-icon-button h-8 w-8 flex-shrink-0"
+              aria-label="Close export"
               title="Close export"
             >
               <X size={14} />
@@ -2601,15 +2790,61 @@ export default function ImageViewer({
               />
             </label>
 
-            <button onClick={() => exportPDF(true)} disabled={exporting}
-              className="ux-button ux-button-primary w-full">
-              <Download size={13} /> Export annotated PDF
+            <label className="block">
+              <span className="mb-1 block text-[12px] font-semibold text-[var(--text)]">File format</span>
+              <select
+                value={exportFormat}
+                onChange={event => setExportFormat(event.currentTarget.value)}
+                className="ux-input"
+              >
+                {EXPORT_FORMAT_OPTIONS.map(option => (
+                  <option key={option.id} value={option.id}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+
+            <fieldset className="space-y-2">
+              <legend className="sr-only">Export contents</legend>
+              <label className="flex cursor-pointer items-center justify-between gap-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] px-3 py-2.5">
+                <span className="text-[12px] text-[var(--text-muted)]">Include segmentation predictions</span>
+                <input
+                  type="checkbox"
+                  checked={includeSegmentationPredictions}
+                  onChange={event => setIncludeSegmentationPredictions(event.currentTarget.checked)}
+                />
+              </label>
+              <label className="flex cursor-pointer items-center justify-between gap-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] px-3 py-2.5">
+                <span className="text-[12px] text-[var(--text-muted)]">Include annotations</span>
+                <input
+                  type="checkbox"
+                  checked={includeAnnotations}
+                  onChange={event => setIncludeAnnotations(event.currentTarget.checked)}
+                />
+              </label>
+              <label className={`flex items-center justify-between gap-3 rounded border border-[var(--border)] px-3 py-2.5 ${
+                includeAnnotations
+                  ? 'cursor-pointer bg-[var(--canvas-bg)]'
+                  : 'cursor-not-allowed bg-[var(--surface-2)] opacity-50'
+              }`}>
+                <span className="text-[12px] text-[var(--text-muted)]">Add names beside annotations</span>
+                <input
+                  type="checkbox"
+                  checked={includeAnnotationNames}
+                  disabled={!includeAnnotations}
+                  onChange={event => setIncludeAnnotationNames(event.currentTarget.checked)}
+                />
+              </label>
+            </fieldset>
+
+            <button
+              onClick={exportImage}
+              disabled={exporting || !imageReady || sliceLoadState.status !== 'ready'}
+              className="ux-button ux-button-primary w-full"
+            >
+              {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
+              {exporting ? 'Exporting…' : `Export ${exportFormatOption(exportFormat).label}`}
             </button>
-            <button onClick={() => exportPDF(false)} disabled={exporting}
-              className="ux-button ux-button-secondary w-full">
-              <Download size={13} /> Export image-only PDF
-            </button>
-            {exportError && <p className="text-[12px] leading-snug text-red-300">{exportError}</p>}
+            {exportError && <p role="alert" className="text-[12px] leading-snug text-red-300">{exportError}</p>}
           </div>
 
           <div className="mt-4 flex items-center justify-between border-t border-[var(--border)] pt-3">

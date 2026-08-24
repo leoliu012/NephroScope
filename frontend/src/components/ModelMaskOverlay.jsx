@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { authFetch } from '../auth.js'
+import { modelMaskContourAlpha } from '../modelAnalysis.js'
 
 function parseHexColor(value) {
   const match = /^#([0-9a-f]{6})$/i.exec(value || '')
@@ -52,6 +53,7 @@ export default function ModelMaskOverlay({
   color,
   opacity,
   visible,
+  displayMode = 'filled',
   onReady,
   onError,
 }) {
@@ -66,6 +68,10 @@ export default function ModelMaskOverlay({
 
   useEffect(() => {
     maskAlphaRef.current = null
+    if (canvasRef.current) {
+      canvasRef.current.dataset.predictionReady = 'false'
+      canvasRef.current.getContext('2d')?.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
+    }
     setMaskRevision(revision => revision + 1)
     if (!maskUrl || !width || !height) return undefined
 
@@ -111,9 +117,13 @@ export default function ModelMaskOverlay({
           for (let index = 0; index < alpha.length; index += 1) alpha[index] = alpha[index] ? 255 : 0
         }
         if (controller.signal.aborted) return
-        maskAlphaRef.current = { alpha, width: image.naturalWidth, height: image.naturalHeight }
+        maskAlphaRef.current = {
+          alpha,
+          contourAlpha: null,
+          width: image.naturalWidth,
+          height: image.naturalHeight,
+        }
         setMaskRevision(revision => revision + 1)
-        readyCallbackRef.current?.({ width: image.naturalWidth, height: image.naturalHeight })
       } catch (error) {
         if (error.name !== 'AbortError') errorCallbackRef.current?.(error.message || 'Unable to load model mask')
       } finally {
@@ -124,7 +134,7 @@ export default function ModelMaskOverlay({
     return () => controller.abort()
   }, [height, maskUrl, width])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const mask = maskAlphaRef.current
     const canvas = canvasRef.current
     if (!mask || !canvas) return
@@ -136,15 +146,21 @@ export default function ModelMaskOverlay({
       return
     }
     const [red, green, blue] = parseHexColor(color)
+    if (displayMode === 'contour' && !mask.contourAlpha) {
+      mask.contourAlpha = modelMaskContourAlpha(mask.alpha, mask.width, mask.height)
+    }
+    const alpha = displayMode === 'contour' ? mask.contourAlpha : mask.alpha
     const output = context.createImageData(mask.width, mask.height)
-    for (let sourceIndex = 0, targetIndex = 0; sourceIndex < mask.alpha.length; sourceIndex += 1, targetIndex += 4) {
+    for (let sourceIndex = 0, targetIndex = 0; sourceIndex < alpha.length; sourceIndex += 1, targetIndex += 4) {
       output.data[targetIndex] = red
       output.data[targetIndex + 1] = green
       output.data[targetIndex + 2] = blue
-      output.data[targetIndex + 3] = mask.alpha[sourceIndex]
+      output.data[targetIndex + 3] = alpha[sourceIndex]
     }
     context.putImageData(output, 0, 0)
-  }, [color, maskRevision])
+    canvas.dataset.predictionReady = 'true'
+    readyCallbackRef.current?.({ width: mask.width, height: mask.height })
+  }, [color, displayMode, maskRevision])
 
   return (
     <canvas
@@ -167,4 +183,3 @@ export default function ModelMaskOverlay({
     />
   )
 }
-

@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { authFetch } from '../auth.js'
+import {
+  denoiseCrossSample,
+  localContrastIntensity,
+  webGlImagePixelGlsl,
+} from '../multiChannelRendering.js'
 
 const MAX_GPU_CHANNELS = 8
 const HISTOGRAM_BINS = 128
@@ -403,23 +408,97 @@ function createGpuRenderer(canvas, planes, width, height, bitsPerSample) {
     uniform float uMaximum[${MAX_GPU_CHANNELS}];
     uniform float uBrightness[${MAX_GPU_CHANNELS}];
     uniform float uContrast[${MAX_GPU_CHANNELS}];
+    uniform float uSmoothing[${MAX_GPU_CHANNELS}];
+    uniform float uDenoise[${MAX_GPU_CHANNELS}];
+    uniform float uSharpening[${MAX_GPU_CHANNELS}];
+    uniform float uLocalContrast[${MAX_GPU_CHANNELS}];
+    uniform float uGamma[${MAX_GPU_CHANNELS}];
     uniform vec3 uColor[${MAX_GPU_CHANNELS}];
 
     out vec4 outputColor;
 
+    void sortPair(inout float lower, inout float upper) {
+      if (lower > upper) {
+        float temporary = lower;
+        lower = upper;
+        upper = temporary;
+      }
+    }
+
+    float medianOfFive(float first, float second, float third, float fourth, float fifth) {
+      sortPair(first, second);
+      sortPair(fourth, fifth);
+      sortPair(first, third);
+      sortPair(second, third);
+      sortPair(first, fourth);
+      sortPair(third, fourth);
+      sortPair(second, fifth);
+      sortPair(second, third);
+      sortPair(fourth, fifth);
+      return third;
+    }
+
     void main() {
-      ivec2 pixel = ivec2(gl_FragCoord.xy) - ivec2(0, 1);
-      pixel.y = ${height} - 1 - pixel.y;
+      ${webGlImagePixelGlsl(height)}
       vec3 composite = vec3(0.0);
       for (int index = 0; index < ${MAX_GPU_CHANNELS}; index += 1) {
         if (index >= uChannelCount) break;
         if (uVisible[index] == 0) continue;
 
-        uint rawValue = texelFetch(uPlanes, ivec3(pixel.x, pixel.y, index), 0).r;
-        float sourceValue = float(rawValue);
+        float sourceValue = float(texelFetch(uPlanes, ivec3(pixel.x, pixel.y, index), 0).r);
+        float neighbourhoodMinimum = sourceValue;
+        float neighbourhoodMaximum = sourceValue;
+        if (
+          uSmoothing[index] > 0.0
+          || uDenoise[index] > 0.0
+          || uSharpening[index] > 0.0
+          || uLocalContrast[index] > 0.0
+        ) {
+          float neighbourhood = 0.0;
+          for (int offsetY = -1; offsetY <= 1; offsetY += 1) {
+            for (int offsetX = -1; offsetX <= 1; offsetX += 1) {
+              ivec2 samplePixel = clamp(
+                pixel + ivec2(offsetX, offsetY),
+                ivec2(0),
+                ivec2(${width - 1}, ${height - 1})
+              );
+              float sampleValue = float(texelFetch(uPlanes, ivec3(samplePixel.x, samplePixel.y, index), 0).r);
+              neighbourhood += sampleValue;
+              neighbourhoodMinimum = min(neighbourhoodMinimum, sampleValue);
+              neighbourhoodMaximum = max(neighbourhoodMaximum, sampleValue);
+            }
+          }
+          float meanValue = neighbourhood / 9.0;
+          if (uDenoise[index] > 0.0) {
+            ivec2 upperPixel = clamp(pixel + ivec2(0, -1), ivec2(0), ivec2(${width - 1}, ${height - 1}));
+            ivec2 rightPixel = clamp(pixel + ivec2(1, 0), ivec2(0), ivec2(${width - 1}, ${height - 1}));
+            ivec2 lowerPixel = clamp(pixel + ivec2(0, 1), ivec2(0), ivec2(${width - 1}, ${height - 1}));
+            ivec2 leftPixel = clamp(pixel + ivec2(-1, 0), ivec2(0), ivec2(${width - 1}, ${height - 1}));
+            float medianValue = medianOfFive(
+              sourceValue,
+              float(texelFetch(uPlanes, ivec3(upperPixel.x, upperPixel.y, index), 0).r),
+              float(texelFetch(uPlanes, ivec3(rightPixel.x, rightPixel.y, index), 0).r),
+              float(texelFetch(uPlanes, ivec3(lowerPixel.x, lowerPixel.y, index), 0).r),
+              float(texelFetch(uPlanes, ivec3(leftPixel.x, leftPixel.y, index), 0).r)
+            );
+            sourceValue = mix(sourceValue, medianValue, uDenoise[index]);
+          }
+          float smoothedValue = mix(sourceValue, meanValue, uSmoothing[index]);
+          sourceValue = smoothedValue + (uSharpening[index] * (sourceValue - meanValue));
+        }
         float span = max(1.0, uMaximum[index] - uMinimum[index]);
         float intensity = clamp((sourceValue - uMinimum[index]) / span, 0.0, 1.0);
         if (uInverted[index] != 0) intensity = 1.0 - intensity;
+        if (uLocalContrast[index] > 0.0 && neighbourhoodMaximum > neighbourhoodMinimum) {
+          float localIntensity = clamp(
+            (sourceValue - neighbourhoodMinimum) / (neighbourhoodMaximum - neighbourhoodMinimum),
+            0.0,
+            1.0
+          );
+          if (uInverted[index] != 0) localIntensity = 1.0 - localIntensity;
+          intensity = mix(intensity, localIntensity, uLocalContrast[index]);
+        }
+        intensity = pow(intensity, 1.0 / max(0.25, uGamma[index]));
         intensity = clamp(((intensity - 0.5) * uContrast[index]) + 0.5 + uBrightness[index], 0.0, 1.0);
         composite += intensity * uColor[index];
       }
@@ -477,6 +556,11 @@ function createGpuRenderer(canvas, planes, width, height, bitsPerSample) {
     maximum: gl.getUniformLocation(program, 'uMaximum[0]'),
     brightness: gl.getUniformLocation(program, 'uBrightness[0]'),
     contrast: gl.getUniformLocation(program, 'uContrast[0]'),
+    smoothing: gl.getUniformLocation(program, 'uSmoothing[0]'),
+    denoise: gl.getUniformLocation(program, 'uDenoise[0]'),
+    sharpening: gl.getUniformLocation(program, 'uSharpening[0]'),
+    localContrast: gl.getUniformLocation(program, 'uLocalContrast[0]'),
+    gamma: gl.getUniformLocation(program, 'uGamma[0]'),
     color: gl.getUniformLocation(program, 'uColor[0]'),
   }
 
@@ -495,6 +579,11 @@ function createGpuRenderer(canvas, planes, width, height, bitsPerSample) {
       const maximum = new Float32Array(MAX_GPU_CHANNELS)
       const brightness = new Float32Array(MAX_GPU_CHANNELS)
       const contrast = new Float32Array(MAX_GPU_CHANNELS)
+      const smoothing = new Float32Array(MAX_GPU_CHANNELS)
+      const denoise = new Float32Array(MAX_GPU_CHANNELS)
+      const sharpening = new Float32Array(MAX_GPU_CHANNELS)
+      const localContrast = new Float32Array(MAX_GPU_CHANNELS)
+      const gamma = new Float32Array(MAX_GPU_CHANNELS).fill(1)
       const color = new Float32Array(MAX_GPU_CHANNELS * 3)
 
       for (const setting of settings || []) {
@@ -507,6 +596,21 @@ function createGpuRenderer(canvas, planes, width, height, bitsPerSample) {
         maximum[index] = Number(setting.max) || 1
         brightness[index] = (Number(setting.brightness) || 0) / 100
         contrast[index] = Number(setting.contrast) || 1
+        smoothing[index] = setting.smoothingEnabled
+          ? Math.min(1, Math.max(0, Number(setting.smoothing) || 0))
+          : 0
+        denoise[index] = setting.denoiseEnabled
+          ? Math.min(1, Math.max(0, Number(setting.denoise) || 0))
+          : 0
+        sharpening[index] = setting.sharpeningEnabled
+          ? Math.min(2, Math.max(0, Number(setting.sharpening) || 0))
+          : 0
+        localContrast[index] = setting.localContrastEnabled
+          ? Math.min(1, Math.max(0, Number(setting.localContrast) || 0))
+          : 0
+        gamma[index] = setting.gammaEnabled
+          ? Math.min(4, Math.max(0.25, Number(setting.gamma) || 1))
+          : 1
         color[index * 3] = rgb.r / 255
         color[(index * 3) + 1] = rgb.g / 255
         color[(index * 3) + 2] = rgb.b / 255
@@ -524,6 +628,11 @@ function createGpuRenderer(canvas, planes, width, height, bitsPerSample) {
       gl.uniform1fv(locations.maximum, maximum)
       gl.uniform1fv(locations.brightness, brightness)
       gl.uniform1fv(locations.contrast, contrast)
+      gl.uniform1fv(locations.smoothing, smoothing)
+      gl.uniform1fv(locations.denoise, denoise)
+      gl.uniform1fv(locations.sharpening, sharpening)
+      gl.uniform1fv(locations.localContrast, localContrast)
+      gl.uniform1fv(locations.gamma, gamma)
       gl.uniform3fv(locations.color, color)
       gl.drawArrays(gl.TRIANGLES, 0, 3)
     },
@@ -554,7 +663,25 @@ function createCpuRenderer(canvas, planes, width, height) {
     },
     draw(settings) {
       const activeChannels = (settings || [])
-        .map(setting => ({ ...setting, rgb: parseHexColor(setting.color) }))
+        .map(setting => ({
+          ...setting,
+          rgb: parseHexColor(setting.color),
+          smoothing: setting.smoothingEnabled
+            ? Math.min(1, Math.max(0, Number(setting.smoothing) || 0))
+            : 0,
+          denoise: setting.denoiseEnabled
+            ? Math.min(1, Math.max(0, Number(setting.denoise) || 0))
+            : 0,
+          sharpening: setting.sharpeningEnabled
+            ? Math.min(2, Math.max(0, Number(setting.sharpening) || 0))
+            : 0,
+          localContrast: setting.localContrastEnabled
+            ? Math.min(1, Math.max(0, Number(setting.localContrast) || 0))
+            : 0,
+          gamma: setting.gammaEnabled
+            ? Math.min(4, Math.max(0.25, Number(setting.gamma) || 1))
+            : 1,
+        }))
         .filter(setting => setting.visible)
       const output = image.data
       const pixels = width * height
@@ -568,8 +695,72 @@ function createCpuRenderer(canvas, planes, width, height) {
           const plane = currentPlanes[channel.index]
           if (!plane) continue
           const span = Math.max(1, channel.max - channel.min)
-          let intensity = Math.min(1, Math.max(0, (plane[pixel] - channel.min) / span))
+          const sourceValue = plane[pixel]
+          let filteredValue = sourceValue
+          let neighbourhoodMinimum = sourceValue
+          let neighbourhoodMaximum = sourceValue
+          if (
+            channel.smoothing > 0
+            || channel.denoise > 0
+            || channel.sharpening > 0
+            || channel.localContrast > 0
+          ) {
+            const x = pixel % width
+            const y = Math.floor(pixel / width)
+            const left = Math.max(0, x - 1)
+            const right = Math.min(width - 1, x + 1)
+            const upperRow = Math.max(0, y - 1) * width
+            const middleRow = y * width
+            const lowerRow = Math.min(height - 1, y + 1) * width
+            const upperLeft = plane[upperRow + left]
+            const upper = plane[upperRow + x]
+            const upperRight = plane[upperRow + right]
+            const middleLeft = plane[middleRow + left]
+            const middleRight = plane[middleRow + right]
+            const lowerLeft = plane[lowerRow + left]
+            const lower = plane[lowerRow + x]
+            const lowerRight = plane[lowerRow + right]
+            const meanValue = (
+              upperLeft + upper + upperRight
+              + middleLeft + sourceValue + middleRight
+              + lowerLeft + lower + lowerRight
+            ) / 9
+            neighbourhoodMinimum = Math.min(
+              upperLeft, upper, upperRight,
+              middleLeft, sourceValue, middleRight,
+              lowerLeft, lower, lowerRight,
+            )
+            neighbourhoodMaximum = Math.max(
+              upperLeft, upper, upperRight,
+              middleLeft, sourceValue, middleRight,
+              lowerLeft, lower, lowerRight,
+            )
+            if (channel.denoise > 0) {
+              filteredValue = denoiseCrossSample(
+                sourceValue,
+                upper,
+                middleRight,
+                lower,
+                middleLeft,
+                channel.denoise,
+              )
+            }
+            const smoothedValue = filteredValue + ((meanValue - filteredValue) * channel.smoothing)
+            filteredValue = smoothedValue + ((filteredValue - meanValue) * channel.sharpening)
+          }
+          let intensity = Math.min(1, Math.max(0, (filteredValue - channel.min) / span))
           if (channel.inverted) intensity = 1 - intensity
+          if (channel.localContrast > 0) {
+            intensity = localContrastIntensity(
+              intensity,
+              filteredValue,
+              neighbourhoodMinimum,
+              neighbourhoodMaximum,
+              channel.inverted,
+              channel.localContrast,
+            )
+          }
+          intensity = Math.pow(intensity, 1 / channel.gamma)
           intensity = Math.min(1, Math.max(0, ((intensity - 0.5) * channel.contrast) + 0.5 + (channel.brightness / 100)))
           red += intensity * channel.rgb.r
           green += intensity * channel.rgb.g

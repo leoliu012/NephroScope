@@ -2,6 +2,7 @@ import { useRef, useState, useCallback, useMemo, useEffect } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 import { formatMeasurement, pixelCalibration } from '../measurement.js'
 import { normalizedAnnotationType as normalizedType } from '../annotationTypes.js'
+import { resolveAnnotationStrokeWidth } from '../annotationStyles.js'
 
 // Tools that support click-to-place two points, in addition to press-drag.
 const TWO_CLICK_TOOLS = ['measure', 'line', 'arrow', 'rect']
@@ -95,11 +96,11 @@ function circleGeometry(coords = [], fallbackRadius = 5) {
 function pointRadius(annotation) {
   const explicit = Number(annotation.radius)
   if (Number.isFinite(explicit) && explicit > 0) return Math.max(1, explicit)
-  return circleGeometry(annotation.coords || [], Math.max(5, (Number(annotation.strokeWidth) || 2) * 2.5)).radius
+  return circleGeometry(annotation.coords || [], Math.max(5, resolveAnnotationStrokeWidth(annotation.strokeWidth, annotation) * 2.5)).radius
 }
 
 function normalizeCircleAnnotation(annotation) {
-  const fallbackRadius = Math.max(5, (Number(annotation.strokeWidth) || 2) * 2.5)
+  const fallbackRadius = Math.max(5, resolveAnnotationStrokeWidth(annotation.strokeWidth, annotation) * 2.5)
   const { cx, cy, radius } = circleGeometry(annotation.coords || [], fallbackRadius)
   return { ...annotation, coords: [cx, cy], radius }
 }
@@ -261,7 +262,7 @@ function rotationTransform(annotation, bounds = annotationBounds(annotation)) {
 }
 
 function ArrowMarker({ id, color, strokeWidth }) {
-  const size = Math.max(8, Number(strokeWidth || 2) * 4)
+  const size = Math.max(8, resolveAnnotationStrokeWidth(strokeWidth, 'arrow') * 4)
   return (
     <defs>
       <marker id={id} markerWidth={size} markerHeight={size} refX={size * 0.75} refY={size * 0.375} orient="auto" markerUnits="userSpaceOnUse">
@@ -295,10 +296,10 @@ function AnnotationNameTag({ ann, selected, imgMeta }) {
   )
 }
 
-function MeasurementShape({ ann, selected, onLabelPointerDown, imgMeta }) {
+function MeasurementShape({ ann, selected, onObjectPointerDown, onLabelPointerDown, imgMeta }) {
   const [x1, y1, x2, y2] = ann.coords
   const color = ann.color || '#000000'
-  const strokeWidth = Number(ann.strokeWidth) || 2
+  const strokeWidth = resolveAnnotationStrokeWidth(ann.strokeWidth, ann)
   const box = measurementLabelBox(ann, imgMeta)
   const labelBackground = labelBackgroundFor(color)
   const angle = Math.atan2(y2 - y1, x2 - x1)
@@ -315,6 +316,16 @@ function MeasurementShape({ ann, selected, onLabelPointerDown, imgMeta }) {
         <line x1={x1 - px} y1={y1 - py} x2={x1 + px} y2={y1 + py} stroke={ann.color} strokeWidth={strokeWidth} />
         <line x1={x2 - px} y1={y2 - py} x2={x2 + px} y2={y2 + py} stroke={ann.color} strokeWidth={strokeWidth} />
       </g>
+      <line
+        x1={x1}
+        y1={y1}
+        x2={x2}
+        y2={y2}
+        stroke="transparent"
+        strokeWidth={Math.max(14, strokeWidth * 3)}
+        strokeLinecap="round"
+        onPointerDown={event => onObjectPointerDown?.(ann, event, 'move')}
+      />
       <g transform={labelTransform} onPointerDown={event => onLabelPointerDown?.(ann, event)}
         style={{ cursor: 'move', filter: selected ? 'drop-shadow(0 0 4px white)' : undefined }}>
         <rect
@@ -417,7 +428,7 @@ function TextShape({ ann, selected, editing, onObjectPointerDown, onTextChange, 
 function AnnShape({ ann, selected, imgMeta, editingTextId, onObjectPointerDown, onLabelPointerDown, onTextChange, onFinishTextEdit, onEditText }) {
   const type = normalizedType(ann)
   const { coords, color } = ann
-  const strokeWidth = Number(ann.strokeWidth) || 2
+  const strokeWidth = resolveAnnotationStrokeWidth(ann.strokeWidth, type)
   const bounds = annotationBounds(ann, imgMeta)
   const transform = type === 'measure' ? undefined : rotationTransform(ann, bounds)
   const pointerDown = event => onObjectPointerDown?.(ann, event, 'move')
@@ -439,7 +450,7 @@ function AnnShape({ ann, selected, imgMeta, editingTextId, onObjectPointerDown, 
       <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="transparent" strokeWidth={Math.max(12, strokeWidth * 4)} onPointerDown={pointerDown} />
     </>
   } else if (type === 'measure') {
-    shape = <MeasurementShape ann={ann} selected={selected} onLabelPointerDown={onLabelPointerDown} imgMeta={imgMeta} />
+    shape = <MeasurementShape ann={ann} selected={selected} onObjectPointerDown={onObjectPointerDown} onLabelPointerDown={onLabelPointerDown} imgMeta={imgMeta} />
   } else if (type === 'rect') {
     const [x1, y1, x2, y2] = coords
     shape = <rect x={Math.min(x1,x2)} y={Math.min(y1,y2)} width={Math.abs(x2-x1)} height={Math.abs(y2-y1)} stroke={color} strokeWidth={strokeWidth} fill="transparent" onPointerDown={pointerDown} />
@@ -449,7 +460,11 @@ function AnnShape({ ann, selected, imgMeta, editingTextId, onObjectPointerDown, 
     const rx = Math.abs(x2-x1)/2, ry = Math.abs(y2-y1)/2
     shape = <ellipse cx={cx} cy={cy} rx={rx} ry={ry} stroke={color} strokeWidth={strokeWidth} fill="transparent" onPointerDown={pointerDown} />
   } else if (type === 'freehand') {
-    shape = <polyline points={polylinePoints(coords)} stroke={color} strokeWidth={strokeWidth} fill="none" onPointerDown={pointerDown} />
+    const points = polylinePoints(coords)
+    shape = <>
+      <polyline points={points} stroke={color} strokeWidth={strokeWidth} fill="none" onPointerDown={pointerDown} />
+      <polyline points={points} stroke="transparent" strokeWidth={Math.max(14, strokeWidth * 3)} fill="none" strokeLinecap="round" strokeLinejoin="round" onPointerDown={pointerDown} />
+    </>
   } else if (type === 'text') {
     shape = <TextShape ann={ann} selected={selected} editing={editingTextId === ann.id}
       onObjectPointerDown={onObjectPointerDown} onTextChange={onTextChange}
@@ -468,7 +483,7 @@ function PreviewShape({ drawing, color, strokeWidth, imgMeta }) {
   if (!drawing) return null
   const type = normalizedType(drawing.type)
   const { coords } = drawing
-  const width = Number(strokeWidth) || 2
+  const width = resolveAnnotationStrokeWidth(strokeWidth, type)
   const s = { stroke: color, strokeWidth: width, fill: 'none', strokeDasharray: '6 3', opacity: 0.85 }
   if (type === 'point') {
     const { cx, cy, radius } = circleGeometry(coords, Math.max(5, width * 2.5))
@@ -622,6 +637,7 @@ export default function AnnotationLayer({
   activeTool, annotatorName, annotationColor,
   strokeWidth, fontSize, onEditAnnotation, panActive = false,
   selectedId, setSelectedId, svgRef,
+  onSelectAnnotation,
   editingTextId, setEditingTextId,
   onExitEditMode,
   zIndex = 0,
@@ -650,7 +666,7 @@ export default function AnnotationLayer({
       annotator: annotatorName,
       timestamp: new Date().toISOString(),
       color: annotationColor,
-      strokeWidth,
+      strokeWidth: resolveAnnotationStrokeWidth(strokeWidth, normalized),
       ...(zCount > 1 ? { zIndex } : {}),
       ...(normalized === 'text' ? { fontSize } : {}),
       ...(normalized === 'measure' ? { pixelSizeXUm: calibration.x, pixelSizeYUm: calibration.y, labelDx: 0, labelDy: 0 } : {}),
@@ -675,13 +691,11 @@ export default function AnnotationLayer({
       setSelectedId(ann.id)
       return
     }
-    const type = normalizedType(ann)
-    const selected = ann.id === selectedId
-    if (activeTool !== 'select' && activeTool !== 'text' && !selected && !(activeTool === 'measure' && type === 'measure')) return
     event.preventDefault()
     event.stopPropagation()
     const point = toImgCoords(svgRef.current, event.clientX, event.clientY)
     const original = { ...ann, type: normalizedType(ann), coords: [...ann.coords] }
+    onSelectAnnotation?.(ann.id)
     setSelectedId(ann.id)
     setInteraction({
       id: ann.id,
@@ -696,7 +710,7 @@ export default function AnnotationLayer({
       shiftKey: Boolean(event.shiftKey),
     })
     svgRef.current.setPointerCapture?.(event.pointerId)
-  }, [activeTool, editingTextId, imgMeta, panActive, readOnly, selectedId, setSelectedId, svgRef])
+  }, [editingTextId, imgMeta, onSelectAnnotation, panActive, readOnly, setSelectedId, svgRef])
 
   const startLabelInteraction = useCallback((ann, event) => {
     startObjectInteraction(ann, event, normalizedType(ann) === 'measure' ? 'move' : 'label')

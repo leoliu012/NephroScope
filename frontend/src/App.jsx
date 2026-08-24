@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import {
   ArrowRight,
+  ChevronDown,
   ChevronRight,
   Crosshair,
   Eye,
@@ -28,6 +29,11 @@ import { authFetch, fetchSession, login as loginRequest, logout as logoutRequest
 import { collaborationClientId, fetchViewState, sendHeartbeat, updateViewState, updateWorkspace } from './collaboration.js'
 import { DEFAULT_EXPANSION_FACTOR, formatPixelSizeInput } from './measurement.js'
 import { loadChannelSettings, normalizeChannelSettings } from './channelDisplay.js'
+import {
+  organizeImageFilenames,
+  organizeImageFilenamesByMagnification,
+  sortAlphanumeric,
+} from './collectionOrganization.js'
 
 const API = '/agh/api'
 const RESEARCH_USE_NOTICE = 'Research use only. Not validated for clinical diagnosis or treatment decisions.'
@@ -38,6 +44,7 @@ const MIN_CASE_PANEL_WIDTH = 160
 const MAX_CASE_PANEL_WIDTH = 420
 const MIN_IMAGE_PANEL_WIDTH = 220
 const MAX_IMAGE_PANEL_WIDTH = 640
+const DEFAULT_COLLAPSED_IMAGE_GROUPS = Object.freeze({ post: true, pre: true, other: true })
 
 async function fetchJson(url, options = {}) {
   const res = await authFetch(url, options)
@@ -496,6 +503,9 @@ export default function App() {
   const [filesReload, setFilesReload] = useState(0)
   const [caseQuery, setCaseQuery] = useState('')
   const [fileQuery, setFileQuery] = useState('')
+  const [organizeImages, setOrganizeImages] = useState(true)
+  const [collapsedImageGroups, setCollapsedImageGroups] = useState(() => ({ ...DEFAULT_COLLAPSED_IMAGE_GROUPS }))
+  const [collapsedMagnificationGroups, setCollapsedMagnificationGroups] = useState({})
   const [selectedFile, setSelectedFile] = useState(initialRoute.filename)
   const [previewError, setPreviewError] = useState(null)
   const [previewMeta, setPreviewMeta] = useState(null)
@@ -602,7 +612,7 @@ export default function App() {
     setLC(true)
     setCasesError(null)
     fetchJson(`${API}/cases`, { signal: controller.signal })
-      .then(data => { setCases(data.cases || []) })
+      .then(data => { setCases(sortAlphanumeric(data.cases || [])) })
       .catch(error => {
         if (error.name === 'AbortError') return
         if (error.status === 401) handleLogout()
@@ -611,6 +621,11 @@ export default function App() {
       .finally(() => { if (!controller.signal.aborted) setLC(false) })
     return () => controller.abort()
   }, [auth.authenticated, casesReload, handleLogout])
+
+  useEffect(() => {
+    setCollapsedImageGroups({ ...DEFAULT_COLLAPSED_IMAGE_GROUPS })
+    setCollapsedMagnificationGroups({})
+  }, [selectedCase])
 
   useEffect(() => {
     if (!auth.authenticated || !selectedCase) return
@@ -642,6 +657,41 @@ export default function App() {
     return files.filter(item => item.toLowerCase().includes(query))
   }, [files, fileQuery])
 
+  const visibleFileGroups = useMemo(() => (
+    organizeImages
+      ? organizeImageFilenames(filteredFiles)
+        .filter(group => group.files.length > 0)
+        .map(group => ({
+          ...group,
+          magnificationGroups: organizeImageFilenamesByMagnification(group.files)
+            .filter(magnificationGroup => magnificationGroup.files.length > 0),
+        }))
+      : [{ id: 'all', label: '', marker: null, files: filteredFiles }]
+  ), [filteredFiles, organizeImages])
+
+  const displayedFiles = useMemo(() => (
+    visibleFileGroups.flatMap(group => (
+      organizeImages
+        ? group.magnificationGroups.flatMap(magnificationGroup => magnificationGroup.files)
+        : group.files
+    ))
+  ), [organizeImages, visibleFileGroups])
+
+  const toggleImageGroup = useCallback((groupId) => {
+    setCollapsedImageGroups(current => ({
+      ...current,
+      [groupId]: !current[groupId],
+    }))
+  }, [])
+
+  const toggleMagnificationGroup = useCallback((groupId, magnificationId) => {
+    const key = `${groupId}:${magnificationId}`
+    setCollapsedMagnificationGroups(current => ({
+      ...current,
+      [key]: !current[key],
+    }))
+  }, [])
+
   const otherPresence = useMemo(() => (
     presence.filter(viewer => viewer?.clientId && viewer.clientId !== clientId)
   ), [clientId, presence])
@@ -659,16 +709,16 @@ export default function App() {
 
   useEffect(() => {
     if (!selectedCase || loadingFiles) return
-    if (!filteredFiles.length) {
+    if (!displayedFiles.length) {
       setSelectedFile(null)
       setPreviewError(null)
       return
     }
-    if (!selectedFile || !filteredFiles.includes(selectedFile)) {
-      setSelectedFile(filteredFiles[0])
+    if (!selectedFile || !displayedFiles.includes(selectedFile)) {
+      setSelectedFile(displayedFiles[0])
       setPreviewError(null)
     }
-  }, [selectedCase, loadingFiles, filteredFiles, selectedFile])
+  }, [selectedCase, loadingFiles, displayedFiles, selectedFile])
 
   useEffect(() => {
     if (!auth.authenticated || !selectedCase || !selectedFile || openFile) {
@@ -770,16 +820,16 @@ export default function App() {
   }, [selectedCase, selectedFile])
 
   const moveSelection = useCallback((delta) => {
-    if (!filteredFiles.length) return
-    const current = Math.max(0, filteredFiles.findIndex(item => item === selectedFile))
-    const next = Math.max(0, Math.min(filteredFiles.length - 1, current + delta))
-    setSelectedFile(filteredFiles[next])
+    if (!displayedFiles.length) return
+    const current = Math.max(0, displayedFiles.findIndex(item => item === selectedFile))
+    const next = Math.max(0, Math.min(displayedFiles.length - 1, current + delta))
+    setSelectedFile(displayedFiles[next])
     setPreviewError(null)
-  }, [filteredFiles, selectedFile])
+  }, [displayedFiles, selectedFile])
 
   const handleFileKeyDown = useCallback((event) => {
     const tag = event.target?.tagName
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || event.target?.isContentEditable) return
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'BUTTON' || tag === 'SELECT' || event.target?.isContentEditable) return
     if (!auth.authenticated || !selectedCase || openFile) return
     if (event.key === 'ArrowDown') {
       event.preventDefault()
@@ -930,9 +980,9 @@ export default function App() {
             </div>
           )}
           {auth.user && <span>{auth.displayName || auth.user}{auth.role ? ` (${auth.role})` : ''}</span>}
-          <button onClick={() => setCalibrationOpen(true)} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[11px]" title="Calibrate expansion factor from matched line pairs">
+          <button onClick={() => setCalibrationOpen(true)} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[11px]" title="Measure expansion factor from matched line pairs">
             <Crosshair size={13} />
-            Calibrate EF
+            EF measurement
           </button>
           <button onClick={() => setEfSettingsOpen(true)} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[11px]" title="EF settings">
             <Settings size={13} />
@@ -1026,6 +1076,14 @@ export default function App() {
           {selectedCase && (
             <div className="border-b border-[var(--border)] px-3 py-3">
               <SearchField value={fileQuery} onChange={setFileQuery} placeholder="Filter images" />
+              <label className="mt-2 flex cursor-pointer items-center gap-2 text-[11px] text-[var(--text-muted)]">
+                <input
+                  type="checkbox"
+                  checked={organizeImages}
+                  onChange={event => setOrganizeImages(event.currentTarget.checked)}
+                />
+                <span>Auto organize</span>
+              </label>
             </div>
           )}
           <div className="flex-1 overflow-y-auto py-2" tabIndex={0} onKeyDown={handleFileKeyDown}>
@@ -1044,41 +1102,106 @@ export default function App() {
                     ? <EmptyState>No images found</EmptyState>
                     : filteredFiles.length === 0
                       ? <EmptyState icon={Search}>No matching images</EmptyState>
-                      : filteredFiles.map(item => (
-                        <div
-                          key={item}
-                          onDoubleClick={() => openViewer(item, 'annotations')}
-                          onClick={() => { setSelectedFile(item); setPreviewError(null) }}
-                          className={`ux-list-item group mx-2 my-0.5 flex cursor-pointer items-start gap-2 rounded-r-md px-3 py-2.5 ${selectedFile === item ? 'ux-list-item-selected' : ''}`}
-                        >
-                          <FileImage size={14} className={`mt-0.5 flex-shrink-0 ${selectedFile === item ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`} />
-                          <div className="min-w-0 flex-1">
-                            <p className="break-all text-xs leading-snug text-[var(--text)]">{item}</p>
-                            <ImageTags filename={item} meta={fileMetaByName[item]} loading={!fileMetaByName[item]} />
-                            <div className="mt-2 flex flex-wrap items-center gap-2">
-                              <span className="text-[11px] text-[var(--text-subtle)]">
-                                {selectedFile === item
-                                  ? previewMetaLoading ? 'Loading metadata' : formatImageMeta(previewMeta)
-                                  : 'Microscopy image'}
-                              </span>
-                              {(presenceByFile.get(item) || []).length > 0 && (
-                                <span className="presence-avatars image-presence-avatars" aria-label="Other users on this image">
-                                  {(presenceByFile.get(item) || []).slice(0, 5).map(viewer => (
-                                    <PresenceAvatar key={viewer.clientId} viewer={viewer} size="small" />
-                                  ))}
+                      : visibleFileGroups.map(group => (
+                        <section key={group.id} aria-labelledby={organizeImages ? `image-group-${group.id}` : undefined} aria-label={organizeImages ? undefined : 'Images'}>
+                          {organizeImages && (
+                            <div className="mx-2 mb-1 mt-2">
+                              <button
+                                id={`image-group-${group.id}`}
+                                type="button"
+                                onClick={() => toggleImageGroup(group.id)}
+                                aria-expanded={!collapsedImageGroups[group.id]}
+                                aria-controls={`image-group-files-${group.id}`}
+                                className="ux-card ux-card-action flex w-full items-center gap-2 px-2.5 py-2 text-left"
+                                title={collapsedImageGroups[group.id] ? `Expand ${group.label} images` : `Fold ${group.label} images`}
+                              >
+                                {collapsedImageGroups[group.id]
+                                  ? <ChevronRight size={14} className="flex-shrink-0 text-[var(--text-subtle)]" />
+                                  : <ChevronDown size={14} className="flex-shrink-0 text-[var(--text-subtle)]" />}
+                                <span className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded bg-[var(--surface-3)] text-[var(--accent)]">
+                                  <FileImage size={13} />
                                 </span>
-                              )}
+                                <span className="min-w-0 flex-1 text-xs font-semibold text-[var(--text)]">{group.label} images</span>
+                                <span className="ux-status-chip ux-status-neutral min-h-0 px-2 py-1">{group.files.length}</span>
+                              </button>
                             </div>
+                          )}
+                          <div id={organizeImages ? `image-group-files-${group.id}` : undefined}>
+                            {(!organizeImages || !collapsedImageGroups[group.id]) && (
+                              organizeImages
+                                ? group.magnificationGroups
+                                : [{ id: 'all', label: '', files: group.files }]
+                            ).map(magnificationGroup => (
+                              <section
+                                key={`${group.id}-${magnificationGroup.id}`}
+                                aria-labelledby={organizeImages ? `image-group-${group.id}-magnification-${magnificationGroup.id}` : undefined}
+                              >
+                                {organizeImages && (
+                                  <button
+                                    id={`image-group-${group.id}-magnification-${magnificationGroup.id}`}
+                                    type="button"
+                                    onClick={() => toggleMagnificationGroup(group.id, magnificationGroup.id)}
+                                    aria-expanded={!collapsedMagnificationGroups[`${group.id}:${magnificationGroup.id}`]}
+                                    aria-controls={`image-group-${group.id}-magnification-files-${magnificationGroup.id}`}
+                                    className="mx-3 mb-1 mt-2 flex w-[calc(100%-1.5rem)] items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-1.5 text-left hover:border-[var(--border-strong)] hover:bg-[var(--surface-3)]"
+                                    title={collapsedMagnificationGroups[`${group.id}:${magnificationGroup.id}`]
+                                      ? `Expand ${magnificationGroup.label}`
+                                      : `Fold ${magnificationGroup.label}`}
+                                  >
+                                    {collapsedMagnificationGroups[`${group.id}:${magnificationGroup.id}`]
+                                      ? <ChevronRight size={12} className="flex-shrink-0 text-[var(--text-subtle)]" />
+                                      : <ChevronDown size={12} className="flex-shrink-0 text-[var(--text-subtle)]" />}
+                                    <Microscope size={12} className="flex-shrink-0 text-[var(--accent)]" />
+                                    <span className="min-w-0 flex-1 text-[10px] font-semibold uppercase tracking-wide text-[var(--text-muted)]">
+                                      {magnificationGroup.label}
+                                    </span>
+                                    <span className="text-[10px] tabular-nums text-[var(--text-subtle)]">
+                                      {magnificationGroup.files.length} {magnificationGroup.files.length === 1 ? 'image' : 'images'}
+                                    </span>
+                                  </button>
+                                )}
+                                <div id={organizeImages ? `image-group-${group.id}-magnification-files-${magnificationGroup.id}` : undefined}>
+                                {(!organizeImages || !collapsedMagnificationGroups[`${group.id}:${magnificationGroup.id}`]) && magnificationGroup.files.map(item => (
+                                  <div
+                                    key={item}
+                                    onDoubleClick={() => openViewer(item, 'annotations')}
+                                    onClick={() => { setSelectedFile(item); setPreviewError(null) }}
+                                    className={`ux-list-item group mx-3 my-0.5 flex cursor-pointer items-start gap-2 rounded-r-md px-3 py-2.5 ${selectedFile === item ? 'ux-list-item-selected' : ''}`}
+                                  >
+                                    <FileImage size={14} className={`mt-0.5 flex-shrink-0 ${selectedFile === item ? 'text-[var(--accent)]' : 'text-[var(--text-subtle)]'}`} />
+                                    <div className="min-w-0 flex-1">
+                                      <p className="break-all text-xs leading-snug text-[var(--text)]">{item}</p>
+                                      <ImageTags filename={item} meta={fileMetaByName[item]} loading={!fileMetaByName[item]} />
+                                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                                        <span className="text-[11px] text-[var(--text-subtle)]">
+                                          {selectedFile === item
+                                            ? previewMetaLoading ? 'Loading metadata' : formatImageMeta(previewMeta)
+                                            : 'Microscopy image'}
+                                        </span>
+                                        {(presenceByFile.get(item) || []).length > 0 && (
+                                          <span className="presence-avatars image-presence-avatars" aria-label="Other users on this image">
+                                            {(presenceByFile.get(item) || []).slice(0, 5).map(viewer => (
+                                              <PresenceAvatar key={viewer.clientId} viewer={viewer} size="small" />
+                                            ))}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <button
+                                      onClick={event => { event.stopPropagation(); openViewer(item, 'annotations') }}
+                                      className="ux-button ux-button-ghost min-h-0 flex-shrink-0 px-2 py-1 text-[11px]"
+                                      title="Open image"
+                                    >
+                                      <Eye size={13} />
+                                      Open
+                                    </button>
+                                  </div>
+                                ))}
+                                </div>
+                              </section>
+                            ))}
                           </div>
-                          <button
-                            onClick={event => { event.stopPropagation(); openViewer(item, 'annotations') }}
-                            className="ux-button ux-button-ghost min-h-0 flex-shrink-0 px-2 py-1 text-[11px]"
-                            title="Open image"
-                          >
-                            <Eye size={13} />
-                            Open
-                          </button>
-                        </div>
+                        </section>
                       ))}
           </div>
         </aside>
@@ -1168,7 +1291,7 @@ export default function App() {
         <ImageViewer
           caseId={openFile.case}
           filename={openFile.filename}
-          files={filteredFiles}
+          files={displayedFiles}
           initialTab={openFile.initialTab}
           user={auth.user}
           role={auth.role}

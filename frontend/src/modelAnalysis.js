@@ -4,6 +4,7 @@ export const DEFAULT_MODEL_OVERLAY_SETTINGS = Object.freeze({
   visible: true,
   color: '#00d4ff',
   opacity: 0.5,
+  displayMode: 'filled',
 })
 
 export const DEFAULT_MODEL_SKELETON_SETTINGS = Object.freeze({
@@ -56,7 +57,47 @@ export function normalizeModelOverlaySettings(raw) {
     visible: typeof raw?.visible === 'boolean' ? raw.visible : DEFAULT_MODEL_OVERLAY_SETTINGS.visible,
     color: HEX_COLOR.test(raw?.color || '') ? raw.color.toLowerCase() : DEFAULT_MODEL_OVERLAY_SETTINGS.color,
     opacity: clamp(opacity, 0, 1),
+    displayMode: raw?.displayMode === 'contour' ? 'contour' : DEFAULT_MODEL_OVERLAY_SETTINGS.displayMode,
   }
+}
+
+export function modelMaskContourAlpha(alpha, width, height) {
+  const imageWidth = Number(width)
+  const imageHeight = Number(height)
+  if (!Number.isInteger(imageWidth) || imageWidth < 1 || !Number.isInteger(imageHeight) || imageHeight < 1) {
+    throw new RangeError('Model mask dimensions must be positive integers')
+  }
+  if (!alpha || Number(alpha.length) !== imageWidth * imageHeight) {
+    throw new RangeError('Model mask alpha length does not match its dimensions')
+  }
+
+  const source = alpha
+  const contour = new Uint8ClampedArray(source.length)
+  for (let y = 0; y < imageHeight; y += 1) {
+    const row = y * imageWidth
+    for (let x = 0; x < imageWidth; x += 1) {
+      const index = row + x
+      const value = source[index]
+      if (!value) continue
+      if (
+        x === 0
+        || y === 0
+        || x === imageWidth - 1
+        || y === imageHeight - 1
+        || !source[index - imageWidth - 1]
+        || !source[index - imageWidth]
+        || !source[index - imageWidth + 1]
+        || !source[index - 1]
+        || !source[index + 1]
+        || !source[index + imageWidth - 1]
+        || !source[index + imageWidth]
+        || !source[index + imageWidth + 1]
+      ) {
+        contour[index] = value
+      }
+    }
+  }
+  return contour
 }
 
 export function loadModelOverlaySettings() {

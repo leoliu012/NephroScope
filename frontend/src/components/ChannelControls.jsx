@@ -1,6 +1,12 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronRight, Eye, EyeOff, SlidersHorizontal, WandSparkles } from 'lucide-react'
-import { CHANNEL_MARKERS, isNhsEsterChannel, markerLabel, sourceValueMax } from '../channelDisplay.js'
+import { ChevronDown, ChevronRight, Eye, EyeOff, Power, RotateCcw, SlidersHorizontal, Sparkles, WandSparkles } from 'lucide-react'
+import {
+  CHANNEL_MARKERS,
+  DEFAULT_CHANNEL_POST_PROCESSING,
+  isNhsEsterChannel,
+  markerLabel,
+  sourceValueMax,
+} from '../channelDisplay.js'
 
 const SLIDER_STEPS = 4096
 
@@ -203,6 +209,48 @@ function DirectSlider({ label, min, max, step = 1, value, displayValue, onChange
   )
 }
 
+function PostProcessingControl({
+  label,
+  enabled,
+  value,
+  min,
+  max,
+  step,
+  displayValue,
+  onToggle,
+  onChange,
+}) {
+  return (
+    <div className={`rounded border px-2.5 py-2 ${enabled ? 'border-[var(--border-strong)] bg-[var(--surface-2)]' : 'border-[var(--border)] bg-[var(--canvas-bg)]'}`}>
+      <div className="flex items-center justify-between gap-3">
+        <label className="flex min-w-0 cursor-pointer items-center gap-2">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={event => onToggle(event.currentTarget.checked)}
+          />
+          <span className="text-[11px] font-semibold text-[var(--text)]">{label}</span>
+        </label>
+        <span className="flex flex-shrink-0 items-center gap-1.5 font-mono text-[10px] text-[var(--text-muted)]">
+          <span>{enabled ? 'On' : 'Off'}</span>
+          <span>{displayValue}</span>
+        </span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        disabled={!enabled}
+        onInput={event => onChange(Number(event.currentTarget.value))}
+        aria-label={`${label} amount`}
+        className="channel-range channel-range-imagej mt-2 disabled:cursor-not-allowed disabled:opacity-40"
+      />
+    </div>
+  )
+}
+
 export default function ChannelControls({
   meta,
   settings,
@@ -401,6 +449,95 @@ export default function ChannelControls({
                 ) : (
                   <span>Loading histogram...</span>
                 )}
+              </div>
+            </div>
+
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-1)] p-2.5">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="flex min-w-0 items-center gap-1.5 text-[11px] font-semibold text-[var(--text)]">
+                  <Sparkles size={12} /> Post processing
+                </div>
+                <div className="flex flex-shrink-0 flex-col gap-1">
+                  <button
+                    type="button"
+                    onClick={() => onChange(updateAt(settings, setting.index, {
+                      smoothingEnabled: false,
+                      denoiseEnabled: false,
+                      sharpeningEnabled: false,
+                      localContrastEnabled: false,
+                      gammaEnabled: false,
+                    }))}
+                    className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[10px]"
+                    title="Remove every effect but retain its configured amount"
+                  >
+                    <Power size={11} /> Remove all
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onChange(updateAt(settings, setting.index, DEFAULT_CHANNEL_POST_PROCESSING))}
+                    className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[10px]"
+                    title="Remove all post processing and restore default amounts"
+                  >
+                    <RotateCcw size={11} /> Reset values
+                  </button>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <PostProcessingControl
+                  label="Smooth"
+                  enabled={Boolean(setting.smoothingEnabled)}
+                  value={setting.smoothing}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  displayValue={`${Math.round(Number(setting.smoothing) * 100)}%`}
+                  onToggle={enabled => onChange(updateAt(settings, setting.index, { smoothingEnabled: enabled }))}
+                  onChange={smoothing => onChange(updateAt(settings, setting.index, { smoothing }))}
+                />
+                <PostProcessingControl
+                  label="Denoise"
+                  enabled={Boolean(setting.denoiseEnabled)}
+                  value={setting.denoise}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  displayValue={`${Math.round(Number(setting.denoise) * 100)}%`}
+                  onToggle={enabled => onChange(updateAt(settings, setting.index, { denoiseEnabled: enabled }))}
+                  onChange={denoise => onChange(updateAt(settings, setting.index, { denoise }))}
+                />
+                <PostProcessingControl
+                  label="Sharpen"
+                  enabled={Boolean(setting.sharpeningEnabled)}
+                  value={setting.sharpening}
+                  min={0}
+                  max={2}
+                  step={0.05}
+                  displayValue={`${Number(setting.sharpening).toFixed(2)}×`}
+                  onToggle={enabled => onChange(updateAt(settings, setting.index, { sharpeningEnabled: enabled }))}
+                  onChange={sharpening => onChange(updateAt(settings, setting.index, { sharpening }))}
+                />
+                <PostProcessingControl
+                  label="Local contrast"
+                  enabled={Boolean(setting.localContrastEnabled)}
+                  value={setting.localContrast}
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  displayValue={`${Math.round(Number(setting.localContrast) * 100)}%`}
+                  onToggle={enabled => onChange(updateAt(settings, setting.index, { localContrastEnabled: enabled }))}
+                  onChange={localContrast => onChange(updateAt(settings, setting.index, { localContrast }))}
+                />
+                <PostProcessingControl
+                  label="Gamma"
+                  enabled={Boolean(setting.gammaEnabled)}
+                  value={setting.gamma}
+                  min={0.25}
+                  max={4}
+                  step={0.05}
+                  displayValue={`${Number(setting.gamma).toFixed(2)}`}
+                  onToggle={enabled => onChange(updateAt(settings, setting.index, { gammaEnabled: enabled }))}
+                  onChange={gamma => onChange(updateAt(settings, setting.index, { gamma }))}
+                />
               </div>
             </div>
               </>

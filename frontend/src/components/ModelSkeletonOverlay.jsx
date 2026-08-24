@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { authFetch } from '../auth.js'
 
 function parseHexColor(value) {
@@ -81,6 +81,10 @@ export default function ModelSkeletonOverlay({
 
   useEffect(() => {
     skeletonAlphaRef.current = null
+    if (canvasRef.current) {
+      canvasRef.current.dataset.predictionReady = 'false'
+      canvasRef.current.getContext('2d')?.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height)
+    }
     setSkeletonRevision(revision => revision + 1)
     if (!skeletonUrl || !width || !height) return undefined
 
@@ -115,7 +119,6 @@ export default function ModelSkeletonOverlay({
         if (controller.signal.aborted) return
         skeletonAlphaRef.current = { alpha, width: image.naturalWidth, height: image.naturalHeight }
         setSkeletonRevision(revision => revision + 1)
-        readyCallbackRef.current?.({ width: image.naturalWidth, height: image.naturalHeight })
       } catch (error) {
         if (error.name !== 'AbortError') errorCallbackRef.current?.(error.message || 'Unable to load the GBM skeleton')
       } finally {
@@ -126,7 +129,7 @@ export default function ModelSkeletonOverlay({
     return () => controller.abort()
   }, [height, skeletonUrl, width])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const skeleton = skeletonAlphaRef.current
     const canvas = canvasRef.current
     if (!skeleton || !canvas) return
@@ -158,6 +161,8 @@ export default function ModelSkeletonOverlay({
     for (const [offsetX, offsetY] of brushOffsets(thickness)) {
       context.drawImage(base, offsetX, offsetY)
     }
+    canvas.dataset.predictionReady = 'true'
+    readyCallbackRef.current?.({ width: skeleton.width, height: skeleton.height })
   }, [color, skeletonRevision, thickness])
 
   return (

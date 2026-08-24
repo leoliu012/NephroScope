@@ -26,6 +26,7 @@ import {
   saveChannelSettings,
 } from '../channelDisplay.js'
 import { DEFAULT_PIXEL_SIZE_UM } from '../measurement.js'
+import { sortAlphanumeric } from '../collectionOrganization.js'
 import {
   computeLinePairRow,
   summarizeLinePairs,
@@ -230,9 +231,8 @@ function useEfImageState(source, clientId) {
 // ---------------------------------------------------------------------------
 // Source picker (one per side): existing case image or a local upload.
 // ---------------------------------------------------------------------------
-function SourcePicker({ side, title, cases, source, onPick, onClear }) {
+function SourcePicker({ side, title, caseId, source, onPick, onClear }) {
   const [mode, setMode] = useState('case')
-  const [caseId, setCaseId] = useState('')
   const [files, setFiles] = useState([])
   const [fileMetaByName, setFileMetaByName] = useState({})
   const [filename, setFilename] = useState('')
@@ -241,10 +241,22 @@ function SourcePicker({ side, title, cases, source, onPick, onClear }) {
   const [error, setError] = useState(null)
 
   useEffect(() => {
-    if (!caseId) { setFiles([]); setFileMetaByName({}); return undefined }
+    setFilename('')
+    setFileMenuOpen(false)
+  }, [caseId])
+
+  useEffect(() => {
+    if (!caseId) {
+      setFiles([])
+      setFileMetaByName({})
+      setBusy(false)
+      setError(null)
+      return undefined
+    }
     const controller = new AbortController()
     setBusy(true)
     setError(null)
+    setFiles([])
     setFileMetaByName({})
     fetchJson(`${API}/cases/${encodeURIComponent(caseId)}/files`, { signal: controller.signal })
       .then(data => setFiles(data.files || []))
@@ -323,8 +335,8 @@ function SourcePicker({ side, title, cases, source, onPick, onClear }) {
   }, [onPick])
 
   const badgeColor = side === 'A' ? 'var(--accent)' : '#a855f7'
-  const caseSelectWidth = selectWidthCh(cases, 'Select a case...')
-  const fileSelectWidth = selectWidthCh(files, busy ? 'Loading...' : 'Select an image...')
+  const filePlaceholder = !caseId ? 'Select the shared case first...' : busy ? 'Loading...' : 'Select an image...'
+  const fileSelectWidth = selectWidthCh(files, filePlaceholder)
   const selectedMetaKnown = filename ? Object.prototype.hasOwnProperty.call(fileMetaByName, filename) : false
 
   if (source) {
@@ -364,10 +376,6 @@ function SourcePicker({ side, title, cases, source, onPick, onClear }) {
 
       {mode === 'case' ? (
         <div className="ef-source-selects">
-          <select className="ux-select ef-source-select" style={{ width: caseSelectWidth }} value={caseId} onChange={e => { setCaseId(e.target.value); setFilename('') }}>
-            <option value="">Select a case…</option>
-            {cases.map(item => <option key={item} value={item}>{item}</option>)}
-          </select>
           <div className="ef-file-picker" style={{ width: fileSelectWidth }}>
             <button
               type="button"
@@ -375,7 +383,7 @@ function SourcePicker({ side, title, cases, source, onPick, onClear }) {
               disabled={!caseId || busy}
               onClick={() => setFileMenuOpen(open => !open)}
             >
-              <span className="ef-file-picker-title">{filename || (busy ? 'Loading...' : 'Select an image...')}</span>
+              <span className="ef-file-picker-title">{filename || filePlaceholder}</span>
               {filename && <ImageTags filename={filename} meta={fileMetaByName[filename]} loading={!selectedMetaKnown} />}
             </button>
             {fileMenuOpen && caseId && !busy && (
@@ -407,7 +415,7 @@ function SourcePicker({ side, title, cases, source, onPick, onClear }) {
             <span className="flex flex-col items-center gap-1 text-center">
               <Upload size={18} />
               <span className="text-[12px] text-[var(--text)]">Choose a .tif / .tiff / .nd2 file</span>
-              <span className="text-[11px] text-[var(--text-subtle)]">Stays local to this calibration — not added to any case</span>
+              <span className="text-[11px] text-[var(--text-subtle)]">Stays local to this measurement — not added to any case</span>
             </span>
           )}
         </label>
@@ -469,10 +477,10 @@ function ImagePreviewCalibration({ side, title, subtitle, imageState, pixelInput
   )
 }
 
-function SelectColumn({ side, title, previewTitle, cases, source, imageState, pixelInput, setPixelInput, onPick, onClear }) {
+function SelectColumn({ side, title, previewTitle, caseId, source, imageState, pixelInput, setPixelInput, onPick, onClear }) {
   return (
     <div className="ef-select-column">
-      <SourcePicker side={side} title={title} cases={cases} source={source} onPick={onPick} onClear={onClear} />
+      <SourcePicker side={side} title={title} caseId={caseId} source={source} onPick={onPick} onClear={onClear} />
       {source && (
         <ImagePreviewCalibration
           side={side}
@@ -493,7 +501,9 @@ function SelectColumn({ side, title, previewTitle, cases, source, imageState, pi
 export default function ExpansionCalibrationPage({ cases = [], onClose }) {
   const [step, setStep] = useState('select')
   const clientId = useRef(collaborationClientId()).current
+  const sortedCases = useMemo(() => sortAlphanumeric(cases), [cases])
 
+  const [sourceCaseId, setSourceCaseId] = useState('')
   const [sourceA, setSourceA] = useState(null)
   const [sourceB, setSourceB] = useState(null)
   const [pixelA, setPixelA] = useState('')
@@ -534,6 +544,15 @@ export default function ExpansionCalibrationPage({ cases = [], onClose }) {
   const pickB = useCallback(src => { setSourceB(src); seedPixel(src, setPixelB); resetPairs() }, [resetPairs, seedPixel])
   const clearA = useCallback(() => { setSourceA(null); seedPixel(null, setPixelA); resetPairs() }, [resetPairs, seedPixel])
   const clearB = useCallback(() => { setSourceB(null); seedPixel(null, setPixelB); resetPairs() }, [resetPairs, seedPixel])
+
+  const changeSourceCase = useCallback((nextCaseId) => {
+    setSourceCaseId(nextCaseId)
+    const clearsA = sourceA?.origin === 'case'
+    const clearsB = sourceB?.origin === 'case'
+    if (clearsA) { setSourceA(null); setPixelA('') }
+    if (clearsB) { setSourceB(null); setPixelB('') }
+    if (clearsA || clearsB) resetPairs()
+  }, [resetPairs, sourceA, sourceB])
 
   const swapSources = useCallback(() => {
     setSourceA(sourceB)
@@ -628,7 +647,7 @@ export default function ExpansionCalibrationPage({ cases = [], onClose }) {
           </button>
           <span className="app-brand-mark"><Crosshair size={15} /></span>
           <div className="min-w-0">
-            <h1 className="text-sm font-semibold leading-tight text-[var(--text)]">Expansion factor calibration</h1>
+            <h1 className="text-sm font-semibold leading-tight text-[var(--text)]">Expansion factor measurement</h1>
             <p className="text-[11px] leading-tight text-[var(--text-subtle)]">Measure matched line pairs to estimate the linear expansion factor · {APP_NAME}</p>
           </div>
         </div>
@@ -659,32 +678,48 @@ export default function ExpansionCalibrationPage({ cases = [], onClose }) {
         )}
 
         {step === 'select' && (
-          <div className="ef-select-grid">
-            <SelectColumn
-              side="A"
-              title="Expanded sample (10X)"
-              previewTitle="Expanded sample"
-              cases={cases}
-              source={sourceA}
-              imageState={imgA}
-              pixelInput={pixelA}
-              setPixelInput={setPixelA}
-              onPick={pickA}
-              onClear={clearA}
-            />
-            <SelectColumn
-              side="B"
-              title="Reference / unexpanded (60X)"
-              previewTitle="Reference sample"
-              cases={cases}
-              source={sourceB}
-              imageState={imgB}
-              pixelInput={pixelB}
-              setPixelInput={setPixelB}
-              onPick={pickB}
-              onClear={clearB}
-            />
-          </div>
+          <>
+            <div className="flex flex-wrap items-center gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-4 py-3">
+              <label className="flex flex-wrap items-center gap-3">
+                <span className="text-xs font-semibold text-[var(--text)]">Case for both samples</span>
+                <select
+                  className="ux-select ef-source-select"
+                  style={{ width: selectWidthCh(sortedCases, 'Select a case...') }}
+                  value={sourceCaseId}
+                  onChange={event => changeSourceCase(event.currentTarget.value)}
+                >
+                  <option value="">Select a case…</option>
+                  {sortedCases.map(item => <option key={item} value={item}>{item}</option>)}
+                </select>
+              </label>
+            </div>
+            <div className="ef-select-grid">
+              <SelectColumn
+                side="A"
+                title="Expanded sample (10X)"
+                previewTitle="Expanded sample"
+                caseId={sourceCaseId}
+                source={sourceA}
+                imageState={imgA}
+                pixelInput={pixelA}
+                setPixelInput={setPixelA}
+                onPick={pickA}
+                onClear={clearA}
+              />
+              <SelectColumn
+                side="B"
+                title="Reference / unexpanded (60X)"
+                previewTitle="Reference sample"
+                caseId={sourceCaseId}
+                source={sourceB}
+                imageState={imgB}
+                pixelInput={pixelB}
+                setPixelInput={setPixelB}
+                onPick={pickB}
+                onClear={clearB}
+              />
+            </div>
+          </>
         )}
 
         {step === 'draw' && (
@@ -768,7 +803,7 @@ export default function ExpansionCalibrationPage({ cases = [], onClose }) {
         )}
 
         {step === 'apply' && (
-          <ApplyStep cases={cases} clientId={clientId} medianEf={rows.medianEf} summary={rows.summary} onDone={onClose} />
+          <ApplyStep cases={sortedCases} clientId={clientId} medianEf={rows.medianEf} summary={rows.summary} onDone={onClose} />
         )}
       </div>
 

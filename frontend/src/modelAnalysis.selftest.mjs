@@ -7,6 +7,7 @@ import {
   formatThicknessMeasurement,
   formatThicknessValue,
   indexModelRunsByZ,
+  modelMaskContourAlpha,
   normalizeModelOverlaySettings,
   normalizeModelSkeletonSettings,
   normalizePolygonRoi,
@@ -14,11 +15,41 @@ import {
 } from './modelAnalysis.js'
 
 test('normalizes model overlay settings', () => {
-  assert.deepEqual(normalizeModelOverlaySettings({ visible: false, color: '#ABCDEF', opacity: 4 }), {
+  assert.deepEqual(normalizeModelOverlaySettings({ visible: false, color: '#ABCDEF', opacity: 4, displayMode: 'contour' }), {
     visible: false,
     color: '#abcdef',
     opacity: 1,
+    displayMode: 'contour',
   })
+  assert.equal(normalizeModelOverlaySettings({ displayMode: 'unknown' }).displayMode, 'filled')
+  assert.equal(normalizeModelOverlaySettings(null).displayMode, 'filled')
+})
+
+test('derives a one-pixel inner mask contour without mutating the mask', () => {
+  const full = new Uint8ClampedArray(9).fill(255)
+  const original = full.slice()
+  assert.deepEqual(Array.from(modelMaskContourAlpha(full, 3, 3)), [
+    255, 255, 255,
+    255, 0, 255,
+    255, 255, 255,
+  ])
+  assert.deepEqual(full, original)
+
+  const isolated = new Uint8ClampedArray([
+    0, 0, 0,
+    0, 255, 0,
+    0, 0, 0,
+  ])
+  assert.deepEqual(modelMaskContourAlpha(isolated, 3, 3), isolated)
+
+  const hole = new Uint8ClampedArray(25).fill(255)
+  hole[12] = 0
+  const holeContour = modelMaskContourAlpha(hole, 5, 5)
+  assert.equal(holeContour[6], 255)
+  assert.equal(holeContour[7], 255)
+  assert.equal(holeContour[12], 0)
+  assert.equal(holeContour[0], 255)
+  assert.throws(() => modelMaskContourAlpha(hole, 4, 5), /length/)
 })
 
 test('normalizes model skeleton display settings', () => {

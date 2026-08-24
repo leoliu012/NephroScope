@@ -24,8 +24,11 @@ export const CHANNEL_MARKERS = [
   'Custom',
 ]
 
+export const DAPI_DEFAULT_COLOR = '#0050d0'
+const LEGACY_DAPI_DEFAULT_COLOR = '#4488ff'
+
 export const CHANNEL_COLORS = [
-  '#4488ff',
+  DAPI_DEFAULT_COLOR,
   '#ffffff',
   '#44ff88',
   '#ff44ff',
@@ -35,12 +38,25 @@ export const CHANNEL_COLORS = [
   '#ff8844',
 ]
 
+export const DEFAULT_CHANNEL_POST_PROCESSING = Object.freeze({
+  smoothingEnabled: false,
+  smoothing: 0.5,
+  denoiseEnabled: false,
+  denoise: 0.5,
+  sharpeningEnabled: false,
+  sharpening: 0.65,
+  localContrastEnabled: false,
+  localContrast: 0.35,
+  gammaEnabled: false,
+  gamma: 1.2,
+})
+
 const STORAGE_PREFIX = 'agh-viewer:channel-display:v6:'
 const IMAGEJ_AUTO_THRESHOLD = 5000
 const MAX_AUTO_STEP = 8
 
 const DEFAULT_MULTICHANNEL_LAYOUT = [
-  { marker: 'DAPI', color: '#4488ff' },
+  { marker: 'DAPI', color: DAPI_DEFAULT_COLOR },
   { marker: 'NHS ester', color: '#ffffff' },
   { marker: 'ACTN4', color: '#44ff88' },
 ]
@@ -96,6 +112,7 @@ export function defaultChannelSetting(index, meta) {
     contrast: 1,
     inverted: isNhsEsterChannel(layout),
     autoStep: 0,
+    ...DEFAULT_CHANNEL_POST_PROCESSING,
   }
 }
 
@@ -105,12 +122,16 @@ function normalizeChannelSetting(raw, index, meta) {
   const marker = CHANNEL_MARKERS.includes(raw?.marker) ? raw.marker : fallback.marker
   const min = clamp(Number.isFinite(Number(raw?.min)) ? Number(raw.min) : fallback.min, 0, sourceMax)
   const max = clamp(Number.isFinite(Number(raw?.max)) ? Number(raw.max) : fallback.max, 0, sourceMax)
+  const savedColor = /^#[0-9a-f]{6}$/i.test(raw?.color || '') ? raw.color.toLowerCase() : fallback.color
+  const color = marker === 'DAPI' && savedColor === LEGACY_DAPI_DEFAULT_COLOR
+    ? DAPI_DEFAULT_COLOR
+    : savedColor
   return {
     ...fallback,
     marker,
     customMarker: typeof raw?.customMarker === 'string' ? raw.customMarker : '',
     visible: typeof raw?.visible === 'boolean' ? raw.visible : fallback.visible,
-    color: /^#[0-9a-f]{6}$/i.test(raw?.color || '') ? raw.color : fallback.color,
+    color,
     min: Math.min(min, Math.max(0, max - 1)),
     max: Math.max(max, Math.min(sourceMax, min + 1)),
     // Version 4 stores the effective display window directly. Older hidden
@@ -119,6 +140,16 @@ function normalizeChannelSetting(raw, index, meta) {
     contrast: 1,
     inverted: typeof raw?.inverted === 'boolean' ? raw.inverted : fallback.inverted,
     autoStep: clamp(Math.round(Number(raw?.autoStep) || 0), 0, MAX_AUTO_STEP),
+    smoothingEnabled: typeof raw?.smoothingEnabled === 'boolean' ? raw.smoothingEnabled : fallback.smoothingEnabled,
+    smoothing: clamp(Number.isFinite(Number(raw?.smoothing)) ? Number(raw.smoothing) : fallback.smoothing, 0, 1),
+    denoiseEnabled: typeof raw?.denoiseEnabled === 'boolean' ? raw.denoiseEnabled : fallback.denoiseEnabled,
+    denoise: clamp(Number.isFinite(Number(raw?.denoise)) ? Number(raw.denoise) : fallback.denoise, 0, 1),
+    sharpeningEnabled: typeof raw?.sharpeningEnabled === 'boolean' ? raw.sharpeningEnabled : fallback.sharpeningEnabled,
+    sharpening: clamp(Number.isFinite(Number(raw?.sharpening)) ? Number(raw.sharpening) : fallback.sharpening, 0, 2),
+    localContrastEnabled: typeof raw?.localContrastEnabled === 'boolean' ? raw.localContrastEnabled : fallback.localContrastEnabled,
+    localContrast: clamp(Number.isFinite(Number(raw?.localContrast)) ? Number(raw.localContrast) : fallback.localContrast, 0, 1),
+    gammaEnabled: typeof raw?.gammaEnabled === 'boolean' ? raw.gammaEnabled : fallback.gammaEnabled,
+    gamma: clamp(Number.isFinite(Number(raw?.gamma)) ? Number(raw.gamma) : fallback.gamma, 0.25, 4),
   }
 }
 
