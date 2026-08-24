@@ -1,5 +1,5 @@
 [Unit]
-Description=AGH Viewer remote image cache synchronizer
+Description=NephroScope remote image cache synchronizer
 After=network.target remote-fs.target
 Wants=remote-fs.target
 # Create this file with AGH_REMOTE_DATA_ROOT before enabling the worker.

@@ -1,5 +1,5 @@
 [Unit]
-Description=AGH MorphoGBM analysis worker
+Description=NephroScope MorphoGBM analysis worker
 After=network.target
 
 [Service]
@@ -18,4 +18,3 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-

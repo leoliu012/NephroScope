@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from .errors import BadRequest, NotFound
@@ -5,6 +6,14 @@ from .errors import BadRequest, NotFound
 
 IMAGE_EXTS = {".tif", ".tiff", ".nd2"}
 TIFF_EXTS = {".tif", ".tiff"}
+
+
+def natural_sort_key(value: str) -> tuple:
+    """Return a case-insensitive key that orders embedded numbers numerically."""
+    return tuple(
+        (1, int(part)) if part.isdigit() else (0, part.casefold())
+        for part in re.split(r"(\d+)", value)
+    )
 
 
 def resolve_under_root(root: Path, *parts: str) -> Path:
@@ -43,9 +52,12 @@ def list_cases(data_root: Path) -> list[str]:
     if not root.exists():
         raise NotFound("Data root does not exist")
     return sorted(
-        child.name
-        for child in root.iterdir()
-        if child.is_dir() and not child.name.startswith(".")
+        (
+            child.name
+            for child in root.iterdir()
+            if child.is_dir() and not child.name.startswith(".")
+        ),
+        key=natural_sort_key,
     )
 
 

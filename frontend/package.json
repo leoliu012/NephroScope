@@ -1,12 +1,19 @@
 {
-  "name": "agh-viewer",
+  "name": "nephroscope",
   "version": "1.6.0",
   "type": "module",
   "private": true,
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "npm run test:annotations && npm run test:channels && npm run test:collections && npm run test:export && npm run test:rendering && npm run test:model && npm run test:calibration",
+    "test:annotations": "node src/annotationStyles.selftest.mjs",
+    "test:channels": "node src/channelDisplay.selftest.mjs",
+    "test:collections": "node src/collectionOrganization.selftest.mjs",
     "test:model": "node src/modelAnalysis.selftest.mjs",
+    "test:rendering": "node src/multiChannelRendering.selftest.mjs",
+    "test:export": "node src/exportOptions.selftest.mjs",
+    "test:calibration": "node src/expansionCalibration.selftest.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

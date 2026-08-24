@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-deploy.py — Build and deploy the AGH Viewer to the Magnify server.
+deploy.py — Build and deploy NephroScope to the Magnify server.
 
 Steps:
   1. Upload frontend source and build it on the server

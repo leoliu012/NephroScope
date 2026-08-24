@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-manage_users.py — create and manage AGH Viewer accounts.
+manage_users.py — create and manage NephroScope accounts.
 
 Passwords are never accepted on the command line (they would leak into shell
 history and the process table). They are read interactively with getpass, or
@@ -151,7 +151,7 @@ def cmd_list(store: UserStore, args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage AGH Viewer accounts.")
+    parser = argparse.ArgumentParser(description="Manage NephroScope accounts.")
     parser.add_argument(
         "--users-file",
         default=None,

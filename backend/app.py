@@ -1,5 +1,5 @@
 """
-AGH Viewer Backend entrypoint.
+NephroScope backend entrypoint.
 
 The production service should run this app through Gunicorn:
     gunicorn --bind 127.0.0.1:5055 "agh_api:create_app()"

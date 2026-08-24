@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard the supported AGH viewer + MorphoGBM integration surface.
+"""Guard the supported NephroScope + MorphoGBM integration surface.
 
 The filename is retained for compatibility with older CI jobs. The app is no
 longer viewer-only: it intentionally contains one narrowly scoped MorphoGBM v10
@@ -108,12 +108,12 @@ def main() -> int:
             )
 
     if problems:
-        print("AGH application-scope guard failed:", file=sys.stderr)
+        print("NephroScope application-scope guard failed:", file=sys.stderr)
         for problem in sorted(set(problems)):
             print(f"  - {problem}", file=sys.stderr)
         return 1
 
-    print("AGH application-scope guard passed (MorphoGBM checkpoint verified).")
+    print("NephroScope application-scope guard passed (MorphoGBM checkpoint verified).")
     return 0
 
 

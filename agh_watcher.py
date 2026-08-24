@@ -397,7 +397,7 @@ def main():
     observer.schedule(handler, str(nas), recursive=True)
     observer.start()
 
-    log.info('AGH Watcher started')
+    log.info('NephroScope watcher started')
     log.info('  Watching : %s', NAS_ROOT)
     log.info('  Server   : %s:%s', SERVER, SERVER_DIR)
     log.info('  State    : %s', STATE_FILE)
@@ -417,7 +417,7 @@ def main():
     finally:
         observer.stop()
         observer.join()
-        log.info('AGH Watcher stopped.')
+        log.info('NephroScope watcher stopped.')
 
 
 if __name__ == '__main__':

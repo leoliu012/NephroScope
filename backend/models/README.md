@@ -1,7 +1,7 @@
 # MorphoGBM model asset
 
 `morphogbm_v10_topology_robust_inference.pt` is the deployment checkpoint for
-the AGH viewer. It was extracted from the supplied model archive; the larger
+NephroScope. It was extracted from the supplied model archive; the larger
 training/optimizer checkpoints and unrelated A-region ablations are not needed
 at runtime.
 

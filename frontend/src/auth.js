@@ -1,4 +1,4 @@
-// Session handling for the AGH Viewer SPA.
+// Session handling for the NephroScope SPA.
 //
 // The server issues an HttpOnly, SameSite=Strict session cookie at login, so
 // the browser attaches it automatically and JavaScript can neither read nor

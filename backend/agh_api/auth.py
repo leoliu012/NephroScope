@@ -1,5 +1,5 @@
 """
-Authentication and session management for the AGH Viewer API.
+Authentication and session management for the NephroScope API.
 
 Design
 ------

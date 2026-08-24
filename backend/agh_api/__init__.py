@@ -466,6 +466,28 @@ def create_app(config: Optional[Config] = None):
         )
         return jsonify({"ok": True})
 
+    @app.route("/agh/api/audit/export", methods=["POST"])
+    def audit_export():
+        denied = require_permission("view")
+        if denied:
+            return denied
+        payload = request.get_json(silent=True) or {}
+        export_format = str(payload.get("format") or "").strip().lower()
+        if export_format not in {"pdf", "png", "jpeg"}:
+            return jsonify({"error": "Unsupported export format"}), 400
+        audit_event(
+            action=f"EXPORT_{export_format.upper()}",
+            case_id=payload.get("caseId"),
+            filename=payload.get("filename"),
+            result="success",
+            details={
+                "includeAnnotations": payload.get("includeAnnotations") is True,
+                "includeAnnotationNames": payload.get("includeAnnotationNames") is True,
+                "includeSegmentationPredictions": payload.get("includeSegmentationPredictions") is True,
+            },
+        )
+        return jsonify({"ok": True})
+
     register_analysis_routes(app, cfg, analysis_store)
     register_ef_routes(app, cfg, raw_channel_cache)
 

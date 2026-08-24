@@ -23,6 +23,15 @@ class PathGuardTests(unittest.TestCase):
         self.assertEqual(list_cases(self.root), ["case A"])
         self.assertEqual(list_tiff_files(self.root, "case A"), ["image.tif", "stack.nd2"])
 
+    def test_lists_cases_in_natural_alphanumeric_order(self):
+        for name in ("#10", "#2", "Case 12", "case 3"):
+            (self.root / name).mkdir()
+
+        self.assertEqual(
+            list_cases(self.root),
+            ["#2", "#10", "case 3", "Case 12", "case A"],
+        )
+
     def test_rejects_case_traversal(self):
         with self.assertRaises(BadRequest):
             list_tiff_files(self.root, "../case A")

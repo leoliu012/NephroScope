@@ -487,6 +487,48 @@ class AuthApiTests(unittest.TestCase):
         self.assertTrue(save_event["ip_hash"])
         self.assertIn("user_agent_hash", save_event)
 
+    def test_export_audit_records_supported_formats_and_options(self):
+        token = self.login().get_json()["csrfToken"]
+        headers = {"X-AGH-CSRF": token}
+        for export_format in ("pdf", "png", "jpeg"):
+            response = self.client.post(
+                "/agh/api/audit/export",
+                json={
+                    "caseId": "case1",
+                    "filename": "image.tif",
+                    "format": export_format,
+                    "includeAnnotations": True,
+                    "includeAnnotationNames": False,
+                    "includeSegmentationPredictions": True,
+                },
+                headers=headers,
+            )
+            self.assertEqual(response.status_code, 200)
+
+        invalid = self.client.post(
+            "/agh/api/audit/export",
+            json={"format": "bmp"},
+            headers=headers,
+        )
+        self.assertEqual(invalid.status_code, 400)
+
+        events = [
+            json.loads(line)
+            for line in self.cfg.audit_log_file.read_text(encoding="utf-8").splitlines()
+        ]
+        exports = [event for event in events if event["action"].startswith("EXPORT_")]
+        self.assertEqual([event["action"] for event in exports], ["EXPORT_PDF", "EXPORT_PNG", "EXPORT_JPEG"])
+        self.assertEqual(exports[-1]["case_id"], "case1")
+        self.assertEqual(exports[-1]["filename"], "image.tif")
+        self.assertEqual(
+            exports[-1]["details"],
+            {
+                "includeAnnotations": True,
+                "includeAnnotationNames": False,
+                "includeSegmentationPredictions": True,
+            },
+        )
+
     def test_admin_user_management_requires_admin_role(self):
         self.login()
         denied = self.client.get("/agh/api/admin/users")

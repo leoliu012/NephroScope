@@ -3,6 +3,7 @@ __pycache__/
 *.log
 *.tmp
 .env
+image-syc.env
 .venv/
 venv/
 inference-venv/
@@ -16,8 +17,12 @@ Thumbs.db
 *:encryptable
 .agh_watcher_state.json
 .patch_backups/
+.last_*_backup
 .last_*_patch_backup
 src_dump*.txt
 dump-folder.mjs
 backend/annotations/
 backend/.local_data/
+backend/.localdata-sync/
+backend/package-lock.json
+=[0-9]*
