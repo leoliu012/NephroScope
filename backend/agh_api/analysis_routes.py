@@ -20,6 +20,8 @@ from .errors import APIError, BadRequest, Conflict
 from .path_guard import image_path
 from .segmentation_service import (
     OPERATION,
+    analysis_request_cache_key,
+    measure_run_distribution,
     measure_run_thickness,
     prepare_analysis_request,
 )
@@ -43,7 +45,7 @@ def register_analysis_routes(app, config, store):
         denied = require_view()
         if denied:
             return denied
-        path = image_path(config.data_root, case, filename)
+        path = image_path(config.active_data_root, case, filename)
         normalized, cache_key = prepare_analysis_request(
             config, path, request.get_json(silent=True)
         )
@@ -55,6 +57,7 @@ def register_analysis_routes(app, config, store):
             normalized,
             cache_key=cache_key,
             requested_by=actor,
+            cache_key_aliases=(analysis_request_cache_key(path, normalized, legacy_source=True),),
         )
         audit_event(
             action="SEGMENTATION_QUEUED",
@@ -91,7 +94,7 @@ def register_analysis_routes(app, config, store):
         denied = require_view()
         if denied:
             return denied
-        path = image_path(config.data_root, case, filename)
+        path = image_path(config.active_data_root, case, filename)
         z_index = _optional_z_index(request.args.get("zIndex"))
         latest_per_z = _optional_boolean(request.args.get("latestPerZ"), "latestPerZ")
         if latest_per_z:
@@ -124,7 +127,7 @@ def register_analysis_routes(app, config, store):
         denied = require_view()
         if denied:
             return denied
-        image_path(config.data_root, case, filename)
+        image_path(config.active_data_root, case, filename)
         z_index = _required_z_index(request.args.get("zIndex"))
         run_ids = store.delete_terminal_runs_for_slice(
             case,
@@ -271,6 +274,19 @@ def register_analysis_routes(app, config, store):
                 "sampleCount": result.get("sampleCount"),
                 "roiPointCount": len((result.get("roi") or {}).get("points") or []),
             },
+        )
+        return jsonify(result)
+
+    @app.route("/agh/api/analysis-runs/<run_id>/measurements/gbm-distribution", methods=["POST"])
+    def analysis_gbm_distribution(run_id):
+        denied = require_view()
+        if denied:
+            return denied
+        run = store.get_run(ensure_run_id(run_id))
+        result = measure_run_distribution(config, run, request.get_json(silent=True))
+        audit_event(
+            action="MEASURE_GBM_DISTRIBUTION", case_id=run["case"], filename=run["filename"],
+            result="success", details={"runId": run_id, "sampleCount": result["sampleCount"]},
         )
         return jsonify(result)
 

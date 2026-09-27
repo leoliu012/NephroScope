@@ -96,6 +96,7 @@ class AnalysisStore:
         *,
         cache_key: str,
         requested_by: str = "",
+        cache_key_aliases: tuple[str, ...] = (),
     ) -> tuple[dict, bool]:
         now = utc_now()
         run_id = str(uuid.uuid4())
@@ -107,14 +108,15 @@ class AnalysisStore:
         }
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            keys = (cache_key, *cache_key_aliases)
             existing = conn.execute(
-                """
+                f"""
                 SELECT * FROM analysis_runs
-                WHERE cache_key = ? AND status IN ('QUEUED', 'RUNNING', 'SUCCEEDED')
+                WHERE cache_key IN ({','.join('?' for _ in keys)}) AND status IN ('QUEUED', 'RUNNING', 'SUCCEEDED')
                 ORDER BY created_at DESC, rowid DESC
                 LIMIT 1
                 """,
-                (cache_key,),
+                keys,
             ).fetchone()
             if existing is not None:
                 conn.commit()

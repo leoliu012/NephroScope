@@ -22,6 +22,7 @@ from .analysis_artifacts import (
 )
 from .errors import BadRequest, Conflict
 from .path_guard import image_path
+from .data_source import image_source_id
 from .tiff_service import choose_z_window, get_metadata, read_z_mip
 
 
@@ -53,6 +54,7 @@ def prepare_analysis_request(config, path: Path, payload) -> tuple[dict, str]:
     stat = Path(path).stat()
     checkpoint = checkpoint_identity(config.model_checkpoint)
     source = {
+        "pathId": image_source_id(path),
         "size": int(stat.st_size),
         "mtimeNs": int(stat.st_mtime_ns),
         "format": metadata.get("sourceFormat"),
@@ -71,20 +73,29 @@ def prepare_analysis_request(config, path: Path, payload) -> tuple[dict, str]:
         "model": checkpoint,
         "pipelineVersion": PIPELINE_VERSION,
     }
+    return request_payload, analysis_request_cache_key(path, request_payload)
+
+
+def analysis_request_cache_key(path: Path, request_payload: dict, *, legacy_source: bool = False) -> str:
+    source = dict(request_payload["source"])
+    if legacy_source:
+        # Older saved runs predate pathId, but their key still includes the
+        # absolute source path, source version, channel, Z window and model.
+        source.pop("pathId", None)
+    checkpoint = request_payload["model"]
     cache_material = {
         "sourcePath": str(Path(path).resolve()),
         "source": source,
-        "zIndex": z_index,
-        "channelIndex": channel_index,
-        "zWindow": list(z_window),
+        "zIndex": request_payload["zIndex"],
+        "channelIndex": request_payload["channelIndex"],
+        "zWindow": request_payload["zWindow"],
         "modelSha256": checkpoint.get("sha256"),
         "modelSize": checkpoint.get("size"),
-        "pipelineVersion": PIPELINE_VERSION,
+        "pipelineVersion": request_payload["pipelineVersion"],
     }
-    cache_key = hashlib.sha256(
+    return hashlib.sha256(
         json.dumps(cache_material, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return request_payload, cache_key
 
 
 def execute_segmentation(
@@ -105,7 +116,7 @@ def execute_segmentation(
     ):
         raise RuntimeError("Analysis job is missing its claimed attempt number")
     request_payload = job.get("request") or {}
-    path = image_path(config.data_root, job["case"], job["filename"])
+    path = image_path(config.active_data_root, job["case"], job["filename"])
     _assert_source_version(path, request_payload.get("source") or {})
     _report(progress, "loading", 0.02, "Reading the source Z window")
 
@@ -285,6 +296,45 @@ def measure_run_thickness(config, run: dict, payload) -> dict:
     }
 
 
+def measure_run_distribution(config, run: dict, payload) -> dict:
+    if run.get("status") != "SUCCEEDED":
+        raise Conflict("Segmentation run is not finished")
+    if not isinstance(payload, dict) or set(payload) != {"calibration"}:
+        raise BadRequest("A calibration object is required")
+    source = (run.get("request") or {}).get("source") or {}
+    path = image_path(config.active_data_root, run["case"], run["filename"])
+    try:
+        _assert_source_version(path, source)
+    except RuntimeError as exc:
+        raise Conflict(str(exc)) from exc
+    if not source.get("pathId") and run["cacheKey"] != analysis_request_cache_key(
+        path, run["request"], legacy_source=True,
+    ):
+        raise Conflict("Source image folder changed since this segmentation")
+    _, calibration = validate_thickness_request({
+        "calibration": payload["calibration"],
+        "roi": {"type": "polygon", "points": [
+            [0, 0], [source["width"], 0],
+            [source["width"], source["height"]], [0, source["height"]],
+        ]},
+    }, run)
+    if (run.get("result") or {}).get("thicknessGeometryAvailable") is False:
+        raise Conflict("This segmentation has no saved thickness geometry")
+    from .gbm_thickness import load_thickness_geometry, gbm_thickness_distribution_from_geometry
+
+    geometry = load_thickness_geometry(thickness_geometry_path(
+        config.analysis_root, run["runId"],
+        attempt=(run.get("result") or {}).get("artifactAttempt"),
+    ))
+    distribution = gbm_thickness_distribution_from_geometry(
+        geometry,
+        pixel_size_x_um=calibration["pixelSizeXUm"],
+        pixel_size_y_um=calibration["pixelSizeYUm"],
+        expansion_factor=calibration["expansionFactor"] if calibration["expansionEnabled"] else 1.0,
+    )
+    return {"analysisRunId": run["runId"], "calibration": calibration, **distribution}
+
+
 def validate_thickness_request(payload, run: dict) -> tuple[dict, dict]:
     if not isinstance(payload, dict):
         raise BadRequest("JSON body is required")
@@ -394,6 +444,8 @@ def _assert_checkpoint_version(path: Path, expected: dict) -> None:
 
 
 def _assert_source_version(path: Path, expected: dict) -> None:
+    if expected.get("pathId") and expected["pathId"] != image_source_id(path):
+        raise RuntimeError("Source image folder changed after this run was queued")
     stat = Path(path).stat()
     if int(stat.st_size) != int(expected.get("size") or -1) or int(stat.st_mtime_ns) != int(
         expected.get("mtimeNs") or -1

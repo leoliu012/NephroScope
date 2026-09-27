@@ -424,6 +424,36 @@ def _points_in_polygon(
     return inside | boundary
 
 
+def gbm_thickness_distribution_from_geometry(
+    geometry: ThicknessGeometry,
+    *,
+    pixel_size_x_um: float,
+    pixel_size_y_um: float | None = None,
+    expansion_factor: float = 1.0,
+) -> dict[str, Any]:
+    """All full-mask centerline diameters, losslessly encoded as value/count pairs.
+
+    Repeated measurements retain their multiplicity; these are not image means
+    or histogram bins. The diameter/calibration calculation matches ROI means.
+    """
+    size_x, size_y, expansion = _calibration(
+        pixel_size_x_um, pixel_size_y_um, expansion_factor,
+    )
+    diameters = 2.0 * np.hypot(
+        geometry.nearest_background_dy_pixels.astype(np.float64) * size_y,
+        geometry.nearest_background_dx_pixels.astype(np.float64) * size_x,
+    ) / expansion
+    values, counts = np.unique(diameters, return_counts=True)
+    return {
+        "valuesUm": values.tolist(),
+        "counts": counts.tolist(),
+        "sampleCount": int(diameters.size),
+        "borderSampleCount": int(np.isin(geometry.skeleton_component, geometry.border_components).sum()),
+        "coverage": "full-mask-centerline",
+        "unit": "µm",
+    }
+
+
 def measure_gbm_thickness_from_geometry(
     geometry: ThicknessGeometry,
     roi_vertices: Any,
@@ -557,6 +587,7 @@ def measure_gbm_thickness(
 __all__ = [
     "THICKNESS_GEOMETRY_SCHEMA_VERSION",
     "ThicknessGeometry",
+    "gbm_thickness_distribution_from_geometry",
     "load_thickness_geometry",
     "measure_gbm_thickness",
     "measure_gbm_thickness_from_geometry",

@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "test": "npm run test:annotations && npm run test:channels && npm run test:collections && npm run test:export && npm run test:rendering && npm run test:model && npm run test:calibration",
+    "test": "npm run test:annotations && npm run test:channels && npm run test:collections && npm run test:export && npm run test:rendering && npm run test:model && npm run test:calibration && npm run test:case-analysis",
+    "test:case-analysis": "node src/caseAnalysis.selftest.mjs && node src/imageThickness.selftest.mjs",
     "test:annotations": "node src/annotationStyles.selftest.mjs",
     "test:channels": "node src/channelDisplay.selftest.mjs",
     "test:collections": "node src/collectionOrganization.selftest.mjs",

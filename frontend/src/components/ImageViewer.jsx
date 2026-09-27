@@ -34,6 +34,7 @@ import {
   ScanLine,
   Eye,
   EyeOff,
+  BarChart3,
 } from 'lucide-react'
 import { jsPDF } from 'jspdf'
 import AnnotationLayer from './AnnotationLayer.jsx'
@@ -41,16 +42,18 @@ import ChannelControls from './ChannelControls.jsx'
 import ModelMaskOverlay from './ModelMaskOverlay.jsx'
 import ModelRoiLayer from './ModelRoiLayer.jsx'
 import ModelSkeletonOverlay from './ModelSkeletonOverlay.jsx'
+import ImageThicknessPanel from './ImageThicknessPanel.jsx'
+import useImageThicknessAnalysis from '../useImageThicknessAnalysis.js'
 import MultiChannelCanvas from './MultiChannelCanvas.jsx'
 import ZSliceSlider, { zIndexForAnnotation } from './ZSliceSlider.jsx'
 import { autoWindowChannelSettings, loadChannelSettings, normalizeChannelSettings, saveChannelSettings } from '../channelDisplay.js'
 import { APP_NAME, APP_VERSION } from '../appInfo.js'
+import { defaultMeasurementSettings, normalizeMeasurementSettings, loadMeasurementSettings, saveMeasurementSettings } from '../measurementSettings.js'
 import {
   DEFAULT_EXPANSION_FACTOR,
   applyMeasurementSettings,
   formatMeasurement,
   formatPixelSize,
-  formatPixelSizeInput,
 } from '../measurement.js'
 import { normalizeAnnotationForStorage, normalizedAnnotationType } from '../annotationTypes.js'
 import {
@@ -107,7 +110,6 @@ const TOOLS = [
 
 const ANNOTATION_TOOL_IDS = ['point', 'line', 'measure', 'arrow', 'rect', 'ellipse', 'freehand', 'text']
 const COLORS = ['#000000','#ff4444','#44ff88','#44aaff','#ff44ff','#ffffff','#ff8800']
-const MEASUREMENT_SETTINGS_STORAGE_PREFIX = 'agh-viewer:measurement-settings:v1:'
 
 const KEYBOARD_SHORTCUTS = [
   { keys: ['F'], action: 'Fit image to window' },
@@ -134,7 +136,7 @@ async function fetchJson(url, options = {}) {
 }
 
 function normalizeSidebarTab(value) {
-  if (value === 'channels' || value === 'settings') return value
+  if (value === 'channels' || value === 'settings' || value === 'thickness') return value
   return 'annotations'
 }
 
@@ -167,51 +169,6 @@ function formatAnnotationTimestamp(value) {
   })
 }
 
-function measurementSettingsStorageKey(caseId, filename) {
-  return `${MEASUREMENT_SETTINGS_STORAGE_PREFIX}${encodeURIComponent(caseId)}/${encodeURIComponent(filename)}`
-}
-
-function validPositiveInput(value, fallback) {
-  const number = Number(value)
-  return Number.isFinite(number) && number > 0 ? String(value) : fallback
-}
-
-const LOCAL_DEV_EXPANSION_CASES = new Set(['4', '5', '9'])
-const LOCAL_DEV_EXPANSION_FACTOR = 7.23
-const AUTO_UNEXPANDED_PIXEL_SIZE_UM = 0.015
-const AUTO_UNEXPANDED_PIXEL_SIZE_TOLERANCE_UM = 0.001
-
-function defaultExpansionFactor(caseId) {
-  const match = String(caseId || '').match(/(?:^|\D)([459])(?:\D|$)/)
-  return match && LOCAL_DEV_EXPANSION_CASES.has(match[1])
-    ? LOCAL_DEV_EXPANSION_FACTOR
-    : DEFAULT_EXPANSION_FACTOR
-}
-
-function isAutoUnexpandedPixelSize(meta) {
-  const pixelSize = Number(meta?.pixelSizeXUm ?? meta?.pixelSizeUm)
-  if (!Number.isFinite(pixelSize) || pixelSize <= 0) return false
-  if (meta?.pixelSizeIsUserOverride || meta?.pixelSizeIsDefault !== false) return false
-  return Math.abs(pixelSize - AUTO_UNEXPANDED_PIXEL_SIZE_UM) <= AUTO_UNEXPANDED_PIXEL_SIZE_TOLERANCE_UM
-}
-
-function defaultMeasurementSettings(meta, caseId) {
-  return {
-    pixelSizeUm: formatPixelSizeInput(meta),
-    expansionEnabled: !isAutoUnexpandedPixelSize(meta),
-    expansionFactor: String(defaultExpansionFactor(caseId)),
-  }
-}
-
-function normalizeMeasurementSettings(raw, meta, caseId) {
-  const fallback = defaultMeasurementSettings(meta, caseId)
-  return {
-    pixelSizeUm: validPositiveInput(raw?.pixelSizeUm, fallback.pixelSizeUm),
-    expansionEnabled: typeof raw?.expansionEnabled === 'boolean' ? raw.expansionEnabled : fallback.expansionEnabled,
-    expansionFactor: validPositiveInput(raw?.expansionFactor, fallback.expansionFactor),
-  }
-}
-
 function clampZIndex(value, meta) {
   const count = Math.max(1, Number(meta?.zCount) || 1)
   const number = Math.round(Number(value) || 0)
@@ -226,23 +183,6 @@ function formatCacheEta(value) {
   const minutes = Math.floor(seconds / 60)
   const remainingSeconds = seconds % 60
   return remainingSeconds ? `about ${minutes}m ${remainingSeconds}s left` : `about ${minutes}m left`
-}
-
-function loadMeasurementSettings(caseId, filename, meta) {
-  try {
-    const saved = JSON.parse(localStorage.getItem(measurementSettingsStorageKey(caseId, filename)) || 'null')
-    return normalizeMeasurementSettings(saved, meta, caseId)
-  } catch {
-    return defaultMeasurementSettings(meta, caseId)
-  }
-}
-
-function saveMeasurementSettings(caseId, filename, settings) {
-  try {
-    localStorage.setItem(measurementSettingsStorageKey(caseId, filename), JSON.stringify(settings))
-  } catch {
-    // Measurement controls remain usable even when storage is unavailable.
-  }
 }
 
 function cloneAnnotation(annotation) {
@@ -504,6 +444,7 @@ export default function ImageViewer({
   const [includeAnnotations, setIncludeAnnotations] = useState(true)
   const [includeAnnotationNames, setIncludeAnnotationNames] = useState(true)
   const [includeSegmentationPredictions, setIncludeSegmentationPredictions] = useState(true)
+  const [includeThicknessPlot, setIncludeThicknessPlot] = useState(false)
   const canAnnotate = role !== 'viewer'
 
   const imageRef = useRef(null)
@@ -598,6 +539,7 @@ export default function ImageViewer({
     setModelHistoryError('')
     setModelDeleteState({ zIndex: null, status: 'idle', message: '' })
     setModelInputChannel(0)
+    setIncludeThicknessPlot(false)
     fetchJson(`${API}/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}/meta`, { signal: controller.signal })
       .then(async meta => {
         let sharedState = null
@@ -1272,6 +1214,36 @@ export default function ImageViewer({
     ? currentRoiRecord.roi
     : null
   const currentCalibration = calibrationPayload(measurementMeta || {})
+  const thicknessAnalysis = useImageThicknessAnalysis({
+    caseId, filename, user, meta: imgMeta, ready: Boolean(imageReady),
+    channelIndex: modelInputChannel, calibration: currentCalibration,
+  })
+  const completedThicknessId = thicknessAnalysis.batch && thicknessAnalysis.progress.total > 0
+    && thicknessAnalysis.progress.complete + thicknessAnalysis.progress.failed === thicknessAnalysis.progress.total
+    ? thicknessAnalysis.batch.id : ''
+  useEffect(() => {
+    if (!completedThicknessId) return undefined
+    const controller = new AbortController()
+    const runIds = new Set(thicknessAnalysis.batch.jobs.map(job => job.runId))
+    fetchLatestModelRuns(imageApiBase, { signal: controller.signal }).then(payload => {
+      if (controller.signal.aborted) return
+      const restored = indexModelRunsByZ(payload?.runs, imageKey)
+      setModelRunsByZ(current => {
+        const next = { ...current }
+        for (const [key, run] of Object.entries(restored)) {
+          const prior = current[key]
+          if (!runIds.has(run.runId)) continue
+          if (prior?.runId !== run.runId && ['SUBMITTING', 'QUEUED', 'RUNNING'].includes(prior?.status)) continue
+          next[key] = prior?.runId === run.runId ? {
+            ...prior, ...run, maskStatus: prior.maskStatus || run.maskStatus,
+            skeletonStatus: prior.skeletonStatus || run.skeletonStatus,
+          } : run
+        }
+        return next
+      })
+    }).catch(() => {})
+    return () => controller.abort()
+  }, [completedThicknessId, imageApiBase, imageKey])
   const currentCalibrationKey = stableModelJson(currentCalibration)
   const currentRoiKey = currentModelRoi ? stableModelJson(currentModelRoi) : ''
   const currentModelMeasurement = modelMeasurementsByZ[String(zIndex)] || null
@@ -1298,6 +1270,8 @@ export default function ImageViewer({
     const expectedImageKey = imageKey
     const expectedZIndex = zIndex
     try {
+      const reportSnapshot = includeThicknessPlot ? thicknessAnalysis.report : null
+      if (includeThicknessPlot && !reportSnapshot) throw new Error('Run thickness analysis before including its box plot')
       const sourceCanvas = imageRef.current
       const predictionLayers = []
       const canvasContainer = sourceCanvas?.closest('.viewer-canvas-container')
@@ -1321,6 +1295,13 @@ export default function ImageViewer({
         includeAnnotationNames,
         predictionLayers,
       })
+      let thicknessReports = []
+      let combineReport = null
+      if (reportSnapshot) {
+        const { renderThicknessReport, appendThicknessReport } = await import('../thicknessExport.jsx')
+        thicknessReports = await renderThicknessReport(reportSnapshot)
+        combineReport = appendThicknessReport
+      }
       if (
         modelViewRef.current.imageKey !== expectedImageKey
         || modelViewRef.current.zIndex !== expectedZIndex
@@ -1356,10 +1337,18 @@ export default function ImageViewer({
         pdf.setFontSize(10)
         pdf.setTextColor(180, 30, 30)
         pdf.text(RESEARCH_USE_NOTICE, 20, Math.max(20, canvas.height - 20))
+        thicknessReports.forEach(report => {
+          pdf.addPage([report.width, report.height], report.width >= report.height ? 'landscape' : 'portrait')
+          pdf.addImage(report.toDataURL('image/png'), 'PNG', 0, 0, report.width, report.height, undefined, 'FAST')
+        })
         pdf.save(outputFilename)
       } else {
         const quality = option.id === 'jpeg' ? 0.92 : undefined
-        const blob = await canvasBlob(canvas, option.mimeType, quality)
+        const output = thicknessReports.length ? combineReport(canvas, thicknessReports) : canvas
+        const blob = await canvasBlob(output, option.mimeType, quality)
+        if (modelViewRef.current.imageKey !== expectedImageKey || modelViewRef.current.zIndex !== expectedZIndex) {
+          throw new Error('The image changed during export. Please export again.')
+        }
         downloadBlob(blob, outputFilename)
       }
 
@@ -1373,6 +1362,7 @@ export default function ImageViewer({
           includeAnnotations,
           includeAnnotationNames: includeAnnotations && includeAnnotationNames,
           includeSegmentationPredictions,
+          includeThicknessPlot: Boolean(reportSnapshot),
         }),
       }).catch(() => {})
     } catch (error) {
@@ -1390,6 +1380,8 @@ export default function ImageViewer({
     includeAnnotationNames,
     includeAnnotations,
     includeSegmentationPredictions,
+    includeThicknessPlot,
+    thicknessAnalysis.report,
     measurementMeta,
     modelOverlayAligned,
     modelOverlaySettings.opacity,
@@ -1975,6 +1967,11 @@ export default function ImageViewer({
             {currentModelRunBusy ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
             {currentModelRunBusy ? 'Running model' : 'Run model'}
           </button>
+          <button type="button" onClick={() => { setSidebarTab('thickness'); setSidebarCollapsed(false) }}
+            disabled={!imageReady} className="ux-button ux-button-secondary whitespace-nowrap"
+            title="Choose Z slices and analyze full-image GBM thickness">
+            <BarChart3 size={14} />Run thickness analysis
+          </button>
           <div className="ux-divider mx-1 h-5 w-px" />
           <button onClick={setActualSize}
             className="ux-button ux-button-ghost font-mono">
@@ -2301,7 +2298,7 @@ export default function ImageViewer({
 
       {!sidebarCollapsed && (
         <aside className="viewer-inspector w-80 flex-shrink-0 border-l flex flex-col min-h-0">
-          <div className="viewer-inspector-tabs px-3 py-2 border-b flex items-center gap-1">
+          <div className="viewer-inspector-tabs ta-tabs px-3 py-2 border-b items-center gap-1">
             <button onClick={() => setSidebarTab('annotations')}
               className={`ux-tab flex-1 min-w-0 ${sidebarTab === 'annotations' ? 'ux-tab-active' : ''}`}>
               <span className="truncate">Annotations</span>
@@ -2314,9 +2311,16 @@ export default function ImageViewer({
               className={`ux-tab flex-1 min-w-0 ${sidebarTab === 'settings' ? 'ux-tab-active' : ''}`}>
               <span className="truncate">Settings</span>
             </button>
+            <button onClick={() => setSidebarTab('thickness')}
+              className={`ux-tab flex-1 min-w-0 ${sidebarTab === 'thickness' ? 'ux-tab-active' : ''}`}>
+              <span className="truncate">Thickness</span>
+            </button>
           </div>
 
           <div className="flex-1 min-h-0 overflow-y-auto">
+            {sidebarTab === 'thickness' && <ImageThicknessPanel analysis={thicknessAnalysis}
+              ready={Boolean(imageReady)} zCount={zCount} channelIndex={modelInputChannel}
+              channelCount={modelChannelCount} onChannelChange={setModelInputChannel} calibration={currentCalibration} />}
             {sidebarTab === 'annotations' && (
               <div className="px-3 py-3 space-y-4">
                 <div className="ux-card p-3 space-y-3">
@@ -2805,6 +2809,14 @@ export default function ImageViewer({
 
             <fieldset className="space-y-2">
               <legend className="sr-only">Export contents</legend>
+              <label className={`flex items-center justify-between gap-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] px-3 py-2.5 ${thicknessAnalysis.report ? 'cursor-pointer' : 'opacity-50'}`}>
+                <span className="text-[12px] text-[var(--text-muted)]">Include thickness box plot and statistics</span>
+                <input type="checkbox" checked={includeThicknessPlot} disabled={!thicknessAnalysis.report}
+                  onChange={event => setIncludeThicknessPlot(event.currentTarget.checked)} />
+              </label>
+              <p className="text-[11px] leading-snug text-[var(--text-subtle)]">{thicknessAnalysis.report
+                ? `${thicknessAnalysis.progress.complete}/${thicknessAnalysis.progress.total} runs measured. Uses the Thickness tab’s grouping and units. PDF adds report pages; PNG/JPEG append the report below the image.`
+                : 'Run thickness analysis to include a box plot. At least one non-empty result is required.'}</p>
               <label className="flex cursor-pointer items-center justify-between gap-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] px-3 py-2.5">
                 <span className="text-[12px] text-[var(--text-muted)]">Include segmentation predictions</span>
                 <input
@@ -2838,7 +2850,7 @@ export default function ImageViewer({
 
             <button
               onClick={exportImage}
-              disabled={exporting || !imageReady || sliceLoadState.status !== 'ready'}
+              disabled={exporting || !imageReady || sliceLoadState.status !== 'ready' || (includeThicknessPlot && !thicknessAnalysis.report)}
               className="ux-button ux-button-primary w-full"
             >
               {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}

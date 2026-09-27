@@ -195,7 +195,7 @@ ssh("sudo cp /tmp/agh_backend.service /tmp/agh_analysis_worker.service "
     "sudo systemctl enable agh_analysis_worker && "
     "sudo systemctl restart agh_analysis_worker && "
     "sudo systemctl enable agh_image_sync && "
-    "if [ -f /etc/agh-viewer/image-sync.env ]; then sudo systemctl restart agh_image_sync; fi")
+    "sudo systemctl restart agh_image_sync")
 # The health endpoint is public (no credentials), so this needs no auth.
 ssh("sleep 2 && curl -fsS http://127.0.0.1:5055/agh/api/health")
 

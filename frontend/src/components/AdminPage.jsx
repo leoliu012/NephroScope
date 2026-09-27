@@ -53,11 +53,13 @@ function eventSummary(event) {
   return parts.join(' | ')
 }
 
-export default function AdminPage({ currentUser, onBack }) {
+export default function AdminPage({ currentUser, onBack, onSourceChanged }) {
   const [users, setUsers] = useState([])
   const [roles, setRoles] = useState([])
   const [events, setEvents] = useState([])
   const [sync, setSync] = useState({ configured: false, state: 'disabled' })
+  const [sourceDraft, setSourceDraft] = useState({ mode: 'sync', folderPath: '' })
+  const [sourceMessage, setSourceMessage] = useState('')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState('')
   const [error, setError] = useState('')
@@ -95,6 +97,7 @@ export default function AdminPage({ currentUser, onBack }) {
       setRoles(userData.roles || [])
       setEvents(eventData.events || [])
       setSync(syncData)
+      setSourceDraft({ mode: syncData.source?.mode || 'sync', folderPath: syncData.source?.folderPath || '' })
     } catch (err) {
       setError(err.message)
     } finally {
@@ -253,6 +256,31 @@ export default function AdminPage({ currentUser, onBack }) {
     }
   }
 
+  const saveImageSource = async (event) => {
+    event.preventDefault()
+    setSaving('image-source')
+    setError('')
+    setSourceMessage('')
+    try {
+      const status = await fetchJson(`${API}/admin/image-sync`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(sourceDraft),
+      })
+      setSync(status)
+      setSourceDraft({ mode: status.source.mode, folderPath: status.source.folderPath })
+      setSourceMessage(status.source.mode === 'direct'
+        ? 'Folder saved. The viewer now reads directly from this folder.'
+        : 'Folder saved. Synchronization is queued for the sync worker.')
+      onSourceChanged?.()
+      await loadAuditEvents().catch(() => {})
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSaving('')
+    }
+  }
+
   return (
     <div className="app-shell flex h-screen w-screen flex-col overflow-hidden">
       <header className="app-header flex flex-shrink-0 items-center justify-between px-4">
@@ -283,6 +311,46 @@ export default function AdminPage({ currentUser, onBack }) {
           <div className="grid gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(420px,0.9fr)]">
             <section className="space-y-4">
               <section className="ux-card p-4">
+                <h2 className="text-sm font-semibold text-[var(--text)]">Project image folder</h2>
+                <form onSubmit={saveImageSource} className="mt-3 mb-4 space-y-3 border-b border-[var(--border)] pb-4">
+                  <fieldset disabled={Boolean(saving) || sync.state === 'running'} className="space-y-3 disabled:opacity-60">
+                    <label className="block text-xs text-[var(--text)]">
+                      Folder mode
+                      <select
+                        value={sourceDraft.mode}
+                        onChange={event => { setSourceDraft(current => ({ ...current, mode: event.target.value })); setSourceMessage('') }}
+                        className="ux-input mt-1 w-full"
+                      >
+                        <option value="sync">Sync folder into the local cache</option>
+                        <option value="direct">Read folder directly (no sync)</option>
+                      </select>
+                    </label>
+                    <label className="block text-xs text-[var(--text)]">
+                      {sourceDraft.mode === 'sync' ? 'Sync source folder' : 'Direct data folder'}
+                      <input
+                        value={sourceDraft.folderPath}
+                        onChange={event => { setSourceDraft(current => ({ ...current, folderPath: event.target.value })); setSourceMessage('') }}
+                        placeholder="R:\AGH_APP or /mnt/r/AGH_APP"
+                        className="ux-input mt-1 w-full"
+                        spellCheck={false}
+                        autoComplete="off"
+                        required
+                        aria-describedby="image-folder-help"
+                      />
+                    </label>
+                    <p id="image-folder-help" className="text-[11px] text-[var(--text-subtle)]">
+                      Choose a parent folder containing case subfolders, with .tif, .tiff, or .nd2 images directly inside each case.
+                      Windows drives and network shares must be mounted and readable by the backend in WSL. You can enter a Windows path or its Linux mount path.
+                      {sourceDraft.mode === 'sync' ? ' The source is authoritative; syncing removes cached images absent from the source.' : ' Images are read in place without copying.'}
+                    </p>
+                    <button type="submit" className="ux-button ux-button-primary min-h-0 px-3 py-1.5 text-[11px]">
+                      {saving === 'image-source' && <Loader2 size={13} className="animate-spin" />}
+                      Save folder
+                    </button>
+                  </fieldset>
+                  {sync.source?.resolvedPath && <p className="break-all text-[11px] text-[var(--text-subtle)]">Current {sync.source.mode === 'direct' ? 'direct' : 'sync source'} folder: {sync.source.resolvedPath}</p>}
+                  {sourceMessage && <p role="status" className="text-[11px] text-green-400">{sourceMessage}</p>}
+                </form>
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <div className="flex items-center gap-2 text-sm font-semibold text-[var(--text)]">
@@ -290,7 +358,7 @@ export default function AdminPage({ currentUser, onBack }) {
                     </div>
                     <p className="mt-1 text-[11px] text-[var(--text-subtle)]">
                       {!sync.configured
-                        ? 'Remote image sync is not configured.'
+                        ? 'Direct folder mode is active. No synchronization is needed.'
                         : sync.state === 'running'
                           ? syncProgress?.phase === 'scanning'
                             ? 'Scanning the remote image folder.'
@@ -305,7 +373,7 @@ export default function AdminPage({ currentUser, onBack }) {
                   <button
                     type="button"
                     onClick={requestImageSync}
-                    disabled={!sync.configured || saving === 'image-sync' || sync.state === 'running' || sync.manualRequestPending}
+                    disabled={!sync.configured || Boolean(saving) || sync.state === 'running' || sync.manualRequestPending}
                     className="ux-button ux-button-primary min-h-0 px-3 py-1.5 text-[11px]"
                   >
                     {saving === 'image-sync' || sync.state === 'running' ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}

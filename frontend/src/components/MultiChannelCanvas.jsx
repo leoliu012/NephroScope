@@ -205,7 +205,7 @@ function abortError() {
 function rawChannelVersion(meta) {
   const size = meta?.sourceSize
   const mtime = meta?.sourceMtimeNs
-  return size != null && mtime != null ? `${size}-${mtime}` : ''
+  return size != null && mtime != null ? `${meta?.sourceId || ''}-${size}-${mtime}` : ''
 }
 
 function rawChannelUrl(apiBase, version, index, zIndex = 0) {

@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import {
   ArrowRight,
+  BarChart3,
   ChevronDown,
   ChevronRight,
   Crosshair,
@@ -23,6 +24,7 @@ import AccountSettingsPage from './components/AccountSettingsPage.jsx'
 import AutoAdjustedPreview from './components/AutoAdjustedPreview.jsx'
 import AdminPage from './components/AdminPage.jsx'
 import ExpansionCalibrationPage from './components/ExpansionCalibrationPage.jsx'
+import CaseAnalysisPage from './components/CaseAnalysisPage.jsx'
 import ImageViewer from './components/ImageViewer.jsx'
 import { APP_NAME, APP_TAGLINE } from './appInfo.js'
 import { authFetch, fetchSession, login as loginRequest, logout as logoutRequest } from './auth.js'
@@ -181,7 +183,7 @@ function parseWorkspaceRoute(hash = window.location.hash) {
   const raw = hash.startsWith('#') ? hash.slice(1) : hash
   const [path, query = ''] = raw.split('?')
   const parts = path.split('/').filter(Boolean)
-  const route = { admin: parts[0] === 'admin', account: parts[0] === 'account', case: null, filename: null, open: false, tab: 'annotations' }
+  const route = { admin: parts[0] === 'admin', account: parts[0] === 'account', caseAnalysis: parts[0] === 'case-analysis', case: null, filename: null, open: false, tab: 'annotations' }
   const caseIndex = parts.indexOf('case')
   const fileIndex = parts.indexOf('file')
   if (caseIndex >= 0 && parts[caseIndex + 1]) route.case = decodeRoutePart(parts[caseIndex + 1])
@@ -521,6 +523,7 @@ export default function App() {
     : null)
   const [adminOpen, setAdminOpen] = useState(initialRoute.admin)
   const [accountOpen, setAccountOpen] = useState(initialRoute.account)
+  const [caseAnalysisOpen, setCaseAnalysisOpen] = useState(initialRoute.caseAnalysis)
   const [auth, setAuth] = useState({ status: 'checking', authenticated: false, user: '', role: '', firstName: '', lastName: '', displayName: '' })
   const [clientId] = useState(() => collaborationClientId())
   const [casePanelWidth, setCasePanelWidth] = useState(DEFAULT_CASE_PANEL_WIDTH)
@@ -537,6 +540,7 @@ export default function App() {
     setOpenFile(null)
     setAdminOpen(false)
     setAccountOpen(false)
+    setCaseAnalysisOpen(false)
     setPreviewMeta(null)
     setPreviewError(null)
     replaceWorkspaceHash('')
@@ -558,6 +562,7 @@ export default function App() {
       const route = parseWorkspaceRoute()
       setAdminOpen(route.admin)
       setAccountOpen(route.account)
+      setCaseAnalysisOpen(route.caseAnalysis)
       setCase(route.case)
       setSelectedFile(route.filename)
       setPreviewError(null)
@@ -575,7 +580,9 @@ export default function App() {
       setAdminOpen(false)
       return
     }
-    const current = accountOpen
+    const current = caseAnalysisOpen
+      ? '#/case-analysis'
+      : accountOpen
       ? '#/account'
       : adminOpen
       ? '#/admin'
@@ -583,7 +590,7 @@ export default function App() {
       ? workspaceHash({ ...openFile, open: true })
       : workspaceHash({ case: selectedCase, filename: selectedFile })
     replaceWorkspaceHash(current)
-  }, [auth.authenticated, selectedCase, selectedFile, openFile, adminOpen, accountOpen])
+  }, [auth.authenticated, selectedCase, selectedFile, openFile, adminOpen, accountOpen, caseAnalysisOpen])
 
   // Validate any existing session cookie on load before showing the app.
   useEffect(() => {
@@ -944,8 +951,29 @@ export default function App() {
 
   if (!auth.authenticated) return <LoginPage onLogin={handleLogin} />
 
+  if (caseAnalysisOpen) {
+    return <CaseAnalysisPage cases={cases} loadingCases={loadingCases} casesError={casesError}
+      initialCase={selectedCase} currentUser={auth.user} onBack={() => setCaseAnalysisOpen(false)}
+      onReloadCases={() => setCasesReload(value => value + 1)} />
+  }
+
   if (adminOpen && auth.role === 'admin') {
-    return <AdminPage currentUser={auth.user} onBack={() => setAdminOpen(false)} />
+    return <AdminPage
+      currentUser={auth.user}
+      onSourceChanged={() => {
+        setCase(null)
+        setSelectedFile(null)
+        setOpenFile(null)
+        setPreviewMeta(null)
+        setFiles([])
+        setCasesReload(value => value + 1)
+      }}
+      onBack={() => {
+        setAdminOpen(false)
+        setCasesReload(value => value + 1)
+        setFilesReload(value => value + 1)
+      }}
+    />
   }
 
   if (accountOpen) {
@@ -980,6 +1008,10 @@ export default function App() {
             </div>
           )}
           {auth.user && <span>{auth.displayName || auth.user}{auth.role ? ` (${auth.role})` : ''}</span>}
+          <button onClick={() => setCaseAnalysisOpen(true)} className="ux-button ux-button-secondary min-h-0 px-2 py-1 text-[11px]" title="Analyze cases and compare GBM thickness distributions">
+            <BarChart3 size={13} />
+            Case analysis
+          </button>
           <button onClick={() => setCalibrationOpen(true)} className="ux-button ux-button-ghost min-h-0 px-2 py-1 text-[11px]" title="Measure expansion factor from matched line pairs">
             <Crosshair size={13} />
             EF measurement

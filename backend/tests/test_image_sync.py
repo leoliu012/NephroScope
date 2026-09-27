@@ -94,6 +94,36 @@ class RemoteImageSyncTests(unittest.TestCase):
         payload = (self.config.sync_state_dir / "manual-sync-request.json").read_text(encoding="utf-8")
         self.assertIn('"requestedBy": "admin"', payload)
 
+    def test_nested_files_are_neither_copied_renamed_nor_deleted(self):
+        old_remote = self._remote_file("case-a/old.tif", b"existing-image")
+        self.syncer.sync_once()
+        nested = self.local / "case-a/results"
+        nested.mkdir()
+        (self.local / "case-a/old.tif").rename(nested / "indexed.tif")
+        with sqlite3.connect(self.syncer.index_path) as conn:
+            conn.execute(
+                "UPDATE sync_index SET local_path = ?, remote_path = ?",
+                ("case-a/results/indexed.tif", "case-a/results/indexed.tif"),
+            )
+        (nested / "unindexed.tif").write_bytes(b"local-only")
+        (nested / "empty").mkdir()
+        old_remote.unlink()
+        self._remote_file("case-a/new.tif", b"existing-image")
+        ignored_remote = self._remote_file("case-a/results/deeper/ignored.tif", b"nested-source")
+
+        result = self.syncer.sync_once()
+
+        self.assertEqual(result["counts"]["remote"], 1)
+        self.assertEqual(result["counts"]["copied"], 1)
+        self.assertEqual(result["counts"]["renamed"], 0)
+        self.assertEqual(result["counts"]["deleted"], 0)
+        self.assertEqual((self.local / "case-a/new.tif").read_bytes(), b"existing-image")
+        self.assertEqual((nested / "indexed.tif").read_bytes(), b"existing-image")
+        self.assertEqual((nested / "unindexed.tif").read_bytes(), b"local-only")
+        self.assertTrue((nested / "empty").is_dir())
+        self.assertFalse((nested / "deeper").exists())
+        self.assertEqual(ignored_remote.read_bytes(), b"nested-source")
+
     def test_actual_sync_records_completion_audit_not_request_success(self):
         self._remote_file("case-a/image.tif", b"image")
 

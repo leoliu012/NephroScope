@@ -1,0 +1,28 @@
+.ta-panel { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.ta-panel h2, .ta-panel h3 { font-size: 13px; font-weight: 600; }
+.ta-panel h4 { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+.ta-panel .ca-help { font-size: 11px; line-height: 1.5; }
+.ta-panel input[type="range"], .ta-panel progress { width: 100%; accent-color: var(--accent); }
+.ta-panel .ca-field input[type="range"] { min-width: 0; margin: 3px 0; }
+.ta-gap-ticks { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-subtle); margin-top: -10px; }
+.ta-slices, .ta-progress-section { font-size: 12px; }
+.ta-progress-section { border-top: 1px solid var(--border); padding-top: 12px; }
+.ta-progress-section progress { height: 8px; margin-bottom: 6px; }
+.ta-actions { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0; }
+.ta-actions .ux-button { min-height: 26px; padding: 4px 6px; font-size: 11px; }
+.ta-panel summary { font-size: 11px; cursor: pointer; padding: 8px 0; }
+.ta-run-settings { border: 1px solid var(--border); border-radius: 6px; padding: 0 10px; }
+.ta-run-settings summary { font-size: 12px; font-weight: 600; }
+.ta-run-settings summary span { display: block; margin-top: 4px; color: var(--text-subtle); font-size: 10px; font-weight: 400; }
+.ta-run-fields { display: flex; flex-direction: column; gap: 10px; padding: 4px 0 10px; }
+.ta-job-list li { display: grid; grid-template-columns: 32px 1fr; gap: 6px; padding: 4px 0; font-size: 11px; }
+.ta-results { border-top: 1px solid var(--border); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.ta-plot-controls { display: grid; grid-template-columns: 1fr 64px; gap: 8px; }
+.ta-check { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.ta-check input { accent-color: var(--accent); }
+.ca-box-plot.ta-compact-plot { min-width: 0; width: 100%; margin: 0; }
+.ta-statistics section { border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin: 8px 0; }
+.ta-statistics dl { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 8px; }
+.ta-statistics dt { color: var(--text-subtle); font-size: 10px; }
+.ta-statistics dd { font-size: 12px; font-variant-numeric: tabular-nums; margin: 2px 0 0; }
+.viewer-inspector-tabs.ta-tabs { display: grid; grid-template-columns: 1fr 1fr; }

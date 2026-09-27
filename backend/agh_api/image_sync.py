@@ -1,7 +1,7 @@
 """Remote-authoritative image cache synchronization.
 
-The Flask API only ever reads ``Config.data_root``.  This module is used by a
-separate process to mirror a mounted remote folder into that local cache.  A
+In sync mode a separate process mirrors the configured source into the local
+cache. In direct mode the worker remains idle and the API reads the source. A
 small SQLite index lets a remote rename be applied as a local ``os.replace``
 instead of downloading the microscopy file again.
 """
@@ -23,6 +23,11 @@ from typing import Callable, Iterator, Optional
 
 from .audit import AuditLog
 from .config import Config
+from .data_source import (
+    SETTINGS_FILENAME, SourceConfigurationError, is_temporary_name as _is_temporary_name,
+    resolve_folder, source_settings,
+    validate_case_folder, validate_sync_roots,
+)
 
 
 log = logging.getLogger(__name__)
@@ -69,15 +74,6 @@ def _safe_relative_path(value: str) -> PurePosixPath:
     if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("Invalid relative sync path")
     return path
-
-
-def _is_temporary_name(name: str) -> bool:
-    lowered = name.lower()
-    return (
-        name.startswith((".", "~"))
-        or name.endswith("~")
-        or any(marker in lowered for marker in (".partial", ".part", ".tmp", ".upload", ".inprogress"))
-    )
 
 
 def is_syncable_image(path: Path) -> bool:
@@ -147,9 +143,13 @@ def _state_path(config: Config, filename: str) -> Path:
 
 def sync_status(config: Config) -> dict:
     """Read the service status without touching the remote mounted folder."""
-    configured = bool(config.remote_data_root)
+    source = source_settings(config)
+    configured = source["mode"] == "sync"
     status = _read_json(_state_path(config, STATUS_FILENAME)) if configured else {}
-    status.setdefault("configured", configured)
+    if status.get("sourceRevision") != source.get("revision"):
+        status = {}
+    status["source"] = source
+    status["configured"] = configured
     status.setdefault("state", "idle" if configured else "disabled")
     status.setdefault("intervalSeconds", config.sync_interval_seconds)
     status["manualRequestPending"] = _state_path(config, REQUEST_FILENAME).exists() if configured else False
@@ -158,8 +158,14 @@ def sync_status(config: Config) -> dict:
 
 def request_manual_sync(config: Config, actor: str = "") -> dict:
     """Queue a sync for the standalone worker and return its current status."""
-    if not config.remote_data_root:
-        raise SyncConfigurationError("Image sync is not configured (set AGH_REMOTE_DATA_ROOT)")
+    with _process_lock(_state_path(config, LOCK_FILENAME), blocking=False):
+        if source_settings(config)["mode"] != "sync":
+            raise SyncConfigurationError("Sync is disabled in direct mode. Select a sync folder first.")
+        _queue_manual_sync(config, actor)
+        return sync_status(config)
+
+
+def _queue_manual_sync(config: Config, actor: str) -> None:
     state_dir = Path(config.sync_state_dir)
     state_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -171,13 +177,32 @@ def request_manual_sync(config: Config, actor: str = "") -> dict:
         "requestedAt": _timestamp(),
         "requestedBy": actor,
     })
-    status = sync_status(config)
-    status["manualRequestPending"] = True
-    return status
+
+
+def save_image_source(config: Config, payload: dict, actor: str = "") -> dict:
+    if not isinstance(payload, dict) or payload.get("mode") not in ("sync", "direct"):
+        raise SourceConfigurationError("Choose sync or direct folder mode")
+    root = resolve_folder(payload.get("folderPath"))
+    validate_case_folder(root)
+    if payload["mode"] == "sync":
+        validate_sync_roots(Path(config.data_root), root)
+    source = {
+        "mode": payload["mode"],
+        "folderPath": payload["folderPath"].strip(),
+        "resolvedPath": str(root),
+        "revision": uuid.uuid4().hex,
+    }
+    # A source cannot change underneath a running remote-authoritative pass.
+    with _process_lock(_state_path(config, LOCK_FILENAME), blocking=False):
+        _atomic_json_write(_state_path(config, SETTINGS_FILENAME), source)
+        _state_path(config, REQUEST_FILENAME).unlink(missing_ok=True)
+        if source["mode"] == "sync":
+            _queue_manual_sync(config, actor)
+        return sync_status(config)
 
 
 @contextmanager
-def _process_lock(path: Path) -> Iterator[None]:
+def _process_lock(path: Path, *, blocking: bool = True) -> Iterator[None]:
     """Prevent accidental duplicate workers on the Linux deployment host."""
     try:
         import fcntl
@@ -186,7 +211,10 @@ def _process_lock(path: Path) -> Iterator[None]:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError as exc:
+            raise SyncConfigurationError("An image sync is running. Wait for it to finish before changing the folder or requesting another sync.") from exc
         try:
             yield
         finally:
@@ -201,6 +229,7 @@ class RemoteImageSync:
         self.local_root = Path(config.data_root)
         self.remote_root = Path(config.remote_data_root) if config.remote_data_root else None
         self.state_dir = Path(config.sync_state_dir)
+        self.source_revision = None
 
     @property
     def index_path(self) -> Path:
@@ -219,8 +248,7 @@ class RemoteImageSync:
             raise SyncConfigurationError("AGH_REMOTE_DATA_ROOT is not configured")
         if not self.remote_root.is_dir():
             raise SyncConfigurationError(f"Remote image folder is unavailable: {self.remote_root}")
-        if self.local_root.resolve() == self.remote_root.resolve():
-            raise SyncConfigurationError("Remote and local image folders must be different")
+        validate_sync_roots(self.local_root, self.remote_root)
         self.local_root.mkdir(parents=True, exist_ok=True)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         try:
@@ -230,8 +258,11 @@ class RemoteImageSync:
 
     def _write_status(self, **payload) -> None:
         current = _read_json(self.status_path)
+        if current.get("sourceRevision") != self.source_revision:
+            current = {}
         current.update(payload)
         current["configured"] = bool(self.remote_root)
+        current["sourceRevision"] = self.source_revision
         current["intervalSeconds"] = self.config.sync_interval_seconds
         current["updatedAt"] = _timestamp()
         current["manualRequestPending"] = _state_path(self.config, REQUEST_FILENAME).exists()
@@ -322,6 +353,10 @@ class RemoteImageSync:
             # partial microscopy upload is commonly written inside one of them.
             child_dirs[:] = [name for name in child_dirs if not _is_temporary_name(name)]
             base = Path(directory)
+            if base == self.remote_root:
+                continue
+            # The viewer reads only root/case/image; ignore deeper directories.
+            child_dirs.clear()
             for name in child_files:
                 source = base / name
                 if not is_syncable_image(source) or source.is_symlink():
@@ -352,6 +387,9 @@ class RemoteImageSync:
         for directory, child_dirs, child_files in os.walk(self.local_root):
             child_dirs[:] = [name for name in child_dirs if not name.startswith(".")]
             base = Path(directory)
+            if base == self.local_root:
+                continue
+            child_dirs.clear()
             for name in child_files:
                 path = base / name
                 if path.is_symlink() or not is_syncable_image(path):
@@ -514,9 +552,8 @@ class RemoteImageSync:
         )
 
     def _remove_empty_local_directories(self) -> None:
-        for directory, _, _ in os.walk(self.local_root, topdown=False):
-            path = Path(directory)
-            if path == self.local_root or path.name.startswith("."):
+        for path in self.local_root.iterdir():
+            if not path.is_dir() or path.is_symlink() or path.name.startswith("."):
                 continue
             try:
                 path.rmdir()
@@ -524,8 +561,16 @@ class RemoteImageSync:
                 pass
 
     def sync_once(self, reason: str = "scheduled", actor: str = "system") -> dict:
+        with _process_lock(self.lock_path):
+            source = source_settings(self.config)
+            if source["mode"] != "sync":
+                return sync_status(self.config)
+            self.remote_root = resolve_folder(source["resolvedPath"])
+            self.source_revision = source.get("revision")
+            return self._sync_once_locked(reason=reason, actor=actor)
+
+    def _sync_once_locked(self, reason: str, actor: str) -> dict:
         """Perform one safe pass.  The remote folder is always authoritative."""
-        self._require_configured_roots()
         started_at = _timestamp()
         log.info("Starting %s image sync: remote=%s local=%s", reason, self.remote_root, self.local_root)
         self._write_status(
@@ -546,147 +591,152 @@ class RemoteImageSync:
         )
         counts = {"remote": 0, "copied": 0, "renamed": 0, "deleted": 0, "unchanged": 0, "deferred": 0}
         try:
-            with _process_lock(self.lock_path):
-                remote_files = self._scan_remote()
-                counts["remote"] = len(remote_files)
-                total_bytes = sum(item.size for item in remote_files)
-                completed_files = 0
-                completed_bytes = 0
+            self._require_configured_roots()
+            remote_files = self._scan_remote()
+            counts["remote"] = len(remote_files)
+            total_bytes = sum(item.size for item in remote_files)
+            completed_files = 0
+            completed_bytes = 0
 
-                def update_progress(phase: str, remote: RemoteFile, current_file_bytes: int = 0) -> None:
-                    self._write_progress(
-                        phase=phase,
-                        total_files=len(remote_files),
-                        completed_files=completed_files,
-                        total_bytes=total_bytes,
-                        completed_bytes=completed_bytes,
-                        current_file=remote.relative_path,
-                        current_file_bytes=current_file_bytes,
-                    )
-
-                def complete_remote(phase: str, remote: RemoteFile) -> None:
-                    nonlocal completed_files, completed_bytes
-                    completed_files += 1
-                    completed_bytes += remote.size
-                    update_progress(phase, remote)
-
+            def update_progress(phase: str, remote: RemoteFile, current_file_bytes: int = 0) -> None:
                 self._write_progress(
-                    phase="checking",
-                    total_files=len(remote_files),
-                    completed_files=0,
-                    total_bytes=total_bytes,
-                    completed_bytes=0,
-                )
-                with self._connect_index() as conn:
-                    rows = list(conn.execute("SELECT * FROM sync_index"))
-                    by_remote = {row["remote_path"]: row for row in rows}
-                    remote_paths = {item.relative_path for item in remote_files}
-                    active_rows: set[str] = set()
-                    preserved_rows: set[str] = set()
-                    moves: list[tuple[sqlite3.Row, RemoteFile]] = []
-                    transfers: list[tuple[Optional[sqlite3.Row], RemoteFile]] = []
-
-                    # Exact paths are either unchanged, changed in place, or
-                    # copied.  They are never used as rename sources.
-                    for remote in remote_files:
-                        row = by_remote.get(remote.relative_path)
-                        destination = self._local_path(remote.relative_path)
-                        if row and self._same_cached_file(destination, remote, row):
-                            active_rows.add(row["file_id"])
-                            self._upsert(conn, row=row, remote=remote, local_path=remote.relative_path)
-                            counts["unchanged"] += 1
-                            complete_remote("checking", remote)
-                        else:
-                            transfers.append((row, remote))
-
-                    # A remote path with no prior index entry can inherit an
-                    # old local cache file only when its identity is unique.
-                    rename_sources = [
-                        row for row in rows
-                        if row["remote_path"] not in remote_paths and row["file_id"] not in active_rows
-                    ]
-                    reserved_ids: set[str] = set()
-                    remaining_transfers: list[tuple[Optional[sqlite3.Row], RemoteFile]] = []
-                    for row, remote in transfers:
-                        if row is not None:
-                            remaining_transfers.append((row, remote))
-                            continue
-                        candidate = self._rename_candidate(remote, rename_sources, reserved_ids)
-                        if candidate is None:
-                            remaining_transfers.append((None, remote))
-                            continue
-                        moves.append((candidate, remote))
-                        reserved_ids.add(candidate["file_id"])
-
-                    self._apply_renames(moves)
-                    for row, remote in moves:
-                        active_rows.add(row["file_id"])
-                        self._upsert(conn, row=row, remote=remote, local_path=remote.relative_path)
-                        counts["renamed"] += 1
-                        complete_remote("renaming", remote)
-
-                    for row, remote in remaining_transfers:
-                        destination = self._local_path(remote.relative_path)
-                        if self._copy_atomic(
-                            remote,
-                            destination,
-                            on_progress=lambda copied, item=remote: update_progress("copying", item, copied),
-                        ):
-                            if row:
-                                active_rows.add(row["file_id"])
-                            self._upsert(conn, row=row, remote=remote, local_path=remote.relative_path)
-                            counts["copied"] += 1
-                        else:
-                            # Do not drop the prior cached image if the source
-                            # changed while it was being copied.  It will be
-                            # retried on the next scheduled/manual pass.
-                            if row:
-                                active_rows.add(row["file_id"])
-                                preserved_rows.add(row["file_id"])
-                            counts["deferred"] += 1
-                        complete_remote("checking", remote)
-
-                    # Any indexed file absent from the remote source is stale.
-                    # This is the one-way, remote-authoritative delete policy.
-                    stale_rows = [row for row in rows if row["file_id"] not in active_rows]
-                    keep_paths = set()
-                    for row in stale_rows:
-                        if row["file_id"] in preserved_rows:
-                            keep_paths.add(row["local_path"])
-                            continue
-                        path = self._local_path(row["local_path"])
-                        try:
-                            log.info("Removing stale cached image: %s", row["local_path"])
-                            path.unlink(missing_ok=True)
-                            counts["deleted"] += 1
-                        except OSError as exc:
-                            log.warning("Could not remove stale cached image %s: %s", path, exc)
-                            keep_paths.add(row["local_path"])
-                            continue
-                        conn.execute("DELETE FROM sync_index WHERE file_id = ?", (row["file_id"],))
-
-                    # On a first run there is no index yet.  Remove unsupported
-                    # stale cache entries too, so the remote is fully
-                    # authoritative rather than merely additive.
-                    desired_paths = {item.relative_path for item in remote_files} | keep_paths
-                    for relative, path in self._scan_local_images() or ():
-                        if relative in desired_paths:
-                            continue
-                        try:
-                            log.info("Removing unindexed stale cached image: %s", relative)
-                            path.unlink(missing_ok=True)
-                            counts["deleted"] += 1
-                        except OSError as exc:
-                            log.warning("Could not remove stale cached image %s: %s", path, exc)
-                    self._remove_empty_local_directories()
-
-                self._write_progress(
-                    phase="finalizing",
+                    phase=phase,
                     total_files=len(remote_files),
                     completed_files=completed_files,
                     total_bytes=total_bytes,
                     completed_bytes=completed_bytes,
+                    current_file=remote.relative_path,
+                    current_file_bytes=current_file_bytes,
                 )
+
+            def complete_remote(phase: str, remote: RemoteFile) -> None:
+                nonlocal completed_files, completed_bytes
+                completed_files += 1
+                completed_bytes += remote.size
+                update_progress(phase, remote)
+
+            self._write_progress(
+                phase="checking",
+                total_files=len(remote_files),
+                completed_files=0,
+                total_bytes=total_bytes,
+                completed_bytes=0,
+            )
+            with self._connect_index() as conn:
+                # Older workers may have indexed nested files. Leave those
+                # files untouched when syncing the viewer's direct case images.
+                rows = [
+                    row for row in conn.execute("SELECT * FROM sync_index")
+                    if len(_safe_relative_path(row["local_path"]).parts) == 2
+                ]
+                by_remote = {row["remote_path"]: row for row in rows}
+                remote_paths = {item.relative_path for item in remote_files}
+                active_rows: set[str] = set()
+                preserved_rows: set[str] = set()
+                moves: list[tuple[sqlite3.Row, RemoteFile]] = []
+                transfers: list[tuple[Optional[sqlite3.Row], RemoteFile]] = []
+
+                # Exact paths are either unchanged, changed in place, or
+                # copied.  They are never used as rename sources.
+                for remote in remote_files:
+                    row = by_remote.get(remote.relative_path)
+                    destination = self._local_path(remote.relative_path)
+                    if row and self._same_cached_file(destination, remote, row):
+                        active_rows.add(row["file_id"])
+                        self._upsert(conn, row=row, remote=remote, local_path=remote.relative_path)
+                        counts["unchanged"] += 1
+                        complete_remote("checking", remote)
+                    else:
+                        transfers.append((row, remote))
+
+                # A remote path with no prior index entry can inherit an
+                # old local cache file only when its identity is unique.
+                rename_sources = [
+                    row for row in rows
+                    if row["remote_path"] not in remote_paths and row["file_id"] not in active_rows
+                ]
+                reserved_ids: set[str] = set()
+                remaining_transfers: list[tuple[Optional[sqlite3.Row], RemoteFile]] = []
+                for row, remote in transfers:
+                    if row is not None:
+                        remaining_transfers.append((row, remote))
+                        continue
+                    candidate = self._rename_candidate(remote, rename_sources, reserved_ids)
+                    if candidate is None:
+                        remaining_transfers.append((None, remote))
+                        continue
+                    moves.append((candidate, remote))
+                    reserved_ids.add(candidate["file_id"])
+
+                self._apply_renames(moves)
+                for row, remote in moves:
+                    active_rows.add(row["file_id"])
+                    self._upsert(conn, row=row, remote=remote, local_path=remote.relative_path)
+                    counts["renamed"] += 1
+                    complete_remote("renaming", remote)
+
+                for row, remote in remaining_transfers:
+                    destination = self._local_path(remote.relative_path)
+                    if self._copy_atomic(
+                        remote,
+                        destination,
+                        on_progress=lambda copied, item=remote: update_progress("copying", item, copied),
+                    ):
+                        if row:
+                            active_rows.add(row["file_id"])
+                        self._upsert(conn, row=row, remote=remote, local_path=remote.relative_path)
+                        counts["copied"] += 1
+                    else:
+                        # Do not drop the prior cached image if the source
+                        # changed while it was being copied.  It will be
+                        # retried on the next scheduled/manual pass.
+                        if row:
+                            active_rows.add(row["file_id"])
+                            preserved_rows.add(row["file_id"])
+                        counts["deferred"] += 1
+                    complete_remote("checking", remote)
+
+                # Any indexed file absent from the remote source is stale.
+                # This is the one-way, remote-authoritative delete policy.
+                stale_rows = [row for row in rows if row["file_id"] not in active_rows]
+                keep_paths = set()
+                for row in stale_rows:
+                    if row["file_id"] in preserved_rows:
+                        keep_paths.add(row["local_path"])
+                        continue
+                    path = self._local_path(row["local_path"])
+                    try:
+                        log.info("Removing stale cached image: %s", row["local_path"])
+                        path.unlink(missing_ok=True)
+                        counts["deleted"] += 1
+                    except OSError as exc:
+                        log.warning("Could not remove stale cached image %s: %s", path, exc)
+                        keep_paths.add(row["local_path"])
+                        continue
+                    conn.execute("DELETE FROM sync_index WHERE file_id = ?", (row["file_id"],))
+
+                # On a first run there is no index yet.  Remove unsupported
+                # stale cache entries too, so the remote is fully
+                # authoritative rather than merely additive.
+                desired_paths = {item.relative_path for item in remote_files} | keep_paths
+                for relative, path in self._scan_local_images() or ():
+                    if relative in desired_paths:
+                        continue
+                    try:
+                        log.info("Removing unindexed stale cached image: %s", relative)
+                        path.unlink(missing_ok=True)
+                        counts["deleted"] += 1
+                    except OSError as exc:
+                        log.warning("Could not remove stale cached image %s: %s", path, exc)
+                self._remove_empty_local_directories()
+
+            self._write_progress(
+                phase="finalizing",
+                total_files=len(remote_files),
+                completed_files=completed_files,
+                total_bytes=total_bytes,
+                completed_bytes=completed_bytes,
+            )
 
             result = {
                 "state": "idle",
@@ -743,6 +793,9 @@ class RemoteImageSyncService:
     def run_forever(self) -> None:
         next_scheduled = 0.0  # Populate an empty local cache when the service starts.
         while True:
+            if source_settings(self.config)["mode"] != "sync":
+                time.sleep(self.config.sync_poll_seconds)
+                continue
             request = _read_json(_state_path(self.config, REQUEST_FILENAME))
             manual = bool(request.get("requestId"))
             now = time.monotonic()

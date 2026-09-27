@@ -12,9 +12,10 @@ from .audit import audit_event, install_audit
 from .auth import ROLES, UserError, has_permission, install_auth
 from .collaboration_service import CollaborationService, collaboration_actor
 from .config import Config
+from .data_source import SourceConfigurationError, image_source_id
 from .ef_uploads import register_ef_routes
 from .errors import APIError
-from .image_sync import SyncConfigurationError, request_manual_sync, sync_status
+from .image_sync import SyncConfigurationError, request_manual_sync, save_image_source, sync_status
 from .path_guard import image_path, list_cases, list_image_files
 from .tiff_service import RawChannelCache, get_metadata, render_preview_png, render_raw_image_png
 
@@ -130,7 +131,7 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("view")
         if denied:
             return denied
-        return jsonify({"cases": list_cases(cfg.data_root)})
+        return jsonify({"cases": list_cases(cfg.active_data_root)})
 
     @app.route("/agh/api/admin/users")
     def admin_users():
@@ -263,6 +264,21 @@ def create_app(config: Optional[Config] = None):
         audit_event(action="IMAGE_SYNC_QUEUED", result="pending", details={"source": "remote-cache"})
         return jsonify(status), 202
 
+    @app.route("/agh/api/admin/image-sync", methods=["PUT"])
+    def admin_set_image_source():
+        denied = require_permission("manage_users")
+        if denied:
+            return denied
+        actor = getattr(g, "remote_user", "") or ""
+        try:
+            status = save_image_source(cfg, request.get_json(silent=True), actor=actor)
+        except SourceConfigurationError as exc:
+            return admin_error(str(exc), 400)
+        except SyncConfigurationError as exc:
+            return admin_error(str(exc), 409)
+        audit_event(action="IMAGE_SOURCE_CHANGED", result="success", details=status["source"])
+        return jsonify(status)
+
     @app.route("/agh/api/account/password", methods=["POST"])
     def change_own_password():
         username = getattr(g, "remote_user", "") or ""
@@ -314,23 +330,23 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("view")
         if denied:
             return denied
-        return jsonify({"files": list_image_files(cfg.data_root, case)})
+        return jsonify({"files": list_image_files(cfg.active_data_root, case)})
 
     @app.route("/agh/api/cases/<path:case>/files/<path:filename>/meta")
     def image_meta(case, filename):
         denied = require_permission("view")
         if denied:
             return denied
-        path = image_path(cfg.data_root, case, filename)
+        path = image_path(cfg.active_data_root, case, filename)
         audit_event(action="VIEW_IMAGE", case_id=case, filename=filename, result="success")
-        return jsonify(get_metadata(path))
+        return jsonify({**get_metadata(path), "sourceId": image_source_id(path)})
 
     @app.route("/agh/api/cases/<path:case>/files/<path:filename>/image")
     def get_image(case, filename):
         denied = require_permission("view")
         if denied:
             return denied
-        path = image_path(cfg.data_root, case, filename)
+        path = image_path(cfg.active_data_root, case, filename)
         audit_event(action="VIEW_IMAGE", case_id=case, filename=filename, result="success")
         return send_file(render_raw_image_png(path), mimetype="image/png", max_age=0)
 
@@ -339,7 +355,7 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("view")
         if denied:
             return denied
-        path = image_path(cfg.data_root, case, filename)
+        path = image_path(cfg.active_data_root, case, filename)
         versioned = bool(request.args.get("v"))
         response = send_file(
             render_preview_png(path, request.args.get("max"), z_index_arg()),
@@ -347,7 +363,7 @@ def create_app(config: Optional[Config] = None):
             max_age=cfg.versioned_response_cache_seconds if versioned else 0,
         )
         stat = path.stat()
-        response.set_etag(f"preview-{stat.st_size}-{stat.st_mtime_ns}-{request.args.get('max') or ''}-{z_index_arg()}")
+        response.set_etag(f"preview-{image_source_id(path)}-{stat.st_size}-{stat.st_mtime_ns}-{request.args.get('max') or ''}-{z_index_arg()}")
         response.headers["Cache-Control"] = (
             f"private, max-age={cfg.versioned_response_cache_seconds}, immutable"
             if versioned else "private, no-cache"
@@ -359,12 +375,12 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("view")
         if denied:
             return denied
-        path = image_path(cfg.data_root, case, filename)
+        path = image_path(cfg.active_data_root, case, filename)
         versioned = bool(request.args.get("v"))
         z_index = z_index_arg()
         response = raw_octet_response(raw_channel_cache.channel_bytes(path, channel_index, z_index).getvalue())
         stat = path.stat()
-        response.set_etag(f"{stat.st_size}-{stat.st_mtime_ns}-{channel_index}-{z_index}")
+        response.set_etag(f"{image_source_id(path)}-{stat.st_size}-{stat.st_mtime_ns}-{channel_index}-{z_index}")
         response.headers["Cache-Control"] = (
             f"private, max-age={cfg.versioned_response_cache_seconds}, immutable"
             if versioned else "private, no-cache"
@@ -376,7 +392,7 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("view")
         if denied:
             return denied
-        image_path(cfg.data_root, case, filename)
+        image_path(cfg.active_data_root, case, filename)
         return jsonify(annotations.get(case, filename))
 
     @app.route("/agh/api/cases/<path:case>/files/<path:filename>/annotations", methods=["PUT"])
@@ -384,7 +400,7 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("annotate")
         if denied:
             return denied
-        image_path(cfg.data_root, case, filename)
+        image_path(cfg.active_data_root, case, filename)
         # Attribution is taken from the authenticated session, never from a
         # client-supplied header or body field, so it cannot be forged.
         updated_by = getattr(g, "remote_user", "") or ""
@@ -421,9 +437,9 @@ def create_app(config: Optional[Config] = None):
         case_id = payload.get("caseId")
         filename = payload.get("filename")
         if case_id and filename:
-            image_path(cfg.data_root, case_id, filename)
+            image_path(cfg.active_data_root, case_id, filename)
         elif case_id:
-            list_image_files(cfg.data_root, case_id)
+            list_image_files(cfg.active_data_root, case_id)
         return jsonify(collaboration.heartbeat(client_id_from(payload), current_actor(payload)))
 
     @app.route("/agh/api/collaboration/workspace", methods=["PATCH"])
@@ -439,7 +455,7 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("view")
         if denied:
             return denied
-        image_path(cfg.data_root, case, filename)
+        image_path(cfg.active_data_root, case, filename)
         return jsonify(collaboration.get_view_state(case, filename))
 
     @app.route("/agh/api/cases/<path:case>/files/<path:filename>/view-state", methods=["PATCH"])
@@ -447,7 +463,7 @@ def create_app(config: Optional[Config] = None):
         denied = require_permission("view")
         if denied:
             return denied
-        image_path(cfg.data_root, case, filename)
+        image_path(cfg.active_data_root, case, filename)
         payload = request.get_json(silent=True) or {}
         return jsonify(collaboration.update_view_state(case, filename, current_actor(payload), payload))
 
@@ -484,6 +500,7 @@ def create_app(config: Optional[Config] = None):
                 "includeAnnotations": payload.get("includeAnnotations") is True,
                 "includeAnnotationNames": payload.get("includeAnnotationNames") is True,
                 "includeSegmentationPredictions": payload.get("includeSegmentationPredictions") is True,
+                "includeThicknessPlot": payload.get("includeThicknessPlot") is True,
             },
         )
         return jsonify({"ok": True})

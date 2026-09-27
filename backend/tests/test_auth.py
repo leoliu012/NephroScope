@@ -500,6 +500,7 @@ class AuthApiTests(unittest.TestCase):
                     "includeAnnotations": True,
                     "includeAnnotationNames": False,
                     "includeSegmentationPredictions": True,
+                    **({"includeThicknessPlot": True} if export_format == "pdf" else {}),
                 },
                 headers=headers,
             )
@@ -520,12 +521,14 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual([event["action"] for event in exports], ["EXPORT_PDF", "EXPORT_PNG", "EXPORT_JPEG"])
         self.assertEqual(exports[-1]["case_id"], "case1")
         self.assertEqual(exports[-1]["filename"], "image.tif")
+        self.assertTrue(exports[0]["details"]["includeThicknessPlot"])
         self.assertEqual(
             exports[-1]["details"],
             {
                 "includeAnnotations": True,
                 "includeAnnotationNames": False,
                 "includeSegmentationPredictions": True,
+                "includeThicknessPlot": False,
             },
         )
 

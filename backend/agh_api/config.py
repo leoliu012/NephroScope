@@ -33,9 +33,8 @@ class Config:
     ef_upload_max_bytes: int = 2048 * 1024 * 1024
     ef_upload_ttl_seconds: int = 24 * 60 * 60
     # --- Remote image-cache synchronization --------------------------------
-    # ``data_root`` always remains the path used by the API.  When configured,
-    # ``remote_data_root`` is a mounted source copied into that local cache by
-    # the separate image-sync service.
+    # ``data_root`` remains the local sync cache. Admin settings may instead
+    # select a direct source, exposed to readers through ``active_data_root``.
     remote_data_root: Optional[Path] = None
     sync_state_dir: Path = Path("/var/lib/agh-viewer/localdata-sync")
     sync_interval_seconds: int = 24 * 60 * 60
@@ -50,6 +49,11 @@ class Config:
     analysis_lease_seconds: int = 60 * 60
     analysis_poll_seconds: float = 1.0
     inference_device: str = "auto"
+
+    @property
+    def active_data_root(self) -> Path:
+        from .data_source import active_data_root
+        return active_data_root(self)
 
     def __post_init__(self):
         analysis_root = self.analysis_root or (Path(self.users_file).parent / "analysis")
