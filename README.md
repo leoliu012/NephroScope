@@ -1,12 +1,78 @@
 # NephroScope
 
-Web-based renal microscopy image viewer for TIFF images and JSON annotations.
+NephroScope is a web application for viewing renal microscopy images, annotating
+structures, and analyzing glomerular basement membrane (GBM) thickness with
+machine-learning segmentation. It brings TIFF/ND2 viewing, MorphoGBM predictions,
+ROI measurements, case comparisons, and image/report export into one workflow.
 
-The viewer supports adjustable annotation color and stroke thickness, editable text annotations with font sizing, and calibrated ruler measurements. Pixel size is read from TIFF metadata when available; otherwise the viewer uses the explicit default calibration `0.106872 µm/px` and marks it as a default in the bottom status bar.
+Segmentation and thickness measurements are for research use only and are not
+validated for clinical diagnosis or treatment decisions.
 
-The project intentionally stays simple: Apache serves the React build at `/agh/`, proxies `/agh/api/` to a Flask API running behind Gunicorn, and a separate worker mirrors a mounted remote image folder into the local cache.
+## Key features
+
+### 1. Multi-channel image viewing and annotation
+
+Browse cases with image previews, open TIFF or ND2 images, and move through Z
+slices. Adjust each channel's marker label, color, visibility, intensity window,
+brightness, contrast, and inversion without changing the source image.
+
+Pan and zoom, then add points, lines, arrows, rectangles, ellipses, freehand
+outlines, editable text, or calibrated rulers. Annotation colors, stroke widths,
+and text sizes are adjustable; revision checks protect against conflicting saves.
+Pixel size comes from image metadata when available, with a visibly labeled
+`0.106872 µm/px` fallback.
+
+### 2. ML segmentation and ROI thickness measurement
+
+Run MorphoGBM v10 on a selected channel and Z view to segment the GBM. Stack
+analysis uses an up-to-five-plane maximum-intensity projection (Z-MIP).
+Predictions are saved per Z slice and can be revisited or deleted individually.
+
+Inspect the segmentation mask and saved thickness skeleton over the source image,
+with adjustable overlay colors, mask opacity, and skeleton line width. Draw a
+polygon ROI to measure average GBM thickness and compare observed values with
+expansion-factor (EF) adjusted values using the current calibration.
+
+### 3. In-viewer thickness analysis
+
+Select **Run thickness analysis** to open the **Thickness** tab. Choose a channel
+and Z sampling gap, then inspect the pooled image distribution or separate box
+plots for each analyzed Z slice. Results include sample counts, quartiles, median,
+whiskers, range, and outlier counts.
+
+Matching saved segmentations are reused. Results retain their analysis calibration,
+and the viewer flags settings that have changed since the analysis was run.
+
+### 4. Compare thickness across cases and images
+
+Open **Case analysis** to select cases and images, sample their Z slices, and
+compare thickness distributions grouped by case, image, or image/Z slice.
+Automatic selection uses the Post and 60X filename groups; manual selection is
+available when a case has no matching images.
+
+Change grouping, included images, units, or observed versus EF-adjusted thickness
+to explore the results. Box-plot statistics use all saved full-mask centerline
+samples, rather than averages of images or cases. Queued jobs continue after
+leaving the page, and reopening it in the same browser restores the comparison.
+
+### 5. Export images with analysis results
+
+Export the current image as PDF, PNG, or JPEG, with optional annotations and
+model overlays. Enable **Include thickness box plot and statistics** to include
+the current Thickness tab results. PDF exports add report pages; PNG/JPEG exports
+append the report below the image. Partial analyses are labeled in the report.
+
+### 6. Configurable image sources and shared review
+
+Admins can select **Administration → Project image folder** to read a folder
+directly or synchronize a mounted source into a local cache. Per-user accounts,
+roles, audit events, and revisioned annotations support shared review.
 
 ## Architecture
+
+Apache serves the React build at `/agh/` and proxies `/agh/api/` to a Flask API
+behind Gunicorn. A separate model worker processes segmentation jobs, and an
+image-sync worker mirrors a mounted source folder when sync mode is enabled.
 
 ```text
 Mounted remote image folder
@@ -256,30 +322,7 @@ Both:
 make test
 ```
 
-## Viewer Features
-
-- Case and TIFF browser
-- Bounded auto-adjusted TIFF previews in the case browser; the TIFF source is never modified
-- Per-channel marker / antibody mapping, visibility, display color, min/max windowing, brightness, contrast, and black/white inversion
-- Pan and zoom
-- Point, line, arrow, rectangle, ellipse, freehand, text, and calibrated ruler annotations
-- Adjustable annotation color, stroke thickness, and text size
-- Pixel calibration from image metadata with a visible `0.106872 µm/px` fallback
-- Revisioned annotation save with conflict detection
-- PDF export with or without annotation overlay
-- MorphoGBM v10 GBM segmentation for the current Z view, with a five-plane
-  Z-MIP for stacks and the supplied fluorescence contrast enhancement
-- Client-adjustable segmentation overlay color, visibility, and opacity
-- Exact saved GBM thickness-skeleton overlay with independent visibility,
-  color, and rendered line-width controls
-- Persistent per-Z predictions with running/segmented Z labels and explicit
-  per-slice deletion
-- Polygon ROI measurement of average GBM thickness using full-mask
-  skeleton/Euclidean-distance geometry, showing both observed and
-  EF-adjusted values that follow the current pixel-size/EF settings
-- Case analysis for every user role: choose cases, review automatically selected
-  Post 60X images, run selected Z slices, and compare full-sample GBM thickness box
-  plots by case, image, or image/Z slice. Matching saved segmentations are reused.
+## Analysis workflow details
 
 Open **Case analysis** from the files-browser header. Automatic selection uses
 the files browser's Post and 60X filename groups. Cases with no matching images
