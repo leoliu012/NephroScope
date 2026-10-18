@@ -45,3 +45,24 @@ export function annotationListPages(entries, { title = 'Annotations', notice = '
   }
   return pages
 }
+
+export function canvasBlob(canvas, mimeType, quality) {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(blob => {
+      if (blob) resolve(blob)
+      else reject(new Error('The browser could not create the export file'))
+    }, mimeType, quality)
+  })
+}
+
+export function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}

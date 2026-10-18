@@ -1,6 +1,7 @@
 import { useId } from 'react'
 import {
-  PLOT_LAYOUT, densityCurve, distributionPlotSize, formatAxisValue, formatThickness, niceScale, plotDomain, thicknessAxisTitle,
+  PLOT_LAYOUT, densityCurve, distributionPlotSize, formatAxisValue, formatThickness, labelChars, middleEllipsis, niceScale,
+  plotDomain, thicknessAxisTitle, wrapLabel,
 } from '../thicknessStats.js'
 
 const PALETTE = {
@@ -10,13 +11,6 @@ const PALETTE = {
 const INK = {
   dark: { text: 'var(--text)', muted: 'var(--text-muted)', subtle: 'var(--text-subtle)', grid: 'var(--border-strong)', minor: 'var(--border)', axis: 'var(--text-subtle)', meanStroke: '#0b0e12' },
   light: { text: '#182230', muted: '#475467', subtle: '#667085', grid: '#d0d5dd', minor: '#eef0f3', axis: '#98a2b3', meanStroke: '#ffffff' },
-}
-
-function middleEllipsis(text, max) {
-  const value = String(text || '')
-  if (value.length <= max) return value
-  const head = Math.ceil((max - 1) * 0.55)
-  return `${value.slice(0, head)}…${value.slice(value.length - (max - 1 - head))}`
 }
 
 function groupTitle(group) {
@@ -74,7 +68,8 @@ export default function ThicknessDistributionPlot({
   const range = domain || plotDomain(groups, focus)
   const scale = niceScale(range.min, range.max, compact ? 4 : 7)
 
-  const { width, plotLeft, plotRight, rowHeight, top } = compact ? PLOT_LAYOUT.compact : PLOT_LAYOUT.full
+  const { width, labelLeft, labelRight, plotLeft, plotRight, rowHeight, top } = compact ? PLOT_LAYOUT.compact : PLOT_LAYOUT.full
+  const labelWidth = labelRight - labelLeft
   const rowsBottom = top + groups.length * rowHeight
   const { height } = distributionPlotSize(groups.length, compact)
   const x = value => plotLeft + (plotRight - plotLeft) * (value - scale.min) / (scale.max - scale.min)
@@ -84,10 +79,13 @@ export default function ThicknessDistributionPlot({
       fontFamily="Arial, Helvetica, sans-serif" className={`ca-distribution-plot${compact ? ' ca-distribution-compact' : ''}`}
       viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`GBM thickness distributions in ${unit}`}>
       <title>GBM thickness distributions: mean, median, interquartile range and density</title>
-      <defs><clipPath id={clipId}><rect x={plotLeft} y={top - 4} width={plotRight - plotLeft} height={rowsBottom - top + 8} /></clipPath></defs>
+      <defs>
+        <clipPath id={clipId}><rect x={plotLeft} y={top - 4} width={plotRight - plotLeft} height={rowsBottom - top + 8} /></clipPath>
+        <clipPath id={`${clipId}-labels`}><rect x={0} y={top} width={compact ? width : labelRight} height={rowsBottom - top} /></clipPath>
+      </defs>
       <Legend x={compact ? 4 : plotLeft} y={14} ink={ink} color={colors[0]} compact={compact} />
       {!compact && <>
-        <text x={16} y={top - 8} fill={ink.subtle} fontSize="11" fontWeight="600">Comparison group</text>
+        <text x={labelLeft} y={top - 8} fill={ink.subtle} fontSize="11" fontWeight="600">Comparison group</text>
         <text x={width - 14} y={top - 8} fill={ink.subtle} fontSize="11" fontWeight="600" textAnchor="end">Mean ± SD</text>
       </>}
 
@@ -97,21 +95,26 @@ export default function ThicknessDistributionPlot({
       {groups.map((group, index) => {
         const stats = group.summary
         const rowTop = top + index * rowHeight
-        const cy = rowTop + (compact ? 44 : 38)
+        const cy = rowTop + (compact ? 44 : 42)
+        const titleLines = compact ? [] : wrapLabel(groupTitle(group), labelChars(labelWidth, 12.5, true), 2)
+        const titleY = titleLines.length > 1 ? [rowTop + 22, rowTop + 37] : [rowTop + 30]
+        const subtitleY = titleLines.length > 1 ? rowTop + 53 : rowTop + 47
         const color = colorFor(group)
         const curve = densityCurve(group.values, group.counts, scale, compact ? 64 : 110, { spread: stats.q3 - stats.q1 })
         const description = `${groupTitle(group)}: mean ${formatThickness(stats.mean, unit)} (SD ${formatThickness(stats.sd, unit)}), median ${formatThickness(stats.median, unit)}, IQR ${formatThickness(stats.q1, unit, { withUnit: false })}–${formatThickness(stats.q3, unit)}, ${stats.count.toLocaleString()} points`
         return <g key={group.key} role="img" aria-label={description}>
           <title>{description}</title>
           {index > 0 && <line x1={compact ? 4 : 12} x2={width - (compact ? 4 : 12)} y1={rowTop} y2={rowTop} stroke={ink.grid} strokeOpacity="0.55" />}
-          {compact ? <>
-            <text x={4} y={rowTop + 15} fill={ink.text} fontSize="11.5" fontWeight="600">{middleEllipsis(groupTitle(group), 24)}</text>
+          {compact ? <g clipPath={`url(#${clipId}-labels)`}>
+            <text x={labelLeft} y={rowTop + 15} fill={ink.text} fontSize="11.5" fontWeight="600">{middleEllipsis(groupTitle(group), labelChars(labelWidth - 80, 11.5, true))}</text>
             <text x={width - 4} y={rowTop + 15} fill={ink.text} fontSize="11.5" fontWeight="700" textAnchor="end">{formatThickness(stats.mean, unit)}</text>
-            <text x={4} y={rowTop + 27} fill={ink.subtle} fontSize="9.5">{`n = ${stats.count.toLocaleString()}`}</text>
+            <text x={labelLeft} y={rowTop + 27} fill={ink.subtle} fontSize="9.5">{`n = ${stats.count.toLocaleString()}`}</text>
             <text x={width - 4} y={rowTop + 27} fill={ink.subtle} fontSize="9.5" textAnchor="end">{`± ${formatThickness(stats.sd, unit, { withUnit: false })} SD`}</text>
-          </> : <>
-            <text x={16} y={cy - 4} fill={ink.text} fontSize="12.5" fontWeight="600">{middleEllipsis(groupTitle(group), 38)}</text>
-            <text x={16} y={cy + 12} fill={ink.subtle} fontSize="10.5">{middleEllipsis(groupSubtitle(group), 46)}</text>
+          </g> : <>
+            <g clipPath={`url(#${clipId}-labels)`}>
+              {titleLines.map((line, i) => <text key={i} x={labelLeft} y={titleY[i]} fill={ink.text} fontSize="12.5" fontWeight="600">{line}</text>)}
+              <text x={labelLeft} y={subtitleY} fill={ink.subtle} fontSize="10.5">{middleEllipsis(groupSubtitle(group), labelChars(labelWidth, 10.5))}</text>
+            </g>
             <text x={width - 14} y={cy + 1} fill={ink.text} fontSize="14" fontWeight="700" textAnchor="end">{formatThickness(stats.mean, unit, { withUnit: false })}</text>
             <text x={width - 14} y={cy + 15} fill={ink.subtle} fontSize="10.5" textAnchor="end">{`± ${formatThickness(stats.sd, unit, { withUnit: false })} ${unit}`}</text>
           </>}

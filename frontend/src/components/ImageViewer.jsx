@@ -37,7 +37,7 @@ import {
   BarChart3,
 } from 'lucide-react'
 import { jsPDF } from 'jspdf'
-import { annotationListPages } from '../exportPages.js'
+import { annotationListPages, canvasBlob, downloadBlob } from '../exportPages.js'
 import AnnotationLayer from './AnnotationLayer.jsx'
 import ChannelControls from './ChannelControls.jsx'
 import ModelMaskOverlay from './ModelMaskOverlay.jsx'
@@ -275,27 +275,6 @@ async function exportCanvasFromViewer(sourceCanvas, svg, {
   }
 
   return output
-}
-
-function canvasBlob(canvas, mimeType, quality) {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(blob => {
-      if (blob) resolve(blob)
-      else reject(new Error('The browser could not create the export file'))
-    }, mimeType, quality)
-  })
-}
-
-function downloadBlob(blob, filename) {
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = filename
-  anchor.style.display = 'none'
-  document.body.appendChild(anchor)
-  anchor.click()
-  anchor.remove()
-  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 async function waitForRenderedPredictionCanvas(container, selector, sourceCanvas) {

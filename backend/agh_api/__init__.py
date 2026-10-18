@@ -502,6 +502,11 @@ def create_app(config: Optional[Config] = None):
                 "includeAnnotationNames": payload.get("includeAnnotationNames") is True,
                 "includeSegmentationPredictions": payload.get("includeSegmentationPredictions") is True,
                 "includeThicknessPlot": payload.get("includeThicknessPlot") is True,
+                **(
+                    {"caseAnalysisId": payload["caseAnalysisId"]}
+                    if isinstance(payload.get("caseAnalysisId"), str) and len(payload["caseAnalysisId"]) <= 64
+                    else {}
+                ),
             },
         )
         return jsonify({"ok": True})

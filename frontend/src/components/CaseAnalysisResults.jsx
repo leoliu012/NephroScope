@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { CircleStop, FilePlus2, Loader2, Play } from 'lucide-react'
+import { CircleStop, Download, FilePlus2, Loader2, Play } from 'lucide-react'
 import {
   analysisGapLabel, analysisTitle, analysisToBatch, batchProgress, comparisonGroups, gapShortLabel,
   monitorSavedAnalysis, savedAnalyses,
 } from '../caseAnalysis.js'
+import { authFetch } from '../auth.js'
 import { caseAnalysisSession } from '../caseAnalysisSession.js'
 import { compareAlphanumeric } from '../collectionOrganization.js'
 import { AnalysisStatusBadge, analysisStatusText } from './CaseAnalysisStatus.jsx'
@@ -130,7 +131,9 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
   const [observed, setObserved] = useState(false)
   const [focus, setFocus] = useState(true)
   const [excluded, setExcluded] = useState([])
-  useEffect(() => { setExcluded([]); setNotice('') }, [id])
+  const [exporting, setExporting] = useState('')
+  const [exportError, setExportError] = useState('')
+  useEffect(() => { setExcluded([]); setNotice(''); setExportError('') }, [id])
 
   const batch = useMemo(() => analysisToBatch(analysis, distributions), [analysis, distributions])
   const progress = batchProgress(batch?.jobs)
@@ -166,6 +169,26 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
     if (failed) setError(`${failed} Z slice${failed === 1 ? '' : 's'} could not be queued: ${Object.values(next.submitErrors)[0]}`)
   })
   const cancelJobs = jobIds => run('cancel', () => savedAnalyses.cancelJobs(id, jobIds))
+  const exportDistributions = async format => {
+    setExporting(format)
+    setExportError('')
+    try {
+      const { exportCaseAnalysisDistributions } = await import('../thicknessExport.jsx')
+      await exportCaseAnalysisDistributions({
+        format, title: analysisTitle(analysis), analysis, gapLabel: analysisGapLabel(analysis), groups, progress,
+        groupBy, unit, observed, focus, excludedCount: excluded.length,
+      })
+      authFetch('/agh/api/audit/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ format, caseAnalysisId: analysis.id, includeThicknessPlot: true }),
+      }).catch(() => {})
+    } catch (err) {
+      setExportError(err.message || 'Unable to export the distributions')
+    } finally {
+      setExporting('')
+    }
+  }
 
   const status = analysis.status
   const running = status === 'running'
@@ -227,9 +250,19 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
 
     <section className="ux-card ca-card">
       <div className="ca-inline ca-between">
-        <h2>GBM thickness distributions</h2>
-        <span className="ca-z-pill">{gapShortLabel(analysis.gap)} · {progress.complete}/{progress.total} Z runs</span>
+        <div className="ca-inline ca-results-title">
+          <h2>GBM thickness distributions</h2>
+          <span className="ca-z-pill">{gapShortLabel(analysis.gap)} · {progress.complete}/{progress.total} Z runs</span>
+        </div>
+        <div className="ca-inline ca-export-actions">
+          {['pdf', 'png'].map(format => <button key={format} type="button" className="ux-button ux-button-secondary"
+            disabled={!groups.length || Boolean(exporting)} onClick={() => exportDistributions(format)}
+            title={format === 'pdf' ? 'Plot and statistics as a PDF, one page per 8 groups' : 'Plot and statistics as one PNG image'}>
+            {exporting === format ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}Export {format.toUpperCase()}
+          </button>)}
+        </div>
       </div>
+      {exportError && <p role="alert" className="ca-error">{exportError}</p>}
       {progress.complete < progress.total && <p className="ca-warning">Partial results: {progress.complete} of {progress.total} Z runs included.</p>}
       <div className="ca-plot-controls">
         <label className="ca-field">Compare by<select className="ux-input" value={groupBy} onChange={event => setGroupBy(event.target.value)}><option value="case">Case</option><option value="image">Image within case</option><option value="slice">Image and Z slice</option></select></label>

@@ -151,7 +151,7 @@
 /* Results */
 .ca-plot-controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: end; padding: 14px 0; }
 .ca-plot-scroll, .ca-table-scroll { width: 100%; overflow-x: auto; }
-.ca-distribution-plot { display: block; width: 100%; min-width: 760px; max-width: 1180px; margin: 10px 0; }
+.ca-distribution-plot { display: block; width: 100%; min-width: 820px; max-width: 1240px; margin: 10px 0; }
 .ca-distribution-plot.ca-distribution-compact { min-width: 0; max-width: none; margin: 0; }
 .ca-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 14px; font-variant-numeric: tabular-nums; }
 .ca-table th, .ca-table td { border-top: 1px solid var(--border); padding: 9px 12px; text-align: right; white-space: nowrap; }
@@ -161,6 +161,9 @@
 .ca-table-swatch { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 2px; vertical-align: 1px; }
 .ca-table-mean { font-weight: 700; color: var(--text); font-size: 13px; }
 .ca-table-mean span { font-weight: 400; color: var(--text-subtle); font-size: 11px; }
+.ca-export-actions { gap: 8px; }
+.ca-export-actions .ux-button { min-height: 30px; padding: 5px 10px; font-size: 12px; }
+.ca-results-title > h2 { margin-bottom: 0; }
 .ca-comparison-filter { margin-bottom: 8px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 4px 0; }
 
 @media (max-width: 900px) { .ca-gap-options { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
