@@ -13,6 +13,9 @@ from .errors import BadRequest, Conflict, NotFound
 
 ACTIVE_CACHE_STATUSES = ("QUEUED", "RUNNING", "SUCCEEDED")
 TERMINAL_STATUSES = ("SUCCEEDED", "FAILED")
+# Reusable results first, then active work, then the newest failure/cancellation.
+RUN_PRIORITY = {"SUCCEEDED": 0, "RUNNING": 1, "QUEUED": 1, "FAILED": 2, "CANCELED": 2}
+CASE_ANALYSIS_STATES = ("active", "interrupted")
 
 
 class LeaseLost(RuntimeError):
@@ -84,6 +87,49 @@ class AnalysisStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_analysis_cache_status
                 ON analysis_runs(cache_key, status)
+                """
+            )
+            # Saved case analyses reference runs by cache key, so a slice
+            # completed by any analysis (or the viewer) counts for all of them.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS case_analyses (
+                    analysis_id TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    signature TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    definition_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_case_analyses_owner_signature
+                ON case_analyses(owner, signature)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS case_analysis_jobs (
+                    analysis_id TEXT NOT NULL,
+                    job_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    case_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    z_index INTEGER NOT NULL,
+                    channel_index INTEGER NOT NULL,
+                    cache_key TEXT NOT NULL,
+                    legacy_cache_key TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY (analysis_id, job_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_case_analysis_jobs_cache
+                ON case_analysis_jobs(cache_key)
                 """
             )
 
@@ -218,6 +264,9 @@ class AnalysisStore:
         priority = {"RUNNING": 0, "QUEUED": 0, "SUCCEEDED": 1, "FAILED": 2}
         for row in rows:
             run = _row_to_dict(row)
+            if run["status"] == "CANCELED":
+                # A cancelled queue entry never produced anything to show.
+                continue
             if source_identity and not _same_source_identity(
                 (run.get("request") or {}).get("source") or {}, source_identity
             ):
@@ -259,7 +308,7 @@ class AnalysisStore:
                 """
                 SELECT run_id FROM analysis_runs
                 WHERE case_id = ? AND filename = ? AND operation = ?
-                  AND z_index = ? AND status IN ('SUCCEEDED', 'FAILED')
+                  AND z_index = ? AND status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
                 """,
                 (case_id, filename, operation, z_index),
             ).fetchall()
@@ -272,6 +321,245 @@ class AnalysisStore:
                 )
             conn.commit()
         return run_ids
+
+    def get_runs(self, run_ids) -> dict[str, dict]:
+        """Return the runs that still exist, keyed by run ID."""
+        ids = list(dict.fromkeys(str(run_id) for run_id in run_ids))
+        found: dict[str, dict] = {}
+        with self._connect() as conn:
+            for chunk in _chunks(ids):
+                rows = conn.execute(
+                    f"SELECT * FROM analysis_runs WHERE run_id IN ({_placeholders(chunk)})",
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    found[str(row["run_id"])] = _row_to_dict(row)
+        return found
+
+    def best_runs_for_cache_keys(self, cache_keys) -> dict[str, dict]:
+        """The most useful run per cache key: saved > active > newest failure."""
+        keys = list(dict.fromkeys(str(key) for key in cache_keys if key))
+        best: dict[str, tuple[int, dict]] = {}
+        with self._connect() as conn:
+            for chunk in _chunks(keys):
+                # Status lookups only: skip the (large) request payload.
+                rows = conn.execute(
+                    f"""
+                    SELECT run_id, cache_key, case_id, filename, z_index, channel_index, status,
+                           operation, result_json, progress_json, error_code, error_message,
+                           created_at, started_at, finished_at
+                    FROM analysis_runs
+                    WHERE cache_key IN ({_placeholders(chunk)})
+                    ORDER BY created_at DESC, rowid DESC
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                for row in rows:
+                    run = _row_to_status_dict(row)
+                    priority = RUN_PRIORITY.get(run["status"], 3)
+                    current = best.get(run["cacheKey"])
+                    if current is None or priority < current[0]:
+                        best[run["cacheKey"]] = (priority, run)
+        return {key: run for key, (_, run) in best.items()}
+
+    def cancel_queued_runs(self, run_ids, *, exclude_analysis_id: str | None = None) -> tuple[list[str], list[str]]:
+        """Cancel runs that have not started yet.
+
+        Runs that another active saved analysis still needs are kept queued, so
+        interrupting one analysis never silently stalls a different one.
+        Returns ``(canceled, kept)``.
+        """
+        ids = list(dict.fromkeys(str(run_id) for run_id in run_ids))
+        canceled: list[str] = []
+        kept: list[str] = []
+        progress = _json_dump({
+            "stage": "canceled",
+            "fraction": 0.0,
+            "percent": 0.0,
+            "message": "Canceled before the model started",
+        })
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for chunk in _chunks(ids):
+                rows = conn.execute(
+                    f"""
+                    SELECT run_id, cache_key FROM analysis_runs
+                    WHERE run_id IN ({_placeholders(chunk)}) AND status = 'QUEUED'
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                if not rows:
+                    continue
+                keys = [str(row["cache_key"]) for row in rows]
+                protected = {
+                    str(row["key"])
+                    for row in conn.execute(
+                        f"""
+                        SELECT jobs.cache_key AS key FROM case_analysis_jobs AS jobs
+                        JOIN case_analyses AS analyses ON analyses.analysis_id = jobs.analysis_id
+                        WHERE analyses.state = 'active' AND analyses.analysis_id != ?
+                          AND jobs.cache_key IN ({_placeholders(keys)})
+                        UNION
+                        SELECT jobs.legacy_cache_key AS key FROM case_analysis_jobs AS jobs
+                        JOIN case_analyses AS analyses ON analyses.analysis_id = jobs.analysis_id
+                        WHERE analyses.state = 'active' AND analyses.analysis_id != ?
+                          AND jobs.legacy_cache_key IN ({_placeholders(keys)})
+                        """,
+                        (exclude_analysis_id or "", *keys, exclude_analysis_id or "", *keys),
+                    ).fetchall()
+                }
+                for row in rows:
+                    run_id = str(row["run_id"])
+                    if str(row["cache_key"]) in protected:
+                        kept.append(run_id)
+                        continue
+                    updated = conn.execute(
+                        """
+                        UPDATE analysis_runs
+                        SET status = 'CANCELED', progress_json = ?, finished_at = ?
+                        WHERE run_id = ? AND status = 'QUEUED'
+                        """,
+                        (progress, utc_now(), run_id),
+                    ).rowcount
+                    (canceled if updated == 1 else kept).append(run_id)
+            conn.commit()
+        return canceled, kept
+
+    def save_case_analysis(self, owner: str, signature: str, definition: dict, jobs: list[dict]) -> tuple[str, bool]:
+        """Create a saved analysis, or merge into the owner's identical one.
+
+        Returns ``(analysis_id, merged)``. Merging keeps the original ID and
+        creation time, refreshes the definition (for example calibration) and
+        makes the analysis active again.
+        """
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing = conn.execute(
+                "SELECT analysis_id FROM case_analyses WHERE owner = ? AND signature = ?",
+                (owner, signature),
+            ).fetchone()
+            if existing is not None:
+                analysis_id = str(existing["analysis_id"])
+                conn.execute(
+                    """
+                    UPDATE case_analyses SET definition_json = ?, state = 'active', updated_at = ?
+                    WHERE analysis_id = ?
+                    """,
+                    (_json_dump(definition), now, analysis_id),
+                )
+            else:
+                analysis_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO case_analyses (
+                        analysis_id, owner, signature, state, created_at, updated_at, definition_json
+                    ) VALUES (?, ?, ?, 'active', ?, ?, ?)
+                    """,
+                    (analysis_id, owner, signature, now, now, _json_dump(definition)),
+                )
+            self._replace_case_analysis_jobs(conn, analysis_id, jobs)
+            conn.commit()
+        return analysis_id, existing is not None
+
+    def update_case_analysis_jobs(self, owner: str, analysis_id: str, jobs: list[dict]) -> None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_case_analysis(conn, owner, analysis_id)
+            self._replace_case_analysis_jobs(conn, analysis_id, jobs)
+            conn.commit()
+
+    def set_case_analysis_state(self, owner: str, analysis_id: str, state: str) -> None:
+        if state not in CASE_ANALYSIS_STATES:
+            raise ValueError(f"Invalid case analysis state: {state}")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_case_analysis(conn, owner, analysis_id)
+            conn.execute(
+                "UPDATE case_analyses SET state = ?, updated_at = ? WHERE analysis_id = ?",
+                (state, utc_now(), analysis_id),
+            )
+            conn.commit()
+
+    def list_case_analyses(self, owner: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM case_analyses WHERE owner = ?
+                ORDER BY updated_at DESC, rowid DESC
+                """,
+                (owner,),
+            ).fetchall()
+            jobs = self._case_analysis_jobs(conn, [str(row["analysis_id"]) for row in rows])
+        return [_case_analysis_to_dict(row, jobs.get(str(row["analysis_id"]), [])) for row in rows]
+
+    def get_case_analysis(self, owner: str, analysis_id: str) -> dict:
+        with self._connect() as conn:
+            row = self._require_case_analysis(conn, owner, analysis_id)
+            jobs = self._case_analysis_jobs(conn, [analysis_id])
+        return _case_analysis_to_dict(row, jobs.get(analysis_id, []))
+
+    def delete_case_analysis(self, owner: str, analysis_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_case_analysis(conn, owner, analysis_id)
+            conn.execute("DELETE FROM case_analysis_jobs WHERE analysis_id = ?", (analysis_id,))
+            conn.execute("DELETE FROM case_analyses WHERE analysis_id = ?", (analysis_id,))
+            conn.commit()
+
+    @staticmethod
+    def _require_case_analysis(conn, owner: str, analysis_id: str):
+        row = conn.execute(
+            "SELECT * FROM case_analyses WHERE analysis_id = ? AND owner = ?",
+            (str(analysis_id), owner),
+        ).fetchone()
+        if row is None:
+            raise NotFound("Case analysis not found")
+        return row
+
+    @staticmethod
+    def _replace_case_analysis_jobs(conn, analysis_id: str, jobs: list[dict]) -> None:
+        conn.execute("DELETE FROM case_analysis_jobs WHERE analysis_id = ?", (analysis_id,))
+        conn.executemany(
+            """
+            INSERT INTO case_analysis_jobs (
+                analysis_id, job_id, position, case_id, filename, z_index,
+                channel_index, cache_key, legacy_cache_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    analysis_id, job["id"], position, job["caseId"], job["filename"],
+                    int(job["zIndex"]), int(job["channelIndex"]), job["cacheKey"],
+                    job.get("legacyCacheKey") or "",
+                )
+                for position, job in enumerate(jobs)
+            ],
+        )
+
+    @staticmethod
+    def _case_analysis_jobs(conn, analysis_ids: list[str]) -> dict[str, list[dict]]:
+        grouped: dict[str, list[dict]] = {}
+        for chunk in _chunks(analysis_ids):
+            rows = conn.execute(
+                f"""
+                SELECT * FROM case_analysis_jobs
+                WHERE analysis_id IN ({_placeholders(chunk)})
+                ORDER BY analysis_id, position
+                """,
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                grouped.setdefault(str(row["analysis_id"]), []).append({
+                    "id": row["job_id"],
+                    "caseId": row["case_id"],
+                    "filename": row["filename"],
+                    "zIndex": int(row["z_index"]),
+                    "channelIndex": int(row["channel_index"]),
+                    "cacheKey": row["cache_key"],
+                    "legacyCacheKey": row["legacy_cache_key"] or "",
+                })
+        return grouped
 
     def claim_next_run(self, worker_id: str, lease_seconds: int | None = None) -> dict | None:
         if not worker_id:
@@ -524,6 +812,48 @@ def _bounded_limit(value) -> int:
     if parsed < 1 or parsed > 100:
         raise BadRequest("limit must be an integer between 1 and 100")
     return parsed
+
+
+def _row_to_status_dict(row: sqlite3.Row) -> dict:
+    return {
+        "runId": row["run_id"],
+        "cacheKey": row["cache_key"],
+        "case": row["case_id"],
+        "filename": row["filename"],
+        "zIndex": int(row["z_index"]),
+        "channelIndex": int(row["channel_index"]),
+        "status": row["status"],
+        "operation": row["operation"],
+        "result": _json_load(row["result_json"], None),
+        "progress": _json_load(row["progress_json"], {}),
+        "errorCode": row["error_code"],
+        "error": row["error_message"],
+        "createdAt": row["created_at"],
+        "startedAt": row["started_at"],
+        "finishedAt": row["finished_at"],
+    }
+
+
+def _case_analysis_to_dict(row: sqlite3.Row, jobs: list[dict]) -> dict:
+    return {
+        "id": row["analysis_id"],
+        "owner": row["owner"],
+        "signature": row["signature"],
+        "state": row["state"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "definition": _json_load(row["definition_json"], {}),
+        "jobs": jobs,
+    }
+
+
+def _chunks(values: list, size: int = 400):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _placeholders(values) -> str:
+    return ",".join("?" for _ in values)
 
 
 def _json_dump(value) -> str:

@@ -174,19 +174,16 @@ function labelBackgroundFor(annotationColor) {
   return contrastRatio(annotationLum, relativeLuminance(parseHexColor(dark.fill))) >= 4.5 ? dark : light
 }
 
+// Keep the annotator's name exactly as entered; only an e-mail domain is dropped.
 function cleanDisplayName(value) {
   const raw = String(value || '').trim()
   if (!raw) return ''
   const withoutEmailDomain = raw.includes('@') ? raw.split('@')[0] : raw
-  return withoutEmailDomain
-    .replace(/[._-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/\b\w/g, letter => letter.toUpperCase())
+  return withoutEmailDomain.replace(/\s+/g, ' ').trim()
 }
 
 function displayInitials(name) {
-  const parts = cleanDisplayName(name).split(' ').filter(Boolean)
+  const parts = cleanDisplayName(name).split(/[\s._-]+/).filter(Boolean)
   if (!parts.length) return '?'
   return parts.slice(0, 2).map(part => part[0]).join('').toUpperCase()
 }

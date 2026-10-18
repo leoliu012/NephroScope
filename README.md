@@ -36,12 +36,14 @@ expansion-factor (EF) adjusted values using the current calibration.
 ### 3. In-viewer thickness analysis
 
 Select **Run thickness analysis** to open the **Thickness** tab. Choose a channel
-and Z sampling gap, then inspect the pooled image distribution or separate box
-plots for each analyzed Z slice. Results include sample counts, quartiles, median,
-whiskers, range, and outlier counts.
+and Z sampling; each choice shows how many of its slices already have results, and
+a sampling that is fully segmented (here or in Case analysis) displays at once.
+Inspect the pooled distribution or each Z slice: mean ± SD first, then median,
+IQR, whiskers and point counts. Running analyses can be interrupted (queued
+slices are canceled) and continued later.
 
-Matching saved segmentations are reused. Results retain their analysis calibration,
-and the viewer flags settings that have changed since the analysis was run.
+Results always use the viewer's current calibration; changing pixel size or EF
+re-measures the saved segmentations without running the model again.
 
 ### 4. Compare thickness across cases and images
 
@@ -50,15 +52,21 @@ compare thickness distributions grouped by case, image, or image/Z slice.
 Automatic selection uses the Post and 60X filename groups; manual selection is
 available when a case has no matching images.
 
+Case analysis opens on two choices, **New analysis** and **Existing analyses**.
+Before running, the Z sampling picker shows, for every gap, how many selected
+images already have results, and points to saved analyses of the same images.
+Analyses are saved on the server: identical selections (same images, channels
+and Z gap) merge into one, interrupted analyses can be continued, and slices
+finished by any other analysis count as done.
+
 Change grouping, included images, units, or observed versus EF-adjusted thickness
-to explore the results. Box-plot statistics use all saved full-mask centerline
-samples, rather than averages of images or cases. Queued jobs continue after
-leaving the page, and reopening it in the same browser restores the comparison.
+to explore the results. Statistics use all saved full-mask centerline samples,
+rather than averages of images or cases.
 
 ### 5. Export images with analysis results
 
 Export the current image as PDF, PNG, or JPEG, with optional annotations and
-model overlays. Enable **Include thickness box plot and statistics** to include
+model overlays. Enable **Include thickness distribution and statistics** to include
 the current Thickness tab results. PDF exports add report pages; PNG/JPEG exports
 append the report below the image. Partial analyses are labeled in the report.
 
@@ -245,6 +253,13 @@ GET  /agh/api/cases/:case/files/:filename/preview
 GET  /agh/api/cases/:case/files/:filename/channels/:channelIndex/raw
 GET  /agh/api/cases/:case/files/:filename/annotations
 PUT  /agh/api/cases/:case/files/:filename/annotations   (requires X-AGH-CSRF)
+POST /agh/api/analysis-runs/batch | lookup | cancel | distributions
+POST /agh/api/analysis-coverage            (saved runs per Z slice and channel)
+GET  /agh/api/case-analyses                (your saved analyses)
+POST /agh/api/case-analyses                (create, or merge an identical one)
+GET  /agh/api/case-analyses/:id
+POST /agh/api/case-analyses/:id/interrupt | resume | cancel
+DELETE /agh/api/case-analyses/:id
 ```
 
 The API rejects path traversal, only serves direct TIFF files inside known case folders, and only allows `.tif` / `.tiff`.
@@ -296,6 +311,30 @@ checkpoint, installs the web and inference virtualenvs, prepares application
 state, installs the API/model/image-sync services, validates Apache, and reloads
 it. Create accounts afterwards with `manage_users.py` (see `docs/security.md`).
 
+## Remote access through a proxy
+
+`npm run dev` serves about 50 separate modules. Some proxies in front of it
+(Tailscale serve was observed returning empty `502` responses above roughly 10
+parallel requests) drop a few of them, and a single dropped module used to leave
+the page blank. Two safeguards now apply:
+
+- The page shows a loading screen and, if any of its files fails, retries up to
+  three times, then explains the problem with a **Reload** button.
+- A small service worker (`/agh/sw.js`) limits parallel file downloads and
+  retries requests a proxy dropped. It never caches responses.
+
+For remote use, serve the production build instead of the dev server. It loads
+in two or three requests and uses the same port (5173, or `AGH_FRONTEND_PORT`),
+so an existing `tailscale serve` mapping keeps working:
+
+```bash
+cd frontend
+npm run serve
+```
+
+Re-run it after updating the code. Restart the backend (`app.py`/Gunicorn) after
+updates as well, so new API routes are available.
+
 ## Tests
 
 Application-scope and model-checksum guard:
@@ -329,34 +368,37 @@ the files browser's Post and 60X filename groups. Cases with no matching images
 say so and offer manual selection. Compact case cards can be folded without
 changing checked images; their headers show selection counts.
 
-The Z-gap slider runs all
-slices at 0; gap 1 skips one slice (Z1, Z3, Z5), up to gap 8. Each image can
-override the batch gap. If the stack is too short for two samples, its middle
+The Z sampling picker runs every
+slice at "All slices"; gap 1 uses every 2nd slice (Z1, Z3, Z5), up to gap 8. Each
+image can override the batch gap. If the stack is too short for two samples, its middle
 slice is used (the upper middle for an even stack). Runs use the existing model's
 up-to-five-plane Z-MIP. Verify each image's channel and pixel-size/EF settings
 before starting; calibration defaults match the image viewer.
 
-The model worker must be running. Queued runs continue when the page closes;
-reopening Case analysis in the same browser restores the last comparison and
-resumes pending submissions and progress. Box-plot quartiles use every saved
-full-mask centerline thickness sample, including repeated values, rather than
-image or case averages. Displayed dots are representative; the statistics use
-all samples. Comparisons can change grouping, image inclusion, units, observed
-versus EF-adjusted thickness, and whether the axis focuses on the IQR whiskers.
+The model worker must be running. Queued runs continue on the server when the
+page closes; reopen the analysis from **Existing analyses**. While an analysis
+runs, **Interrupt analysis** cancels its queued slices (the slice already on the
+model finishes) and **Cancel queued** in the progress list cancels one image.
+Interrupted analyses offer **Continue analysis** and **New analysis**. Queued
+slices that another running analysis also needs are kept.
+
+Results show the Z sampling of the analysis and can switch to any other saved
+analysis. Each group shows its mean (◆, primary) ± SD, median, IQR box,
+1.5 × IQR whiskers and a density curve; every saved full-mask centerline
+thickness sample counts, rather than image or case averages. Axis gridlines use
+whole 1, 2 or 5 × 10ⁿ steps (for example every 50 or 100 nm) with a finer
+minor grid. Measurements are cached in the browser, so reopening an analysis
+needs no new measurement requests.
 
 The opened image viewer also has **Run thickness analysis**, which opens the
-**Thickness** side tab. Choose a channel and Z gap, then run to view the pooled
-full-image distribution or separate boxes for each analyzed Z slice, with
-point counts, quartiles, median, whiskers, range, and outlier counts. Results
-retain the analysis calibration; changes to channel, pixel size, EF, or gap are
-identified until another analysis applies them. Per-image progress can resume
-after reopening and does not replace the separate Case analysis comparison.
+**Thickness** side tab described above. Its Z slider marks segmented slices with
+small green bars under the track and merges crowded annotation pins.
 
-In the existing **Export** window, check **Include thickness box plot and
+In the existing **Export** window, check **Include thickness distribution and
 statistics**. The current Thickness tab grouping, units, and completed samples
 are included, with partial analyses labeled explicitly. PDF adds report pages;
-PNG/JPEG append the report below the image. This works even when the Thickness
-tab is hidden. Very large combined image reports should use PDF.
+PNG/JPEG append the report below the image. Annotation lists in PDFs are drawn
+with the browser's fonts, so names and labels appear exactly as typed.
 
 ## Raw Display and Model Analysis Contract
 

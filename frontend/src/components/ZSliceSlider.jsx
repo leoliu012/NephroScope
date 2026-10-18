@@ -1,62 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Loader2, MapPin, ScanLine } from 'lucide-react'
+import { MapPin } from 'lucide-react'
 
-function annotationZIndex(annotation, zCount) {
-  const value = Number(annotation?.zIndex)
-  // Annotations saved before Z scoping was introduced belong to the first
-  // plane. This is deterministic and, importantly, stops legacy shapes from
-  // appearing on every plane of a stack.
-  if (!Number.isInteger(value)) return 0
-  return Math.max(0, Math.min(zCount - 1, value))
-}
-
-function annotationMarkers(annotations, zCount) {
-  const slices = new Map()
-  for (const annotation of annotations || []) {
-    const zIndex = annotationZIndex(annotation, zCount)
-    slices.set(zIndex, (slices.get(zIndex) || 0) + 1)
-  }
-  return Array.from(slices, ([zIndex, count]) => ({ type: 'annotation', zIndex, count }))
-    .sort((left, right) => left.zIndex - right.zIndex)
-}
-
-function modelMarkers(modelRuns, zCount) {
-  const markers = []
-  for (const [zKey, run] of Object.entries(modelRuns || {})) {
-    const zIndex = Number(run?.requestedZIndex ?? run?.request?.zIndex ?? zKey)
-    if (!Number.isInteger(zIndex) || zIndex < 0 || zIndex >= zCount) continue
-    const status = String(run?.status || '').toUpperCase()
-    if (status === 'SUBMITTING' || status === 'QUEUED' || status === 'RUNNING') {
-      markers.push({ type: 'model', state: 'running', zIndex, label: 'Running' })
-    } else if (status === 'SUCCEEDED') {
-      markers.push({ type: 'model', state: 'segmented', zIndex, label: 'Segmented' })
-    }
-  }
-  return markers.sort((left, right) => left.zIndex - right.zIndex)
-}
-
-function pinWidth(marker) {
-  if (marker.type === 'model') return marker.state === 'running' ? 67 : 84
-  return marker.count > 9 ? 38 : marker.count > 1 ? 26 : 20
-}
-
-function assignPinLanes(markers, zCount, width) {
-  if (!width || zCount < 2) return markers.map(marker => ({ ...marker, lane: 0 }))
-  const rightEdges = []
-  return markers.map(marker => {
-    const center = (marker.zIndex / (zCount - 1)) * width
-    const halfWidth = pinWidth(marker) / 2
-    const left = center - halfWidth
-    let lane = rightEdges.findIndex(right => left > right + 4)
-    if (lane < 0) lane = rightEdges.length
-    rightEdges[lane] = center + halfWidth
-    return { ...marker, lane }
-  })
-}
-
-export function zIndexForAnnotation(annotation, zCount) {
-  return annotationZIndex(annotation, zCount)
-}
+import { annotationMarkers, clusterAnnotationPins, modelSliceMarks } from '../zSliceMarkers.js'
 
 export default function ZSliceSlider({
   zCount,
@@ -69,12 +14,11 @@ export default function ZSliceSlider({
 }) {
   const trackRef = useRef(null)
   const [trackWidth, setTrackWidth] = useState(0)
-  const markers = useMemo(() => [
-    ...annotationMarkers(annotations, zCount),
-    ...modelMarkers(modelRuns, zCount),
-  ], [annotations, modelRuns, zCount])
-  const pinnedSlices = useMemo(() => assignPinLanes(markers, zCount, Math.max(0, trackWidth - 16)), [markers, zCount, trackWidth])
-  const laneCount = pinnedSlices.length ? Math.max(...pinnedSlices.map(marker => marker.lane + 1)) : 0
+  const innerWidth = Math.max(0, trackWidth - 16)
+  const pins = useMemo(() => clusterAnnotationPins(annotationMarkers(annotations, zCount), zCount, innerWidth), [annotations, zCount, innerWidth])
+  const marks = useMemo(() => modelSliceMarks(modelRuns, zCount), [modelRuns, zCount])
+  const segmentedCount = marks.filter(mark => mark.state === 'segmented').length
+  const runningCount = marks.length - segmentedCount
 
   useEffect(() => {
     const track = trackRef.current
@@ -86,55 +30,48 @@ export default function ZSliceSlider({
     return () => observer.disconnect()
   }, [])
 
+  const left = zIndex => (zCount > 1 ? (zIndex / (zCount - 1)) * 100 : 0)
+  const markSummary = [
+    segmentedCount ? `${segmentedCount} segmented Z slice${segmentedCount === 1 ? '' : 's'} (green marks)` : '',
+    runningCount ? `${runningCount} running (blue marks)` : '',
+  ].filter(Boolean).join(' · ')
+
   return (
     <div
       ref={trackRef}
-      className="viewer-z-slider-track"
-      style={{ '--z-pin-lanes': laneCount }}
+      className={`viewer-z-slider-track${pins.length ? ' has-pins' : ''}`}
+      title={markSummary || undefined}
     >
-      {pinnedSlices.length > 0 && (
-        <div className="viewer-z-annotation-pins" aria-label="Z slice labels">
-          {pinnedSlices.map(marker => {
-            const position = zCount > 1 ? (marker.zIndex / (zCount - 1)) * 100 : 0
-            if (marker.type === 'model') {
-              const description = marker.state === 'running'
-                ? `Model prediction is running on Z ${marker.zIndex + 1}`
-                : `Saved model segmentation on Z ${marker.zIndex + 1}`
-              return (
-                <button
-                  key={`model:${marker.zIndex}`}
-                  type="button"
-                  className={`viewer-z-model-pin viewer-z-model-pin-${marker.state}`}
-                  style={{ left: `${position}%`, top: `${marker.lane * 22}px` }}
-                  onClick={() => onJumpToSlice?.(marker.zIndex)}
-                  title={`${description}. Go to slice.`}
-                  aria-label={`${description}. Go to slice.`}
-                >
-                  {marker.state === 'running'
-                    ? <Loader2 size={12} className="animate-spin" aria-hidden="true" />
-                    : <ScanLine size={12} aria-hidden="true" />}
-                  <span>{marker.label}</span>
-                </button>
-              )
-            }
-            const annotationWord = marker.count === 1 ? 'annotation' : 'annotations'
+      {pins.length > 0 && (
+        <div className="viewer-z-annotation-pins" aria-label="Z slices with annotations">
+          {pins.map(pin => {
+            const sliceText = pin.slices.length > 1
+              ? `Z ${pin.slices[0] + 1}–${pin.slices.at(-1) + 1}`
+              : `Z ${pin.zIndex + 1}`
+            const label = `${pin.count} annotation${pin.count === 1 ? '' : 's'} on ${sliceText}. Go to Z ${pin.zIndex + 1}.`
             return (
               <button
-                key={`annotation:${marker.zIndex}`}
+                key={`annotation:${pin.slices.join(',')}`}
                 type="button"
-                className="viewer-z-annotation-pin"
-                style={{ left: `${position}%`, top: `${marker.lane * 22}px` }}
-                onClick={() => onJumpToSlice?.(marker.zIndex)}
-                title={`${marker.count} ${annotationWord} on Z ${marker.zIndex + 1}. Go to slice.`}
-                aria-label={`${marker.count} ${annotationWord} on Z ${marker.zIndex + 1}. Go to slice.`}
+                className={`viewer-z-annotation-pin${pin.slices.length > 1 ? ' is-cluster' : ''}`}
+                style={pin.position !== undefined ? { left: `${pin.position}px` } : { left: `${left(pin.zIndex)}%` }}
+                onClick={() => onJumpToSlice?.(pin.zIndex)}
+                title={label}
+                aria-label={label}
               >
                 <MapPin size={17} strokeWidth={2.4} aria-hidden="true" />
-                {marker.count > 1 && <span className="viewer-z-annotation-pin-count">{marker.count > 99 ? '99+' : marker.count}</span>}
+                {pin.count > 1 && <span className="viewer-z-annotation-pin-count">{pin.count > 99 ? '99+' : pin.count}</span>}
               </button>
             )
           })}
         </div>
       )}
+      <div className="viewer-z-slice-marks" aria-hidden="true">
+        {marks.map(mark => (
+          <span key={mark.zIndex} className={`viewer-z-slice-mark is-${mark.state}`} style={{ left: `${left(mark.zIndex)}%` }} />
+        ))}
+      </div>
+      {markSummary && <span className="sr-only">{markSummary}</span>}
       <input
         type="range"
         min={0}

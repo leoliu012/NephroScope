@@ -1,78 +1,49 @@
 import { authFetch } from './auth.js'
 import { v4 as uuidv4 } from 'uuid'
 import { compareAlphanumeric, getImageMagnificationGroup, organizeImageFilenames } from './collectionOrganization.js'
+import { distributionCacheKey, getCachedDistributions, putCachedDistributions } from './distributionCache.js'
 
 export const imageKey = (caseId, filename) => JSON.stringify([caseId, filename])
+export const jobKey = (caseId, filename, zIndex) => `${imageKey(caseId, filename)}:${zIndex}`
 export const imageApi = (caseId, filename) => `/agh/api/cases/${encodeURIComponent(caseId)}/files/${encodeURIComponent(filename)}`
 export const is60X = filename => getImageMagnificationGroup(filename) === '60x'
 export const isPost60X = filename => is60X(filename)
   && organizeImageFilenames([filename]).some(group => group.id === 'post' && group.files.length > 0)
 
+export const MAX_GAP = 8
+const ACTIVE = new Set(['QUEUED', 'RUNNING'])
+
 export function selectedZSlices(zCount, gap = 0) {
   const count = Math.max(1, Math.floor(Number(zCount) || 1))
-  const skip = Math.max(0, Math.min(8, Math.round(Number(gap) || 0)))
+  const skip = Math.max(0, Math.min(MAX_GAP, Math.round(Number(gap) || 0)))
   if (skip > 0 && count <= skip + 1) return [Math.floor(count / 2)]
   return Array.from({ length: Math.ceil(count / (skip + 1)) }, (_, index) => index * (skip + 1))
 }
 
+export function ordinal(value) {
+  const tens = value % 100
+  if (tens >= 11 && tens <= 13) return `${value}th`
+  return `${value}${({ 1: 'st', 2: 'nd', 3: 'rd' })[value % 10] || 'th'}`
+}
+
 export function gapLabel(gap) {
-  return Number(gap) === 0 ? 'All Z slices' : `Skip ${gap} slice${Number(gap) === 1 ? '' : 's'} between runs`
+  const value = Number(gap) || 0
+  return value === 0 ? 'Every Z slice' : `Every ${ordinal(value + 1)} Z slice`
 }
 
-export async function caseAnalysisJson(url, options = {}) {
-  const response = await authFetch(url, {
-    ...options, headers: { Accept: 'application/json', ...options.headers },
-  })
-  const body = await response.json().catch(() => ({}))
-  if (!response.ok) {
-    const error = new Error(body.error || `Request failed (${response.status})`)
-    error.status = response.status
-    throw error
-  }
-  return body
+export function gapShortLabel(gap) {
+  const value = Number(gap) || 0
+  return value === 0 ? 'All slices' : `Gap ${value}`
 }
 
-export async function mapLimit(items, limit, callback, signal) {
-  let index = 0
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (index < items.length && !signal?.aborted) {
-      const next = index++
-      await callback(items[next], next)
-    }
-  }))
+export function sliceSummary(slices, limit = 12) {
+  const labels = slices.slice(0, limit).map(z => `Z${z + 1}`)
+  return `${labels.join(', ')}${slices.length > limit ? ', …' : ''}`
 }
 
-export function makeAnalysisBatch(images, gap, id = uuidv4()) {
-  const jobs = images.flatMap(image => selectedZSlices(image.zCount, image.gap ?? gap).map(zIndex => ({
-    id: `${image.key}:${zIndex}`, imageKey: image.key, zIndex, status: 'PENDING',
-    runId: null, reused: false, distribution: null, distributionError: '',
-  })))
-  return { id, createdAt: new Date().toISOString(), gap, images, jobs }
-}
-
-const batchStorageKey = (user, scope) => `agh-viewer:${scope}:v1:${encodeURIComponent(user || 'local')}`
-
-export function saveAnalysisBatch(user, batch, scope = 'case-analysis') {
-  try {
-    if (!batch) localStorage.removeItem(batchStorageKey(user, scope))
-    else localStorage.setItem(batchStorageKey(user, scope), JSON.stringify({
-      ...batch, jobs: batch.jobs.map(({ distribution, ...job }) => job),
-    }))
-    return true
-  } catch {
-    return false
-  }
-}
-
-export function loadAnalysisBatch(user, scope = 'case-analysis') {
-  try {
-    const batch = JSON.parse(localStorage.getItem(batchStorageKey(user, scope)) || 'null')
-    if (!batch?.id || !Array.isArray(batch.images) || !Array.isArray(batch.jobs)) return null
-    return { ...batch, jobs: batch.jobs.map(job => ({ ...job, distribution: null })) }
-  } catch {
-    return null
-  }
-}
+// The analysis server sits behind proxies that occasionally drop a request
+// (502/503/504 or a network error). Every call here is safe to repeat.
+const RETRY_STATUSES = new Set([502, 503, 504])
 
 function abortableDelay(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -89,85 +60,288 @@ function abortableDelay(ms, signal) {
   })
 }
 
-// The server queue persists jobs. The browser stores the selection/run IDs and
-// can resume submission, polling and distributions after navigation or reload.
-export async function monitorCaseAnalysis(initial, { signal, onChange, request = caseAnalysisJson, pollMs = 3000 }) {
-  const batch = { ...initial, jobs: initial.jobs.map(job => ({ ...job })) }
-  const images = new Map(batch.images.map(image => [image.key, image]))
-  const publish = () => {
-    if (!signal?.aborted) onChange({ ...batch, jobs: batch.jobs.map(job => ({ ...job })) })
-  }
-  const fatal = error => error.name === 'AbortError' || [401, 403].includes(error.status)
-  await mapLimit(batch.jobs.filter(job => job.status === 'PENDING'), 3, async job => {
-    const image = images.get(job.imageKey)
+export async function caseAnalysisJson(url, options = {}, { retries = 3 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    let response
     try {
-      const run = await request(`${imageApi(image.caseId, image.filename)}/analysis-runs`, {
-        method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ zIndex: job.zIndex, channelIndex: image.channelIndex }),
+      response = await authFetch(url, {
+        ...options, headers: { Accept: 'application/json', ...options.headers },
       })
-      Object.assign(job, { runId: run.runId, status: run.status, reused: Boolean(run.reused), error: '' })
     } catch (error) {
-      if (fatal(error)) throw error
-      Object.assign(job, { status: 'SUBMIT_ERROR', error: error.message })
+      if (error.name === 'AbortError' || attempt >= retries) throw error
+      await abortableDelay(400 * 3 ** attempt, options.signal)
+      continue
     }
-    publish()
-  }, signal)
-
-  while (!signal?.aborted) {
-    const pending = batch.jobs.filter(job => job.runId && !['FAILED', 'SUBMIT_ERROR'].includes(job.status)
-      && (!job.distribution && !job.distributionError))
-    if (!pending.length) break
-    await mapLimit(pending, 3, async job => {
-      try {
-        if (job.status !== 'SUCCEEDED') {
-          const run = await request(`/agh/api/analysis-runs/${encodeURIComponent(job.runId)}`, { signal })
-          Object.assign(job, { status: run.status, progress: run.progress, error: run.error?.message || '', pollError: '' })
-        }
-        if (job.status === 'SUCCEEDED') {
-          try {
-            job.distribution = await request(`/agh/api/analysis-runs/${encodeURIComponent(job.runId)}/measurements/gbm-distribution`, {
-              method: 'POST', signal, headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ calibration: images.get(job.imageKey).calibration }),
-            })
-            job.pollError = ''
-          } catch (error) {
-            if (fatal(error)) throw error
-            job.distributionError = error.message
-          }
-        }
-      } catch (error) {
-        if (fatal(error)) throw error
-        if (error.status === 404) Object.assign(job, { status: 'FAILED', error: 'The saved run was deleted. Retry to queue it again.' })
-        else job.pollError = error.message
-      }
-      publish()
-    }, signal)
-    if (batch.jobs.some(job => job.runId && ['QUEUED', 'RUNNING'].includes(job.status))) {
-      await abortableDelay(pollMs, signal)
+    if (RETRY_STATUSES.has(response.status) && attempt < retries) {
+      await abortableDelay(400 * 3 ** attempt, options.signal)
+      continue
     }
+    const body = await response.json().catch(() => ({}))
+    if (!response.ok) {
+      const error = new Error(body.error || `Request failed (${response.status})`)
+      error.status = response.status
+      throw error
+    }
+    return body
   }
-  return batch
 }
 
-export function retryAnalysisBatch(batch) {
-  return { ...batch, jobs: batch.jobs.map(job => ['FAILED', 'SUBMIT_ERROR'].includes(job.status)
-    ? { ...job, status: 'PENDING', runId: null, error: '', pollError: '', distributionError: '', distribution: null }
-    : { ...job, distributionError: '', pollError: '' }) }
+export async function mapLimit(items, limit, callback, signal) {
+  let index = 0
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (index < items.length && !signal?.aborted) {
+      const next = index++
+      await callback(items[next], next)
+    }
+  }))
+}
+
+function chunked(items, size) {
+  return Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size))
+}
+
+const postJson = (request, url, body, signal) => request(url, {
+  method: 'POST', signal, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+})
+
+// ---- Run API (batched) -----------------------------------------------------
+
+export async function submitRuns(items, { signal, request = caseAnalysisJson } = {}) {
+  const results = []
+  for (const chunk of chunked(items, 500)) {
+    const payload = await postJson(request, '/agh/api/analysis-runs/batch', {
+      runs: chunk.map(item => ({ case: item.caseId, filename: item.filename, zIndex: item.zIndex, channelIndex: item.channelIndex })),
+    }, signal)
+    results.push(...payload.runs)
+  }
+  return results
+}
+
+export async function lookupRuns(runIds, { signal, request = caseAnalysisJson } = {}) {
+  const runs = {}
+  for (const chunk of chunked([...new Set(runIds)].filter(Boolean), 1000)) {
+    Object.assign(runs, (await postJson(request, '/agh/api/analysis-runs/lookup', { runIds: chunk }, signal)).runs)
+  }
+  return runs
+}
+
+export async function cancelRuns(runIds, { signal, request = caseAnalysisJson } = {}) {
+  const ids = [...new Set(runIds)].filter(Boolean)
+  if (!ids.length) return { canceled: [], kept: [] }
+  return postJson(request, '/agh/api/analysis-runs/cancel', { runIds: ids }, signal)
+}
+
+// Existing runs per Z slice for each image/channel, matched by the same cache
+// key the server uses to reuse segmentations.
+export async function fetchCoverage(images, { signal, request = caseAnalysisJson } = {}) {
+  const coverage = new Map()
+  for (const chunk of chunked(images, 100)) {
+    const payload = await postJson(request, '/agh/api/analysis-coverage', {
+      images: chunk.map(image => ({ case: image.caseId, filename: image.filename, channelIndex: image.channelIndex })),
+    }, signal)
+    payload.images.forEach(entry => {
+      coverage.set(coverageKey(entry.case, entry.filename, entry.channelIndex), entry)
+    })
+  }
+  return coverage
+}
+
+export const coverageKey = (caseId, filename, channelIndex) => `${imageKey(caseId, filename)}#${channelIndex}`
+
+// Ready/active slice counts for one image at one Z gap.
+export function gapCoverage(entry, zCount, gap) {
+  const slices = selectedZSlices(zCount, gap)
+  let ready = 0, active = 0
+  for (const z of slices) {
+    const status = entry?.runs?.[String(z)]?.status
+    if (status === 'SUCCEEDED') ready++
+    else if (ACTIVE.has(status)) active++
+  }
+  return { total: slices.length, ready, active, missing: slices.length - ready - active }
+}
+
+// Measurements for finished runs; cached results return without a request.
+export async function fetchDistributions(items, { signal, request = caseAnalysisJson, onResult } = {}) {
+  const keyed = items.map(item => ({ ...item, cacheKey: distributionCacheKey(item.runId, item.calibration) }))
+  const cached = await getCachedDistributions(keyed.map(item => item.cacheKey))
+  const pending = []
+  keyed.forEach(item => {
+    const distribution = cached.get(item.cacheKey)
+    if (distribution) onResult?.(item.key, { runId: item.runId, cacheKey: item.cacheKey, distribution })
+    else pending.push(item)
+  })
+  await mapLimit(chunked(pending, 40), 2, async chunk => {
+    let payload
+    try {
+      payload = await postJson(request, '/agh/api/analysis-runs/distributions', {
+        items: chunk.map(item => ({ runId: item.runId, calibration: item.calibration })),
+      }, signal)
+    } catch (error) {
+      if (error.name === 'AbortError' || [401, 403].includes(error.status)) throw error
+      chunk.forEach(item => onResult?.(item.key, { runId: item.runId, cacheKey: item.cacheKey, error: error.message, retryable: true }))
+      return
+    }
+    const fresh = []
+    payload.results.forEach((result, index) => {
+      const item = chunk[index]
+      if (result.distribution) {
+        fresh.push({ key: item.cacheKey, distribution: result.distribution })
+        onResult?.(item.key, { runId: item.runId, cacheKey: item.cacheKey, distribution: result.distribution })
+      } else {
+        onResult?.(item.key, { runId: item.runId, cacheKey: item.cacheKey, error: result.error || 'Measurement unavailable', status: result.status })
+      }
+    })
+    if (fresh.length) await putCachedDistributions(fresh)
+  }, signal)
+}
+
+// ---- Saved case analyses ----------------------------------------------------
+
+const ANALYSES = '/agh/api/case-analyses'
+
+export const savedAnalyses = {
+  list: ({ signal, request = caseAnalysisJson } = {}) => request(ANALYSES, { signal }).then(payload => payload.analyses || []),
+  get: (id, { signal, request = caseAnalysisJson } = {}) => request(`${ANALYSES}/${encodeURIComponent(id)}`, { signal }),
+  create: (body, { signal, request = caseAnalysisJson } = {}) => postJson(request, ANALYSES, body, signal),
+  interrupt: (id, { signal, request = caseAnalysisJson } = {}) => postJson(request, `${ANALYSES}/${encodeURIComponent(id)}/interrupt`, {}, signal),
+  resume: (id, { signal, request = caseAnalysisJson } = {}) => postJson(request, `${ANALYSES}/${encodeURIComponent(id)}/resume`, {}, signal),
+  cancelJobs: (id, jobIds, { signal, request = caseAnalysisJson } = {}) => postJson(request, `${ANALYSES}/${encodeURIComponent(id)}/cancel`, { jobIds }, signal),
+  remove: (id, { signal, request = caseAnalysisJson } = {}) => request(`${ANALYSES}/${encodeURIComponent(id)}`, { method: 'DELETE', signal }),
+}
+
+// Request body for a new (or merged) saved analysis.
+export function analysisRequest(images, gap, { start = true } = {}) {
+  return {
+    gap,
+    start,
+    images: images.map(image => ({
+      caseId: image.caseId, filename: image.filename, channelIndex: image.channelIndex,
+      zCount: image.zCount, gap: image.gap ?? null, calibration: image.calibration,
+    })),
+    jobs: images.flatMap(image => selectedZSlices(image.zCount, image.gap ?? gap).map(zIndex => ({
+      caseId: image.caseId, filename: image.filename, zIndex,
+    }))),
+  }
+}
+
+// Same images, channels and Z sampling => the same analysis (the server
+// merges these). Used to point at existing results before running anything.
+export function selectionSignature(images, gap) {
+  return images.map(image => JSON.stringify([image.caseId, image.filename, image.channelIndex, image.gap ?? gap]))
+    .sort().join('\n')
+}
+
+export function imageSetSignature(images) {
+  return images.map(image => imageKey(image.caseId, image.filename)).sort().join('\n')
+}
+
+export function analysisTitle(analysis) {
+  const cases = analysis.caseIds || [...new Set((analysis.images || []).map(image => image.caseId))]
+  const named = cases.slice(0, 3).join(', ')
+  return cases.length > 3 ? `${named} +${cases.length - 3} more` : named || 'Case analysis'
+}
+
+export function analysisGapLabel(analysis) {
+  const gaps = new Set((analysis.images || []).map(image => image.gap ?? analysis.gap))
+  if (gaps.size > 1) return `${gapLabel(analysis.gap)} · custom gaps for some images`
+  return gapLabel([...gaps][0] ?? analysis.gap)
+}
+
+export async function monitorSavedAnalysis(initial, {
+  signal, onChange, request = caseAnalysisJson, pollMs = 3000, measure = fetchDistributions, distributions: known,
+} = {}) {
+  let analysis = initial
+  const distributions = new Map(known || [])
+  let dirty = false
+  let retryPasses = 0
+  const publish = () => {
+    if (!signal?.aborted) onChange?.({ analysis, distributions: new Map(distributions) })
+    dirty = false
+  }
+  while (!signal?.aborted) {
+    const images = new Map(analysis.images.map(image => [image.key, image]))
+    const needed = analysis.jobs.filter(job => {
+      if (job.run?.status !== 'SUCCEEDED') return false
+      const measured = distributions.get(job.id)
+      const cacheKey = distributionCacheKey(job.run.runId, images.get(job.imageKey)?.calibration)
+      return !measured || measured.cacheKey !== cacheKey || measured.retryable
+    })
+    if (needed.length) {
+      let lastPublish = Date.now()
+      await measure(needed.map(job => ({
+        key: job.id, runId: job.run.runId, calibration: images.get(job.imageKey)?.calibration,
+      })), {
+        signal, request,
+        onResult: (key, result) => {
+          distributions.set(key, result)
+          dirty = true
+          if (Date.now() - lastPublish > 250) { publish(); lastPublish = Date.now() }
+        },
+      })
+    }
+    if (dirty || needed.length === 0) publish()
+    const active = analysis.jobs.some(job => ACTIVE.has(job.run?.status))
+    const retryable = analysis.jobs.some(job => distributions.get(job.id)?.retryable)
+    if (!active && (!retryable || retryPasses >= 2)) break
+    if (!active) retryPasses++
+    await abortableDelay(pollMs, signal)
+    if (active) {
+      analysis = await savedAnalyses.get(analysis.id, { signal, request })
+      publish()
+    }
+  }
+  return { analysis, distributions }
+}
+
+// ---- Batch view model -------------------------------------------------------
+
+export function makeAnalysisBatch(images, gap, id = uuidv4()) {
+  const jobs = images.flatMap(image => selectedZSlices(image.zCount, image.gap ?? gap).map(zIndex => ({
+    id: `${image.key}:${zIndex}`, imageKey: image.key, zIndex, status: 'PENDING',
+    runId: null, reused: false, distribution: null, distributionError: '',
+  })))
+  return { id, createdAt: new Date().toISOString(), gap, images, jobs }
+}
+
+export function jobFromRun(job, run, measured) {
+  const distribution = measured?.runId === run?.runId ? measured : null
+  return {
+    ...job,
+    status: run?.status || 'MISSING',
+    runId: run?.runId || null,
+    progress: run?.progress || null,
+    error: run?.status === 'FAILED' ? run?.error?.message || 'Segmentation failed' : '',
+    distribution: distribution?.distribution || null,
+    distributionError: distribution?.error || '',
+  }
+}
+
+export function analysisToBatch(analysis, distributions = new Map()) {
+  if (!analysis) return null
+  return {
+    id: analysis.id,
+    createdAt: analysis.createdAt,
+    gap: analysis.gap,
+    images: analysis.images,
+    jobs: analysis.jobs.map(job => jobFromRun({ id: job.id, imageKey: job.imageKey, zIndex: job.zIndex }, job.run, distributions.get(job.id))),
+  }
 }
 
 export function batchProgress(jobs = []) {
   let fraction = 0
-  const counts = { total: jobs.length, complete: 0, reused: 0, failed: 0, empty: 0, queued: 0, running: 0 }
+  const counts = { total: jobs.length, complete: 0, failed: 0, canceled: 0, missing: 0, empty: 0, queued: 0, running: 0, measuring: 0 }
   for (const job of jobs) {
     if (job.status === 'SUCCEEDED') {
       fraction += job.distribution || job.distributionError ? 1 : 0.95
       if (job.distribution) counts.complete++
-      if (job.reused) counts.reused++
+      else if (job.distributionError) counts.failed++
+      else counts.measuring++
       if (job.distribution?.sampleCount === 0) counts.empty++
-      if (job.distributionError) counts.failed++
     } else if (['FAILED', 'SUBMIT_ERROR'].includes(job.status)) { counts.failed++; fraction++ }
+    else if (job.status === 'CANCELED') counts.canceled++
     else if (job.status === 'RUNNING') { counts.running++; fraction += Math.min(0.95, Math.max(0, job.progress?.fraction || 0)) }
     else if (job.status === 'QUEUED') counts.queued++
+    else counts.missing++
   }
   return { ...counts, percent: jobs.length ? Math.round(100 * fraction / jobs.length) : 0 }
 }
@@ -198,18 +372,13 @@ export function distributionSummary(values, counts) {
   const low = values.find(value => value >= q1 - 1.5 * iqr)
   const high = [...values].reverse().find(value => value <= q3 + 1.5 * iqr)
   const outliers = counts.reduce((sum, n, index) => sum + (values[index] < low || values[index] > high ? n : 0), 0)
-  return { count, q1, median, q3, low, high, min: values[0], max: values[values.length - 1], outliers }
-}
-
-export function representativeSamples(values, counts, limit = 120) {
-  const total = counts.reduce((sum, count) => sum + count, 0)
-  const length = Math.min(limit, total)
-  let valueIndex = 0, cumulative = counts[0] || 0
-  return Array.from({ length }, (_, index) => {
-    const rank = Math.floor((index + 0.5) * total / length)
-    while (cumulative <= rank && valueIndex < values.length - 1) cumulative += counts[++valueIndex]
-    return values[valueIndex]
-  })
+  let total = 0
+  values.forEach((value, index) => { total += value * counts[index] })
+  const mean = total / count
+  let squares = 0
+  values.forEach((value, index) => { squares += counts[index] * (value - mean) ** 2 })
+  const sd = count > 1 ? Math.sqrt(squares / (count - 1)) : 0
+  return { count, mean, sd, q1, median, q3, low, high, min: values[0], max: values[values.length - 1], outliers }
 }
 
 export function comparisonGroups(batch, { groupBy = 'case', unit = 'nm', observed = false, excluded = [] } = {}) {
@@ -223,7 +392,8 @@ export function comparisonGroups(batch, { groupBy = 'case', unit = 'nm', observe
     const image = images.get(job.imageKey)
     const key = groupBy === 'case' ? image.caseId : groupBy === 'slice' ? job.id : image.key
     if (!groups.has(key)) groups.set(key, {
-      key, caseId: image.caseId,
+      key, caseId: image.caseId, filename: groupBy === 'case' ? '' : image.filename,
+      zIndex: groupBy === 'slice' ? job.zIndex : null,
       label: groupBy === 'case' ? image.caseId : `${image.caseId} · ${image.filename}${groupBy === 'slice' ? ` · Z${job.zIndex + 1}` : ''}`,
       histogram: new Map(), images: new Set(), runs: 0,
     })
@@ -240,6 +410,26 @@ export function comparisonGroups(batch, { groupBy = 'case', unit = 'nm', observe
   return [...groups.values()].map(group => {
     const values = [...group.histogram.keys()].sort((a, b) => a - b)
     const counts = values.map(value => group.histogram.get(value))
-    return { ...group, imageCount: group.images.size, values, counts, summary: distributionSummary(values, counts) }
-  }).filter(group => group.summary).sort((a, b) => compareAlphanumeric(a.label, b.label))
+    const { histogram, images: imageKeys, ...rest } = group
+    return { ...rest, imageCount: imageKeys.size, values, counts, summary: distributionSummary(values, counts) }
+  }).filter(group => group.summary).sort((a, b) => compareAlphanumeric(a.label, b.label)
+    || (a.zIndex ?? 0) - (b.zIndex ?? 0))
+}
+
+// ---- Legacy browser-stored comparison (migrated to saved analyses) --------
+
+const legacyStorageKey = (user, scope) => `agh-viewer:${scope}:v1:${encodeURIComponent(user || 'local')}`
+
+export function loadLegacyAnalysisBatch(user, scope = 'case-analysis') {
+  try {
+    const batch = JSON.parse(localStorage.getItem(legacyStorageKey(user, scope)) || 'null')
+    if (!batch?.id || !Array.isArray(batch.images) || !Array.isArray(batch.jobs)) return null
+    return batch
+  } catch {
+    return null
+  }
+}
+
+export function clearLegacyAnalysisBatch(user, scope = 'case-analysis') {
+  try { localStorage.removeItem(legacyStorageKey(user, scope)) } catch { /* optional */ }
 }

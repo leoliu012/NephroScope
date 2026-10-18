@@ -1,5 +1,4 @@
-import { batchProgress, comparisonGroups, imageKey, makeAnalysisBatch } from './caseAnalysis.js'
-import { stableModelJson } from './modelAnalysis.js'
+import { MAX_GAP, batchProgress, comparisonGroups, gapLabel, imageKey, makeAnalysisBatch, selectedZSlices } from './caseAnalysis.js'
 
 export function imageThicknessScope(caseId, filename, meta) {
   return `image-thickness:${encodeURIComponent(JSON.stringify([
@@ -14,30 +13,67 @@ export function makeImageThicknessBatch({ caseId, filename, zCount, gap, channel
   }], gap, id)
 }
 
-export function imageThicknessSettingsChanged(batch, { gap, channelIndex, calibration }) {
-  const image = batch?.images?.[0]
-  return Boolean(image && (batch.gap !== gap || image.channelIndex !== channelIndex
-    || stableModelJson(image.calibration) !== stableModelJson(calibration)))
+// Distinct Z samplings for this stack; short stacks collapse to one choice.
+export function viewerGapOptions(zCount) {
+  const seen = new Set()
+  const options = []
+  for (let gap = 0; gap <= MAX_GAP; gap++) {
+    const slices = selectedZSlices(zCount, gap)
+    const signature = slices.join(',')
+    if (seen.has(signature)) continue
+    seen.add(signature)
+    options.push({ gap, slices })
+  }
+  return options
+}
+
+export function gapRunCounts(slices, runs = {}) {
+  let ready = 0, active = 0, failed = 0
+  for (const z of slices) {
+    const status = runs[String(z)]?.status
+    if (status === 'SUCCEEDED') ready++
+    else if (status === 'QUEUED' || status === 'RUNNING') active++
+    else if (status === 'FAILED') failed++
+  }
+  return { total: slices.length, ready, active, failed, missing: slices.length - ready - active }
+}
+
+const gapPreferenceKey = scope => `agh-viewer:thickness-gap:v1:${scope}`
+
+export function loadGapPreference(scope) {
+  try {
+    const value = localStorage.getItem(gapPreferenceKey(scope))
+    if (value === null || value === undefined) return null
+    const gap = Number(value)
+    return Number.isInteger(gap) && gap >= 0 && gap <= MAX_GAP ? gap : null
+  } catch {
+    return null
+  }
+}
+
+export function saveGapPreference(scope, gap) {
+  try { localStorage.setItem(gapPreferenceKey(scope), String(gap)) } catch { /* optional */ }
 }
 
 export function imageThicknessReport(batch, options = {}) {
   if (!batch) return null
   const image = batch.images[0]
+  const groupBy = options.groupBy === 'slice' ? 'slice' : 'image'
   const groups = comparisonGroups(batch, {
-    groupBy: options.groupBy === 'slice' ? 'slice' : 'image',
-    unit: options.unit || 'nm', observed: Boolean(options.observed),
-  }).map(group => ({ ...group, label: options.groupBy === 'slice'
-    ? `Z${batch.jobs.find(job => job.id === group.key).zIndex + 1}` : 'All analyzed Z slices' }))
+    groupBy, unit: options.unit || 'nm', observed: Boolean(options.observed),
+  }).map(group => {
+    const title = groupBy === 'slice' ? `Z${batch.jobs.find(job => job.id === group.key).zIndex + 1}` : 'All analyzed Z slices'
+    return { ...group, label: title, title }
+  })
   if (!groups.length) return null
   return {
     caseId: image.caseId, filename: image.filename, calibration: image.calibration,
-    channelIndex: image.channelIndex, gap: batch.gap, createdAt: batch.createdAt,
+    channelIndex: image.channelIndex, gap: batch.gap, gapLabel: gapLabel(batch.gap), createdAt: batch.createdAt,
     slices: batch.jobs.map(job => job.zIndex + 1),
     measuredSlices: batch.jobs.filter(job => job.distribution).map(job => job.zIndex + 1),
     progress: batchProgress(batch.jobs), groups,
     unit: options.unit || 'nm', observed: Boolean(options.observed),
-    focus: options.focus !== false, showPoints: options.showPoints !== false,
-    groupBy: options.groupBy === 'slice' ? 'slice' : 'image',
+    focus: options.focus !== false, groupBy,
   }
 }
 
@@ -58,7 +94,7 @@ export function combinedThicknessExportLayout(image, reports) {
     return item
   })
   if (width > 16384 || height > 16384 || width * height > 64_000_000) {
-    throw new Error('This image and thickness report are too large for one PNG/JPEG. Choose PDF, or pool the Z slices into one box plot.')
+    throw new Error('This image and thickness report are too large for one PNG/JPEG. Choose PDF, or pool the Z slices into one plot.')
   }
   return { width, height, items }
 }
