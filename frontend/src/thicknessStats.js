@@ -109,9 +109,40 @@ export function plotDomain(groups, focus) {
   }
 }
 
+// The full layout keeps a fixed label column left of the plot area; labels
+// wrap or shorten inside it and never run into the distributions.
 export const PLOT_LAYOUT = {
-  full: { width: 980, plotLeft: 262, plotRight: 820, rowHeight: 62, top: 34, bottom: 62 },
-  compact: { width: 320, plotLeft: 12, plotRight: 308, rowHeight: 64, top: 30, bottom: 58 },
+  full: { width: 1060, labelLeft: 16, labelRight: 300, plotLeft: 320, plotRight: 900, rowHeight: 70, top: 34, bottom: 62 },
+  compact: { width: 320, labelLeft: 4, labelRight: 316, plotLeft: 12, plotRight: 308, rowHeight: 64, top: 30, bottom: 58 },
+}
+
+export function middleEllipsis(text, max) {
+  const value = String(text || '')
+  if (value.length <= max) return value
+  const head = Math.ceil((max - 1) * 0.55)
+  return `${value.slice(0, head)}…${value.slice(value.length - (max - 1 - head))}`
+}
+
+// Characters that fit in a column, from a conservative Arial advance width
+// (digits, capitals and underscores dominate microscopy file names).
+export function labelChars(widthPx, fontSize, bold = false) {
+  return Math.max(4, Math.floor(widthPx / (fontSize * (bold ? 0.64 : 0.57))))
+}
+
+// Wrap at "_", "-", " " or "·" where possible; the last line keeps the end of
+// the name (for example "-3.nd2") with a middle ellipsis.
+export function wrapLabel(text, maxChars, maxLines = 2) {
+  let rest = String(text || '')
+  const lines = []
+  while (rest.length > maxChars && lines.length < maxLines - 1) {
+    const window = rest.slice(0, maxChars + 1)
+    const breakAt = Math.max(...['_', '-', ' ', '·', '.'].map(mark => window.lastIndexOf(mark)))
+    const cut = breakAt >= Math.floor(maxChars * 0.5) && breakAt < maxChars ? breakAt + 1 : maxChars
+    lines.push(rest.slice(0, cut).trimEnd())
+    rest = rest.slice(cut).trimStart()
+  }
+  lines.push(middleEllipsis(rest, maxChars))
+  return lines
 }
 
 export function distributionPlotSize(groupCount, compact = false) {

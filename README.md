@@ -388,7 +388,9 @@ analysis. Each group shows its mean (◆, primary) ± SD, median, IQR box,
 thickness sample counts, rather than image or case averages. Axis gridlines use
 whole 1, 2 or 5 × 10ⁿ steps (for example every 50 or 100 nm) with a finer
 minor grid. Measurements are cached in the browser, so reopening an analysis
-needs no new measurement requests.
+needs no new measurement requests. **Export PDF** and **Export PNG** save the
+current comparison (grouping, units, included images) with its statistics table;
+PDFs hold eight groups per page on a shared axis.
 
 The opened image viewer also has **Run thickness analysis**, which opens the
 **Thickness** side tab described above. Its Z slider marks segmented slices with
