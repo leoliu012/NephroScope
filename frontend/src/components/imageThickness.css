@@ -1,28 +1,37 @@
-.ta-panel { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.ta-panel { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
 .ta-panel h2, .ta-panel h3 { font-size: 13px; font-weight: 600; }
-.ta-panel h4 { font-size: 12px; font-weight: 600; margin-bottom: 8px; }
+.ta-panel h4 { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
 .ta-panel .ca-help { font-size: 11px; line-height: 1.5; }
+.ta-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 24px; }
+.ta-loading { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--text-subtle); }
+.ta-label { font-size: 11px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; }
+.ta-gap-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 4px; }
+.ta-gap { display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 5px 2px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); color: var(--text-muted); font-size: 11px; font-weight: 600; cursor: pointer; }
+.ta-gap:hover:not(:disabled) { border-color: var(--border-strong); }
+.ta-gap:disabled { cursor: not-allowed; opacity: 0.6; }
+.ta-gap.is-selected { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.ta-gap-count { display: inline-flex; align-items: center; font-size: 10px; font-weight: 500; color: var(--text-subtle); font-variant-numeric: tabular-nums; }
+.ta-gap.is-ready .ta-gap-count { color: var(--success); }
+.ta-gap.is-partial .ta-gap-count { color: var(--accent); }
+.ta-slices { font-size: 11px; color: var(--text-muted); margin-top: 6px; line-height: 1.5; }
+.ta-slices strong { color: var(--text); font-weight: 600; }
+.ta-calibration { font-size: 11px; color: var(--text-subtle); margin-top: -6px; }
 .ta-panel input[type="range"], .ta-panel progress { width: 100%; accent-color: var(--accent); }
-.ta-panel .ca-field input[type="range"] { min-width: 0; margin: 3px 0; }
-.ta-gap-ticks { display: flex; justify-content: space-between; font-size: 10px; color: var(--text-subtle); margin-top: -10px; }
-.ta-slices, .ta-progress-section { font-size: 12px; }
-.ta-progress-section { border-top: 1px solid var(--border); padding-top: 12px; }
-.ta-progress-section progress { height: 8px; margin-bottom: 6px; }
-.ta-actions { display: flex; flex-wrap: wrap; gap: 4px; margin: 5px 0; }
-.ta-actions .ux-button { min-height: 26px; padding: 4px 6px; font-size: 11px; }
-.ta-panel summary { font-size: 11px; cursor: pointer; padding: 8px 0; }
-.ta-run-settings { border: 1px solid var(--border); border-radius: 6px; padding: 0 10px; }
-.ta-run-settings summary { font-size: 12px; font-weight: 600; }
-.ta-run-settings summary span { display: block; margin-top: 4px; color: var(--text-subtle); font-size: 10px; font-weight: 400; }
-.ta-run-fields { display: flex; flex-direction: column; gap: 10px; padding: 4px 0 10px; }
-.ta-job-list li { display: grid; grid-template-columns: 32px 1fr; gap: 6px; padding: 4px 0; font-size: 11px; }
+.ta-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.ta-actions:empty { display: none; }
+.ta-actions .ux-button { flex: 1; justify-content: center; }
+.ta-progress-section { font-size: 12px; }
+.ta-progress-section progress { height: 8px; margin-bottom: 4px; }
+.ta-panel summary { font-size: 11px; cursor: pointer; padding: 4px 0; color: var(--text-muted); }
+.ta-job-list li { display: grid; grid-template-columns: 32px 1fr; gap: 6px; padding: 3px 0; font-size: 11px; }
 .ta-results { border-top: 1px solid var(--border); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
-.ta-plot-controls { display: grid; grid-template-columns: 1fr 64px; gap: 8px; }
-.ta-check { display: flex; align-items: center; gap: 8px; font-size: 11px; }
-.ta-check input { accent-color: var(--accent); }
-.ca-box-plot.ta-compact-plot { min-width: 0; width: 100%; margin: 0; }
+.ta-results-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ta-results-head .ca-z-pill { font-size: 11px; }
+.ta-plot-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .ta-statistics section { border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin: 8px 0; }
-.ta-statistics dl { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 8px; }
+.ta-stat-mean { font-size: 18px; font-weight: 700; color: var(--text); font-variant-numeric: tabular-nums; margin-bottom: 8px; }
+.ta-stat-mean span { display: block; font-size: 11px; font-weight: 400; color: var(--text-subtle); margin-top: 1px; }
+.ta-statistics dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .ta-statistics dt { color: var(--text-subtle); font-size: 10px; }
 .ta-statistics dd { font-size: 12px; font-variant-numeric: tabular-nums; margin: 2px 0 0; }
 .viewer-inspector-tabs.ta-tabs { display: grid; grid-template-columns: 1fr 1fr; }

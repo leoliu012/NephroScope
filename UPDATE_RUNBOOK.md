@@ -39,6 +39,20 @@ sudo apache2ctl configtest
 sudo systemctl reload apache2
 ```
 
+## 2b. Frontend Served Through Tailscale (no Apache)
+
+If users open the app through `tailscale serve` (or another proxy) pointed at the
+Vite port, run the production build instead of `npm run dev`; the dev server's
+many module requests can be dropped by the proxy and leave a blank page:
+
+```bash
+cd ~/NephroScope/frontend
+npm run serve
+```
+
+It listens on the same port as the dev server (5173 unless `AGH_FRONTEND_PORT`
+is set) and proxies `/agh/api` to the backend like the dev server does.
+
 ## 3. Browser Hard Refresh
 
 After the backend restart and frontend rebuild, hard refresh the browser:

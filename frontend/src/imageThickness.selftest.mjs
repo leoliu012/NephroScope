@@ -1,55 +1,58 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { loadAnalysisBatch, saveAnalysisBatch } from './caseAnalysis.js'
+import { jobFromRun } from './caseAnalysis.js'
 import {
-  combinedThicknessExportLayout, imageThicknessReport, imageThicknessScope,
-  imageThicknessSettingsChanged, makeImageThicknessBatch, thicknessReportPages,
+  combinedThicknessExportLayout, gapRunCounts, imageThicknessReport, imageThicknessScope, loadGapPreference,
+  makeImageThicknessBatch, saveGapPreference, thicknessReportPages, viewerGapOptions,
 } from './imageThickness.js'
 
 const calibration = { pixelSizeXUm: 0.5, pixelSizeYUm: 0.5, expansionEnabled: true, expansionFactor: 2 }
 const input = { caseId: 'case1', filename: 'image.tif', zCount: 6, gap: 1, channelIndex: 1, calibration }
 
-test('viewer analysis uses the same slice selection and snapshots calibration', () => {
+test('viewer analysis uses the same slice selection and copies calibration', () => {
   const batch = makeImageThicknessBatch(input, 'image-analysis')
   assert.deepEqual(batch.jobs.map(job => job.zIndex), [0, 2, 4])
   assert.deepEqual(batch.images[0].calibration, calibration)
   assert.notEqual(batch.images[0].calibration, calibration)
-  assert.equal(imageThicknessSettingsChanged(batch, input), false)
-  for (const update of [{ gap: 0 }, { channelIndex: 0 }, { calibration: { ...calibration, expansionFactor: 7 } }]) {
-    assert.equal(imageThicknessSettingsChanged(batch, { ...input, ...update }), true)
-  }
   assert.deepEqual(makeImageThicknessBatch({ ...input, zCount: 2, gap: 8 }, 'short').jobs.map(job => job.zIndex), [1])
 })
 
-test('image/user/source-specific persistence does not replace Case analysis', () => {
+test('Z sampling choices collapse duplicates and count saved runs', () => {
+  assert.deepEqual(viewerGapOptions(1).map(option => option.gap), [0])
+  assert.deepEqual(viewerGapOptions(3).map(option => [option.gap, option.slices]), [[0, [0, 1, 2]], [1, [0, 2]], [2, [1]]])
+  assert.equal(viewerGapOptions(40).length, 9)
+  const runs = { 0: { status: 'SUCCEEDED' }, 2: { status: 'QUEUED' }, 4: { status: 'FAILED' } }
+  assert.deepEqual(gapRunCounts([0, 2, 4], runs), { total: 3, ready: 1, active: 1, failed: 1, missing: 1 })
+})
+
+test('the remembered Z sampling is per image source', () => {
   const data = new Map()
-  globalThis.localStorage = { getItem: key => data.get(key), setItem: (key, value) => data.set(key, value), removeItem: key => data.delete(key) }
+  globalThis.localStorage = { getItem: key => data.has(key) ? data.get(key) : null, setItem: (key, value) => data.set(key, value) }
   const meta = { sourceId: 'path-a', sourceSize: 10, sourceMtimeNs: 123 }
   const scope = imageThicknessScope('case1', 'image.tif', meta)
-  const batch = makeImageThicknessBatch(input, 'viewer')
-  saveAnalysisBatch('alice', { ...batch, id: 'cases' })
-  saveAnalysisBatch('alice', batch, scope)
-  assert.equal(loadAnalysisBatch('alice').id, 'cases')
-  assert.equal(loadAnalysisBatch('alice', scope).id, 'viewer')
-  assert.equal(loadAnalysisBatch('bob', scope), null)
+  assert.equal(loadGapPreference(scope), null)
+  saveGapPreference(scope, 3)
+  assert.equal(loadGapPreference(scope), 3)
   for (const different of [
     imageThicknessScope('case2', 'image.tif', meta),
     imageThicknessScope('case1', 'another.tif', meta),
     imageThicknessScope('case1', 'image.tif', { ...meta, sourceMtimeNs: 124 }),
-    imageThicknessScope('case1', 'image.tif', { ...meta, sourceId: 'path-b' }),
-  ]) assert.equal(loadAnalysisBatch('alice', different), null)
+  ]) assert.equal(loadGapPreference(different), null)
   delete globalThis.localStorage
 })
 
 test('report and sidebar share exact point-weighted statistics and record partial/empty runs', () => {
   const batch = makeImageThicknessBatch(input, 'viewer')
-  batch.jobs.forEach((job, index) => Object.assign(job, { runId: `run${index}`, status: 'SUCCEEDED' }))
-  batch.jobs[0].distribution = { calibration, valuesUm: [0.1, 0.5], counts: [100, 1], sampleCount: 101 }
-  batch.jobs[1].distribution = { calibration, valuesUm: [], counts: [], sampleCount: 0 }
+  batch.jobs = batch.jobs.map((job, index) => jobFromRun(job, { runId: `run${index}`, status: 'SUCCEEDED' }, index === 0
+    ? { runId: 'run0', distribution: { calibration, valuesUm: [0.1, 0.5], counts: [100, 1], sampleCount: 101 } }
+    : index === 1 ? { runId: 'run1', distribution: { calibration, valuesUm: [], counts: [], sampleCount: 0 } } : null))
   const report = imageThicknessReport(batch, { unit: 'nm', observed: false })
   assert.equal(report.groups.length, 1)
   assert.equal(report.groups[0].summary.count, 101)
   assert.equal(report.groups[0].summary.median, 100)
+  assert.ok(Math.abs(report.groups[0].summary.mean - (100 * 100 + 500) / 101) < 1e-9)
+  assert.equal(report.groups[0].title, 'All analyzed Z slices')
+  assert.equal(report.gapLabel, 'Every 2nd Z slice')
   assert.equal(report.progress.complete, 2)
   assert.equal(report.progress.empty, 1)
   assert.deepEqual(report.slices, [1, 3, 5])

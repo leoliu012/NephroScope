@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  batchProgress, comparisonGroups, distributionSummary, imageApi, imageKey, is60X, isPost60X,
-  loadAnalysisBatch, makeAnalysisBatch, monitorCaseAnalysis, retryAnalysisBatch,
-  representativeSamples, saveAnalysisBatch, selectedZSlices, weightedQuantile,
+  analysisRequest, analysisToBatch, batchProgress, caseAnalysisJson, comparisonGroups, distributionSummary,
+  fetchDistributions, gapCoverage, gapLabel, imageApi, imageKey, is60X, isPost60X, makeAnalysisBatch,
+  monitorSavedAnalysis, selectedZSlices, selectionSignature, weightedQuantile,
 } from './caseAnalysis.js'
+import { distributionCacheKey } from './distributionCache.js'
+import { densityCurve, formatThickness, niceScale } from './thicknessStats.js'
 import { defaultMeasurementSettings, loadMeasurementSettings, saveMeasurementSettings } from './measurementSettings.js'
 
 const calibration = { pixelSizeXUm: 0.5, pixelSizeYUm: 0.5, expansionEnabled: true, expansionFactor: 2 }
@@ -59,8 +61,11 @@ test('quantiles exactly match the full expanded sample population, including une
   assert.equal(weightedQuantile([], [], 0.5), null)
   assert.equal(distributionSummary([], []), null)
   assert.deepEqual(distributionSummary([4], [1]), {
-    count: 1, q1: 4, median: 4, q3: 4, low: 4, high: 4, min: 4, max: 4, outliers: 0,
+    count: 1, mean: 4, sd: 0, q1: 4, median: 4, q3: 4, low: 4, high: 4, min: 4, max: 4, outliers: 0,
   })
+  const weighted = distributionSummary([1, 3], [3, 1])
+  assert.equal(weighted.mean, 1.5)
+  assert.ok(Math.abs(weighted.sd - 1) < 1e-12)
   const withOutlier = distributionSummary([1, 2, 3, 100], [5, 5, 5, 1])
   assert.equal(withOutlier.high, 3)
   assert.equal(withOutlier.outliers, 1)
@@ -93,96 +98,6 @@ test('empty masks contribute no fabricated values to comparison groups', () => {
   assert.equal(batchProgress(batch.jobs).complete, 1)
 })
 
-test('representative dots use actual samples and show every sample for small groups', () => {
-  assert.deepEqual(representativeSamples([1, 2, 3], [3, 1, 1]), [1, 1, 1, 2, 3])
-  assert.deepEqual(representativeSamples([], []), [])
-  const dots = representativeSamples([1, 2], [990, 10])
-  assert.equal(dots.length, 120)
-  assert.ok(dots.every(value => value === 1 || value === 2))
-  assert.ok(dots.filter(value => value === 1).length > 115)
-})
-
-test('orchestration joins saved segmentations and polls queued jobs before measuring', async () => {
-  const initial = makeAnalysisBatch([image('case1', 'a', 2)], 0, 'batch')
-  const calls = [], updates = []
-  let polls = 0
-  const request = async (url, options = {}) => {
-    calls.push([url, options])
-    if (url.endsWith('/analysis-runs')) {
-      const body = JSON.parse(options.body)
-      assert.equal(body.channelIndex, 1)
-      return { runId: `run${body.zIndex}`, status: body.zIndex === 0 ? 'SUCCEEDED' : 'QUEUED', reused: body.zIndex === 0 }
-    }
-    if (url.endsWith('/gbm-distribution')) {
-      assert.deepEqual(JSON.parse(options.body), { calibration })
-      return distribution()
-    }
-    assert.equal(url, '/agh/api/analysis-runs/run1')
-    polls++
-    return polls === 1 ? { status: 'RUNNING', progress: { fraction: 0.5 } } : { status: 'SUCCEEDED' }
-  }
-  const done = await monitorCaseAnalysis(initial, { request, onChange: next => updates.push(next), pollMs: 0 })
-  assert.equal(calls.filter(([url]) => url.endsWith('/analysis-runs')).length, 2)
-  assert.equal(calls.filter(([url]) => url.endsWith('/gbm-distribution')).length, 2)
-  assert.equal(polls, 2)
-  assert.ok(updates.some(batch => batch.jobs[1].status === 'RUNNING'))
-  assert.equal(batchProgress(done.jobs).complete, 2)
-  assert.equal(batchProgress(done.jobs).reused, 1)
-  assert.equal(batchProgress(done.jobs).percent, 100)
-  assert.equal(initial.jobs[0].status, 'PENDING')
-})
-
-test('failed submissions, deleted runs and distribution failures can be retried', async () => {
-  const initial = makeAnalysisBatch([image('case1', 'a', 3)], 0, 'batch')
-  Object.assign(initial.jobs[1], { status: 'QUEUED', runId: 'deleted' })
-  Object.assign(initial.jobs[2], { status: 'SUCCEEDED', runId: 'saved' })
-  const done = await monitorCaseAnalysis(initial, { onChange() {}, request: async url => {
-    if (url.endsWith('/analysis-runs')) throw new Error('Cannot submit')
-    if (url.endsWith('/deleted')) throw Object.assign(new Error('Gone'), { status: 404 })
-    throw new Error('Cannot load geometry')
-  } })
-  assert.equal(batchProgress(done.jobs).failed, 3)
-  const retried = retryAnalysisBatch(done)
-  assert.deepEqual(retried.jobs.map(job => job.status), ['PENDING', 'PENDING', 'SUCCEEDED'])
-  assert.deepEqual(retried.jobs.map(job => job.runId), [null, null, 'saved'])
-  assert.ok(retried.jobs.every(job => !job.distributionError))
-})
-
-test('abort stops additional submissions and auth errors stop monitoring', async () => {
-  const initial = makeAnalysisBatch([image('case1', 'a', 20)], 0, 'batch')
-  const controller = new AbortController()
-  let calls = 0
-  await assert.rejects(monitorCaseAnalysis(initial, { signal: controller.signal, onChange() {}, request: async () => {
-    calls++
-    controller.abort()
-    throw new DOMException('Aborted', 'AbortError')
-  } }), { name: 'AbortError' })
-  assert.equal(calls, 1)
-  await assert.rejects(monitorCaseAnalysis(makeAnalysisBatch([image()], 0, 'batch'), {
-    onChange() {}, request: async () => { throw Object.assign(new Error('Session expired'), { status: 401 }) },
-  }), { status: 401 })
-})
-
-test('saved browser batch retains run IDs and calibration; reopens without resubmitting runs', async () => {
-  const data = new Map()
-  globalThis.localStorage = { setItem: (key, value) => data.set(key, value), getItem: key => data.get(key), removeItem: key => data.delete(key) }
-  const batch = makeAnalysisBatch([image()], 0, 'batch')
-  Object.assign(batch.jobs[0], { status: 'SUCCEEDED', runId: 'cached', distribution: distribution() })
-  assert.equal(saveAnalysisBatch('alice', batch), true)
-  assert.equal(loadAnalysisBatch('bob'), null)
-  const restored = loadAnalysisBatch('alice')
-  assert.equal(restored.jobs[0].distribution, null)
-  assert.deepEqual(restored.images[0].calibration, calibration)
-  const done = await monitorCaseAnalysis(restored, { onChange() {}, request: async url => {
-    assert.equal(url, '/agh/api/analysis-runs/cached/measurements/gbm-distribution')
-    return distribution()
-  } })
-  assert.equal(batchProgress(done.jobs).complete, 1)
-  saveAnalysisBatch('alice', null)
-  assert.equal(loadAnalysisBatch('alice'), null)
-  delete globalThis.localStorage
-})
-
 test('analysis shares the viewer calibration defaults and saved per-image settings', () => {
   const meta = { pixelSizeXUm: 0.015, pixelSizeIsDefault: false }
   assert.equal(defaultMeasurementSettings(meta, '#4').expansionFactor, '7.23')
@@ -194,4 +109,137 @@ test('analysis shares the viewer calibration defaults and saved per-image settin
   saveMeasurementSettings('#4', 'a.tif', settings)
   assert.deepEqual(loadMeasurementSettings('#4', 'a.tif', meta), settings)
   delete globalThis.localStorage
+})
+
+test('axis ticks fall on whole 1, 2 or 5 steps with a finer minor grid', () => {
+  const nm = niceScale(306.346, 1531.732, 7)
+  assert.equal(nm.step, 200)
+  assert.deepEqual(nm.ticks, [200, 400, 600, 800, 1000, 1200, 1400, 1600])
+  assert.equal(nm.minorStep, 50)
+  assert.ok(nm.minorTicks.includes(250) && !nm.minorTicks.includes(400))
+  const compact = niceScale(212, 388, 4)
+  assert.equal(compact.step, 50)
+  assert.deepEqual(compact.ticks, [200, 250, 300, 350, 400])
+  assert.equal(compact.minorStep, 10)
+  const um = niceScale(0.212, 0.388, 4)
+  assert.equal(um.step, 0.05)
+  assert.equal(um.decimals, 2)
+  assert.deepEqual(um.ticks, [0.2, 0.25, 0.3, 0.35, 0.4])
+  for (const [low, high] of [[0, 1], [37, 41], [123, 9876], [0.0012, 0.0019]]) {
+    const scale = niceScale(low, high, 7)
+    const units = scale.step / 10 ** Math.floor(Math.log10(scale.step) + 1e-9)
+    assert.ok([1, 2, 5].some(value => Math.abs(units - value) < 1e-9), `${scale.step} is a 1/2/5 step`)
+    assert.ok(scale.min <= low && scale.max >= high)
+  }
+  assert.ok(niceScale(5, 5).ticks.length > 1)
+  assert.equal(formatThickness(312.44, 'nm'), '312 nm')
+  assert.equal(formatThickness(0.31244, 'µm'), '0.312 µm')
+})
+
+test('density curve is normalized and covers the axis', () => {
+  const curve = densityCurve([100, 110, 300], [50, 50, 1], { min: 0, max: 400 }, 41)
+  assert.equal(curve.length, 41)
+  assert.equal(Math.max(...curve.map(([, density]) => density)), 1)
+  const peak = curve.reduce((best, point) => point[1] > best[1] ? point : best)
+  assert.ok(peak[0] >= 90 && peak[0] <= 120)
+  assert.deepEqual(densityCurve([], [], { min: 0, max: 1 }), [])
+})
+
+test('Z sampling labels, coverage and saved-analysis requests', () => {
+  assert.equal(gapLabel(0), 'Every Z slice')
+  assert.equal(gapLabel(1), 'Every 2nd Z slice')
+  assert.equal(gapLabel(2), 'Every 3rd Z slice')
+  assert.equal(gapLabel(3), 'Every 4th Z slice')
+  const entry = { runs: { 0: { status: 'SUCCEEDED' }, 2: { status: 'RUNNING' }, 4: { status: 'FAILED' } } }
+  assert.deepEqual(gapCoverage(entry, 6, 1), { total: 3, ready: 1, active: 1, missing: 1 })
+  assert.deepEqual(gapCoverage(entry, 6, 8), { total: 1, ready: 0, active: 0, missing: 1 })
+  const images = [image('case1', 'a', 6), image('case2', 'b', 3, 8)]
+  const body = analysisRequest(images, 1)
+  assert.deepEqual(body.jobs.map(job => [job.caseId, job.zIndex]), [['case1', 0], ['case1', 2], ['case1', 4], ['case2', 1]])
+  assert.equal(body.images[1].gap, 8)
+  assert.equal(body.start, true)
+  assert.equal(selectionSignature(images, 1), selectionSignature([...images].reverse(), 1))
+  assert.notEqual(selectionSignature(images, 1), selectionSignature(images, 2))
+  assert.notEqual(selectionSignature(images, 1), selectionSignature([{ ...images[0], channelIndex: 0 }, images[1]], 1))
+})
+
+const savedAnalysis = (statuses) => ({
+  id: 'analysis-1', createdAt: '2026-01-01T00:00:00Z', gap: 0, status: 'running',
+  images: [{ ...image('case1', 'a', statuses.length), key: imageKey('case1', 'a') }],
+  jobs: statuses.map((status, z) => ({
+    id: `${imageKey('case1', 'a')}:${z}`, imageKey: imageKey('case1', 'a'), caseId: 'case1', filename: 'a', zIndex: z,
+    run: status ? { runId: `run${z}`, status } : null,
+  })),
+})
+
+test('saved analyses map onto the comparison view model', () => {
+  const analysis = savedAnalysis(['SUCCEEDED', 'QUEUED', 'CANCELED', null])
+  const batch = analysisToBatch(analysis, new Map([[analysis.jobs[0].id, { runId: 'run0', distribution: distribution() }]]))
+  assert.deepEqual(batch.jobs.map(job => job.status), ['SUCCEEDED', 'QUEUED', 'CANCELED', 'MISSING'])
+  const progress = batchProgress(batch.jobs)
+  assert.deepEqual([progress.complete, progress.queued, progress.canceled, progress.missing], [1, 1, 1, 1])
+  assert.equal(comparisonGroups(batch)[0].summary.count, 4)
+  // A measurement of an older run is not shown for a newer run of the same slice.
+  const stale = analysisToBatch(analysis, new Map([[analysis.jobs[0].id, { runId: 'old', distribution: distribution() }]]))
+  assert.equal(stale.jobs[0].distribution, null)
+})
+
+test('monitoring polls one analysis request and measures finished slices once', async () => {
+  const first = savedAnalysis(['SUCCEEDED', 'RUNNING'])
+  const second = savedAnalysis(['SUCCEEDED', 'SUCCEEDED'])
+  const calls = []
+  const measured = []
+  const request = async url => { calls.push(url); return second }
+  const measure = async (items, { onResult }) => {
+    measured.push(...items.map(item => item.runId))
+    items.forEach(item => onResult(item.key, { runId: item.runId, cacheKey: distributionCacheKey(item.runId, item.calibration), distribution: distribution() }))
+  }
+  const updates = []
+  const done = await monitorSavedAnalysis(first, { request, measure, pollMs: 0, onChange: next => updates.push(next) })
+  assert.deepEqual(calls, ['/agh/api/case-analyses/analysis-1'])
+  assert.deepEqual(measured, ['run0', 'run1'])
+  assert.equal(done.distributions.size, 2)
+  assert.ok(updates.length >= 2)
+})
+
+test('distribution requests are batched and cached results need no request', async () => {
+  const items = [{ key: 'a', runId: 'r1', calibration }, { key: 'b', runId: 'r2', calibration }]
+  let requests = 0
+  const request = async (url, options) => {
+    requests++
+    assert.equal(url, '/agh/api/analysis-runs/distributions')
+    const body = JSON.parse(options.body)
+    return { results: body.items.map(item => item.runId === 'r2'
+      ? { runId: item.runId, status: 409, error: 'not finished' }
+      : { runId: item.runId, distribution: distribution() }) }
+  }
+  const first = new Map()
+  await fetchDistributions(items, { request, onResult: (key, result) => first.set(key, result) })
+  assert.equal(requests, 1)
+  assert.equal(first.get('a').distribution.sampleCount, 4)
+  assert.equal(first.get('b').error, 'not finished')
+  const second = new Map()
+  await fetchDistributions(items, { request, onResult: (key, result) => second.set(key, result) })
+  assert.equal(requests, 2, 'only the unfinished run is requested again')
+  assert.ok(second.get('a').distribution)
+})
+
+test('requests dropped by a proxy are retried', async () => {
+  const realFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = async () => {
+    calls++
+    if (calls === 1) return new Response('', { status: 502 })
+    if (calls === 2) throw new TypeError('Failed to fetch')
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  try {
+    assert.deepEqual(await caseAnalysisJson('/agh/api/case-analyses'), { ok: true })
+    assert.equal(calls, 3)
+    calls = 10
+    globalThis.fetch = async () => new Response(JSON.stringify({ error: 'Nope' }), { status: 400 })
+    await assert.rejects(caseAnalysisJson('/agh/api/case-analyses'), { status: 400 })
+  } finally {
+    globalThis.fetch = realFetch
+  }
 })

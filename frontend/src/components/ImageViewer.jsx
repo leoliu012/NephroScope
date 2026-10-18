@@ -37,6 +37,7 @@ import {
   BarChart3,
 } from 'lucide-react'
 import { jsPDF } from 'jspdf'
+import { annotationListPages } from '../exportPages.js'
 import AnnotationLayer from './AnnotationLayer.jsx'
 import ChannelControls from './ChannelControls.jsx'
 import ModelMaskOverlay from './ModelMaskOverlay.jsx'
@@ -45,7 +46,8 @@ import ModelSkeletonOverlay from './ModelSkeletonOverlay.jsx'
 import ImageThicknessPanel from './ImageThicknessPanel.jsx'
 import useImageThicknessAnalysis from '../useImageThicknessAnalysis.js'
 import MultiChannelCanvas from './MultiChannelCanvas.jsx'
-import ZSliceSlider, { zIndexForAnnotation } from './ZSliceSlider.jsx'
+import ZSliceSlider from './ZSliceSlider.jsx'
+import { zIndexForAnnotation } from '../zSliceMarkers.js'
 import { autoWindowChannelSettings, loadChannelSettings, normalizeChannelSettings, saveChannelSettings } from '../channelDisplay.js'
 import { APP_NAME, APP_VERSION } from '../appInfo.js'
 import { defaultMeasurementSettings, normalizeMeasurementSettings, loadMeasurementSettings, saveMeasurementSettings } from '../measurementSettings.js'
@@ -140,19 +142,17 @@ function normalizeSidebarTab(value) {
   return 'annotations'
 }
 
+// Names are shown exactly as entered (only an e-mail domain is dropped), so
+// "leo", "McKay" or "élise" are not re-cased on canvas, lists or exports.
 function cleanDisplayName(value) {
   const raw = String(value || '').trim()
   if (!raw) return ''
   const withoutEmailDomain = raw.includes('@') ? raw.split('@')[0] : raw
-  return withoutEmailDomain
-    .replace(/[._-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/\b\w/g, letter => letter.toUpperCase())
+  return withoutEmailDomain.replace(/\s+/g, ' ').trim()
 }
 
 function displayInitials(value) {
-  const parts = cleanDisplayName(value).split(' ').filter(Boolean)
+  const parts = cleanDisplayName(value).split(/[\s._-]+/).filter(Boolean)
   if (!parts.length) return '?'
   return parts.slice(0, 2).map(part => part[0]).join('').toUpperCase()
 }
@@ -336,6 +336,7 @@ function modelProgressLabel(entry, globalBusy = false) {
     return 'Model ready'
   }
   if (status === 'FAILED') return 'Model failed'
+  if (status === 'CANCELED') return 'Canceled before it ran'
   return globalBusy ? 'Another Z slice is running…' : 'Not run on this Z slice'
 }
 
@@ -449,6 +450,8 @@ export default function ImageViewer({
 
   const imageRef = useRef(null)
   const svgRef = useRef(null)
+  const bottomBarsRef = useRef(null)
+  const [bottomBarsHeight, setBottomBarsHeight] = useState(0)
   const viewportRef = useRef(null)
   const dragRef = useRef(null)
   const panRafRef = useRef(null)
@@ -935,6 +938,16 @@ export default function ImageViewer({
     setAnnotationToolsOpen(true)
   }, [canAnnotate])
 
+  useEffect(() => {
+    const bars = bottomBarsRef.current
+    if (!bars || typeof ResizeObserver === 'undefined') return undefined
+    const update = () => setBottomBarsHeight(bars.getBoundingClientRect().height)
+    update()
+    const observer = new ResizeObserver(update)
+    observer.observe(bars)
+    return () => observer.disconnect()
+  }, [])
+
   const currentFileIndex = useMemo(() => files.findIndex(item => item === filename), [files, filename])
   const previousFile = currentFileIndex > 0 ? files[currentFileIndex - 1] : null
   const nextFile = currentFileIndex >= 0 && currentFileIndex < files.length - 1 ? files[currentFileIndex + 1] : null
@@ -1271,7 +1284,7 @@ export default function ImageViewer({
     const expectedZIndex = zIndex
     try {
       const reportSnapshot = includeThicknessPlot ? thicknessAnalysis.report : null
-      if (includeThicknessPlot && !reportSnapshot) throw new Error('Run thickness analysis before including its box plot')
+      if (includeThicknessPlot && !reportSnapshot) throw new Error('Run thickness analysis before including its distribution')
       const sourceCanvas = imageRef.current
       const predictionLayers = []
       const canvasContainer = sourceCanvas?.closest('.viewer-canvas-container')
@@ -1317,26 +1330,29 @@ export default function ImageViewer({
         const pdf = new jsPDF({ orientation, unit: 'px', format: [canvas.width, canvas.height], compress: false })
         pdf.addImage(imageData, 'PNG', 0, 0, canvas.width, canvas.height, undefined, 'NONE')
 
+        pdf.setFontSize(10)
+        pdf.setTextColor(180, 30, 30)
+        pdf.text(RESEARCH_USE_NOTICE, 20, Math.max(20, canvas.height - 20))
+
         const exportedAnnotations = annotations.filter(annotation => (
           zIndexForAnnotation(annotation, zCount) === zIndex
         ))
         if (includeAnnotations && exportedAnnotations.length) {
-          pdf.addPage()
-          pdf.setFontSize(10)
-          pdf.text('Annotations', 20, 20)
-          exportedAnnotations.forEach((annotation, index) => {
+          // Drawn with the browser's fonts: the PDF's built-in font cannot show
+          // every character (µ, ×, accents, Chinese) exactly as typed.
+          const entries = exportedAnnotations.map((annotation, index) => {
             const type = normalizedAnnotationType(annotation)
             const timestamp = annotation.timestamp ? new Date(annotation.timestamp).toLocaleString() : ''
             const details = type === 'measure'
               ? formatMeasurement(annotation.coords, annotation, measurementMeta)
               : annotation.label || ''
-            pdf.text(`${index + 1}. [${type}] ${details} - ${annotation.annotator || 'unknown'} @ ${timestamp}`, 20, 35 + index * 14)
+            return `${index + 1}. [${type}] ${details} — ${annotation.annotator || 'unknown'}${timestamp ? ` · ${timestamp}` : ''}`
+          })
+          annotationListPages(entries, { title: `Annotations · ${filename} · Z ${zIndex + 1}`, notice: RESEARCH_USE_NOTICE }).forEach(page => {
+            pdf.addPage([page.width, page.height], page.width >= page.height ? 'landscape' : 'portrait')
+            pdf.addImage(page.toDataURL('image/png'), 'PNG', 0, 0, page.width, page.height, undefined, 'FAST')
           })
         }
-
-        pdf.setFontSize(10)
-        pdf.setTextColor(180, 30, 30)
-        pdf.text(RESEARCH_USE_NOTICE, 20, Math.max(20, canvas.height - 20))
         thicknessReports.forEach(report => {
           pdf.addPage([report.width, report.height], report.width >= report.height ? 'landscape' : 'portrait')
           pdf.addImage(report.toDataURL('image/png'), 'PNG', 0, 0, report.width, report.height, undefined, 'FAST')
@@ -1865,7 +1881,9 @@ export default function ImageViewer({
   const currentModelError = currentModelRun?.maskError || (modelSkeletonSettings.visible ? currentModelRun?.skeletonError : '') || currentModelRun?.error || currentModelRun?.pollError || ''
   const currentModelProgressPercent = modelProgressPercent(currentModelRun)
   const exportFloatingRight = sidebarCollapsed ? 18 : 338
-  const exportFloatingBottom = zCount > 1 ? 108 : 64
+  // Float above the Z bar and status bar, whatever their current height, so
+  // Export never covers "Cache all slices".
+  const exportFloatingBottom = Math.max(zCount > 1 ? 108 : 64, Math.ceil(bottomBarsHeight) + 14)
   const exportFloatingStyle = {
     right: `${exportFloatingRight}px`,
     bottom: `${exportFloatingBottom}px`,
@@ -2207,6 +2225,7 @@ export default function ImageViewer({
             </div>
           </div>
         </div>
+        <div ref={bottomBarsRef} className="flex-shrink-0">
         {zCount > 1 && (
           <div className="viewer-z-bar flex flex-shrink-0 items-center gap-3 px-4 py-2">
             <button
@@ -2293,6 +2312,7 @@ export default function ImageViewer({
           <div className="viewer-statusbar-actions">
             <span className="text-[12px] text-[var(--text-subtle)]">{canAnnotate ? (dirty ? 'Auto-saving annotations...' : 'Annotations saved') : 'Read-only'}</span>
           </div>
+        </div>
         </div>
       </div>
 
@@ -2709,7 +2729,7 @@ export default function ImageViewer({
                       )}
                       {currentThickness && (
                         <div className="rounded border border-[var(--accent)] bg-[var(--surface-1)] p-3">
-                          <p className="text-[10px] uppercase tracking-wide text-[var(--text-subtle)]">After EF adjustment · primary</p>
+                          <p className="text-[11px] font-semibold text-[var(--text-subtle)]">After EF adjustment · primary</p>
                           <p className="mt-1 font-mono text-lg font-semibold text-[var(--text)]">
                             {formatThicknessValue(currentThickness.after)}
                           </p>
@@ -2810,13 +2830,13 @@ export default function ImageViewer({
             <fieldset className="space-y-2">
               <legend className="sr-only">Export contents</legend>
               <label className={`flex items-center justify-between gap-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] px-3 py-2.5 ${thicknessAnalysis.report ? 'cursor-pointer' : 'opacity-50'}`}>
-                <span className="text-[12px] text-[var(--text-muted)]">Include thickness box plot and statistics</span>
+                <span className="text-[12px] text-[var(--text-muted)]">Include thickness distribution and statistics</span>
                 <input type="checkbox" checked={includeThicknessPlot} disabled={!thicknessAnalysis.report}
                   onChange={event => setIncludeThicknessPlot(event.currentTarget.checked)} />
               </label>
               <p className="text-[11px] leading-snug text-[var(--text-subtle)]">{thicknessAnalysis.report
-                ? `${thicknessAnalysis.progress.complete}/${thicknessAnalysis.progress.total} runs measured. Uses the Thickness tab’s grouping and units. PDF adds report pages; PNG/JPEG append the report below the image.`
-                : 'Run thickness analysis to include a box plot. At least one non-empty result is required.'}</p>
+                ? `${thicknessAnalysis.report.gapLabel} · ${thicknessAnalysis.progress.complete}/${thicknessAnalysis.progress.total} Z runs measured. Uses the Thickness tab’s grouping and units.`
+                : 'Run thickness analysis to include its distribution. At least one non-empty result is required.'}</p>
               <label className="flex cursor-pointer items-center justify-between gap-3 rounded border border-[var(--border)] bg-[var(--canvas-bg)] px-3 py-2.5">
                 <span className="text-[12px] text-[var(--text-muted)]">Include segmentation predictions</span>
                 <input

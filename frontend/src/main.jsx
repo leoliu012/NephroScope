@@ -8,3 +8,6 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     <App />
   </React.StrictMode>
 )
+
+// Every module loaded; tell the boot guard in index.html not to retry.
+window.__nephroscopeBoot?.ready()

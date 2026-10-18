@@ -12,14 +12,23 @@ const extraAllowedHosts = (process.env.AGH_ALLOWED_HOSTS || '')
   .map(host => host.trim())
   .filter(Boolean)
 const allowedHosts = [...new Set([...defaultAllowedHosts, ...extraAllowedHosts])]
+const port = Number(process.env.AGH_FRONTEND_PORT) || 5173
+const proxy = { '/agh/api': apiTarget }
 
 export default defineConfig({
   plugins: [react()],
   base: '/agh/',
   server: {
+    port,
     allowedHosts,
-    proxy: {
-      '/agh/api': apiTarget
-    }
+    proxy
+  },
+  // `npm run serve`: the production build on the dev server's port, for
+  // remote access through a proxy (2-3 requests instead of ~50 modules).
+  preview: {
+    port,
+    strictPort: true,
+    allowedHosts,
+    proxy
   }
 })

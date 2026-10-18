@@ -57,6 +57,9 @@ body {
 }
 
 button, input, select, textarea { font: inherit; }
+/* SVG text (annotations, plots) is also exported as a standalone image, where
+   the body's stylistic sets do not apply; keep both renderings identical. */
+svg text { font-feature-settings: normal; }
 button { -webkit-tap-highlight-color: transparent; }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -698,12 +701,21 @@ button { -webkit-tap-highlight-color: transparent; }
   position: relative;
   min-width: 0;
   flex: 1;
-  padding-top: calc(var(--z-pin-lanes, 1) * 22px);
+  padding-top: 4px;
+  padding-bottom: 8px;
+}
+.viewer-z-slider-track.has-pins {
+  padding-top: 22px;
 }
 .viewer-z-slider-track input {
+  position: relative;
+  z-index: 1;
   display: block;
   width: 100%;
   min-width: 0;
+  height: 16px;
+  margin: 0;
+  background: transparent;
   accent-color: var(--accent);
   cursor: ew-resize;
   touch-action: pan-y;
@@ -712,13 +724,13 @@ button { -webkit-tap-highlight-color: transparent; }
   position: absolute;
   top: 0;
   right: 8px;
-  bottom: 18px;
   left: 8px;
+  height: 20px;
   pointer-events: none;
 }
 .viewer-z-annotation-pin {
   position: absolute;
-  z-index: 1;
+  z-index: 2;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -754,38 +766,34 @@ button { -webkit-tap-highlight-color: transparent; }
   line-height: 13px;
   text-align: center;
 }
-.viewer-z-model-pin {
+.viewer-z-annotation-pin.is-cluster .viewer-z-annotation-pin-count {
+  background: #b45309;
+}
+/* Segmented slices: a row of short green bars just under the slider track. */
+.viewer-z-slice-marks {
   position: absolute;
-  z-index: 2;
-  display: inline-flex;
-  height: 20px;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  padding: 0 7px;
+  right: 8px;
+  bottom: 0;
+  left: 8px;
+  height: 7px;
+  pointer-events: none;
+}
+.viewer-z-slice-mark {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
   transform: translateX(-50%);
-  border: 1px solid currentColor;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--surface-1) 88%, transparent);
-  font-size: 9px;
-  font-weight: 700;
-  line-height: 18px;
-  white-space: nowrap;
-  cursor: pointer;
-  pointer-events: auto;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.55);
+  border-radius: 1px;
+  background: #4ade80;
+  box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.45);
 }
-.viewer-z-model-pin-running {
-  color: var(--accent);
+.viewer-z-slice-mark.is-running {
+  background: var(--accent);
+  animation: viewer-z-mark-pulse 1.2s ease-in-out infinite;
 }
-.viewer-z-model-pin-segmented {
-  color: #4ade80;
-}
-.viewer-z-model-pin:hover,
-.viewer-z-model-pin:focus-visible {
-  color: #ffffff;
-  outline: none;
-  transform: translateX(-50%) scale(1.06);
+@keyframes viewer-z-mark-pulse {
+  50% { opacity: 0.35; }
 }
 .viewer-z-load-status {
   width: 96px;

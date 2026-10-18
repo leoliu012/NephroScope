@@ -16,7 +16,7 @@ export const DEFAULT_MODEL_SKELETON_SETTINGS = Object.freeze({
 const MODEL_OVERLAY_STORAGE_KEY = 'agh-viewer:model-overlay-settings:v1'
 const MODEL_SKELETON_STORAGE_KEY = 'agh-viewer:model-skeleton-settings:v1'
 const HEX_COLOR = /^#[0-9a-f]{6}$/i
-const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED'])
+const TERMINAL_RUN_STATUSES = new Set(['SUCCEEDED', 'FAILED', 'CANCELED'])
 
 function clamp(value, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, value))
@@ -143,7 +143,7 @@ export function saveModelSkeletonSettings(settings) {
 
 export function normalizeRunStatus(value) {
   const status = String(value || '').trim().toUpperCase()
-  if (status === 'QUEUED' || status === 'RUNNING' || status === 'SUCCEEDED' || status === 'FAILED') return status
+  if (['QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELED'].includes(status)) return status
   return status || 'QUEUED'
 }
 

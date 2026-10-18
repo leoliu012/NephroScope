@@ -29,6 +29,7 @@ import ImageViewer from './components/ImageViewer.jsx'
 import { APP_NAME, APP_TAGLINE } from './appInfo.js'
 import { authFetch, fetchSession, login as loginRequest, logout as logoutRequest } from './auth.js'
 import { collaborationClientId, fetchViewState, sendHeartbeat, updateViewState, updateWorkspace } from './collaboration.js'
+import { resetCaseAnalysisSession } from './caseAnalysisSession.js'
 import { DEFAULT_EXPANSION_FACTOR, formatPixelSizeInput } from './measurement.js'
 import { loadChannelSettings, normalizeChannelSettings } from './channelDisplay.js'
 import {
@@ -543,6 +544,7 @@ export default function App() {
     setCaseAnalysisOpen(false)
     setPreviewMeta(null)
     setPreviewError(null)
+    resetCaseAnalysisSession()
     replaceWorkspaceHash('')
   }, [])
 
@@ -581,7 +583,8 @@ export default function App() {
       return
     }
     const current = caseAnalysisOpen
-      ? '#/case-analysis'
+      // Case analysis keeps its own sub-route (new / saved analysis).
+      ? (window.location.hash.startsWith('#/case-analysis') ? window.location.hash : '#/case-analysis')
       : accountOpen
       ? '#/account'
       : adminOpen
@@ -961,6 +964,7 @@ export default function App() {
     return <AdminPage
       currentUser={auth.user}
       onSourceChanged={() => {
+        resetCaseAnalysisSession()
         setCase(null)
         setSelectedFile(null)
         setOpenFile(null)

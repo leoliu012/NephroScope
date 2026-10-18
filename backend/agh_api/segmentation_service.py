@@ -41,9 +41,33 @@ def prepare_analysis_request(config, path: Path, payload) -> tuple[dict, str]:
 
     z_index = _strict_index(payload.get("zIndex"), "zIndex")
     channel_index = _strict_index(payload.get("channelIndex"), "channelIndex")
-    metadata = get_metadata(path)
+    return build_analysis_request(path, analysis_request_context(config, path), z_index, channel_index)
+
+
+def analysis_request_context(config, path: Path) -> dict:
+    """Per-image request inputs, read once and shared by every Z slice."""
+    stat = Path(path).stat()
+    metadata = _cached_metadata(str(Path(path).resolve()), int(stat.st_size), int(stat.st_mtime_ns))
     z_count = max(1, int(metadata.get("zCount") or 1))
     channel_count = max(1, int(metadata.get("channelCount") or 1))
+    return {
+        "source": {
+            "pathId": image_source_id(path),
+            "size": int(stat.st_size),
+            "mtimeNs": int(stat.st_mtime_ns),
+            "format": metadata.get("sourceFormat"),
+            "width": int(metadata["width"]),
+            "height": int(metadata["height"]),
+            "zCount": z_count,
+            "channelCount": channel_count,
+        },
+        "model": checkpoint_identity(config.model_checkpoint),
+    }
+
+
+def build_analysis_request(path: Path, context: dict, z_index: int, channel_index: int) -> tuple[dict, str]:
+    z_count = context["source"]["zCount"]
+    channel_count = context["source"]["channelCount"]
     if z_index >= z_count:
         raise BadRequest(f"zIndex must be between 0 and {z_count - 1}")
     if channel_index >= channel_count:
@@ -51,29 +75,23 @@ def prepare_analysis_request(config, path: Path, payload) -> tuple[dict, str]:
 
     requested_mip_z = 5 if z_count > 1 else 1
     z_window = choose_z_window(z_index, z_count, requested_mip_z)
-    stat = Path(path).stat()
-    checkpoint = checkpoint_identity(config.model_checkpoint)
-    source = {
-        "pathId": image_source_id(path),
-        "size": int(stat.st_size),
-        "mtimeNs": int(stat.st_mtime_ns),
-        "format": metadata.get("sourceFormat"),
-        "width": int(metadata["width"]),
-        "height": int(metadata["height"]),
-        "zCount": z_count,
-        "channelCount": channel_count,
-    }
     request_payload = {
         "zIndex": z_index,
         "channelIndex": channel_index,
         "mipZRequested": requested_mip_z,
         "mipZ": len(z_window),
         "zWindow": list(z_window),
-        "source": source,
-        "model": checkpoint,
+        "source": dict(context["source"]),
+        "model": dict(context["model"]),
         "pipelineVersion": PIPELINE_VERSION,
     }
     return request_payload, analysis_request_cache_key(path, request_payload)
+
+
+@lru_cache(maxsize=512)
+def _cached_metadata(resolved_path: str, size: int, mtime_ns: int) -> dict:
+    # Size and mtime are part of the key, so a replaced image is read again.
+    return get_metadata(Path(resolved_path))
 
 
 def analysis_request_cache_key(path: Path, request_payload: dict, *, legacy_source: bool = False) -> str:
