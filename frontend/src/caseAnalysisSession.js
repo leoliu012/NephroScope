@@ -7,6 +7,7 @@ export const caseAnalysisSession = {
   coverage: new Map(), // coverageKey -> { entry, loadedAt }
   analyses: null, // saved analysis summaries
   analysisState: new Map(), // analysisId -> { analysis, distributions }
+  views: new Map(), // analysisId -> comparison options, folded cases, scroll position
   draft: null, // the unfinished New analysis selection
   legacyMigrated: new Set(),
 }
@@ -17,5 +18,6 @@ export function resetCaseAnalysisSession() {
   caseAnalysisSession.coverage.clear()
   caseAnalysisSession.analyses = null
   caseAnalysisSession.analysisState.clear()
+  caseAnalysisSession.views.clear()
   caseAnalysisSession.draft = null
 }

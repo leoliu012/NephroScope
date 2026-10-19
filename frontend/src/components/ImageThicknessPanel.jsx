@@ -36,10 +36,12 @@ export default function ImageThicknessPanel({ analysis, ready, zCount, channelIn
       <p className="ta-label">Z sampling</p>
       {zCount > 1 ? <div className="ta-gap-grid" role="radiogroup" aria-label="Thickness analysis Z sampling">
         {gapOptions.map(option => {
+          // Short stacks share slices across gaps; match the chosen slices.
+          const selected = option.slices.join(',') === slices.join(',')
           const full = option.total && option.ready === option.total
           const partial = !full && (option.ready || option.active)
-          return <button key={option.gap} type="button" role="radio" aria-checked={option.gap === gap} disabled={!ready}
-            className={`ta-gap${option.gap === gap ? ' is-selected' : ''}${full ? ' is-ready' : partial ? ' is-partial' : ''}`}
+          return <button key={option.gap} type="button" role="radio" aria-checked={selected} disabled={!ready}
+            className={`ta-gap${selected ? ' is-selected' : ''}${full ? ' is-ready' : partial ? ' is-partial' : ''}`}
             title={`${gapLabel(option.gap)} · ${option.slices.length} Z · ${option.ready}/${option.total} with results`}
             onClick={() => setGap(option.gap)}>
             <span>{option.gap === 0 ? 'All' : `Gap ${option.gap}`}</span>

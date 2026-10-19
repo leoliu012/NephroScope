@@ -14,7 +14,7 @@ const POLL_MS = 3000
 // Thickness results for the open image come from the runs already saved on
 // the server for this channel, so any Z sampling that was analyzed before
 // (here or in Case analysis) shows immediately.
-export default function useImageThicknessAnalysis({ caseId, filename, meta, ready, channelIndex, calibration }) {
+export default function useImageThicknessAnalysis({ caseId, filename, meta, ready, channelIndex, calibration, initialGap = null }) {
   const zCount = Math.max(1, Number(meta?.zCount) || 1)
   const scope = ready ? imageThicknessScope(caseId, filename, meta) : null
   const coverageId = scope ? `${scope}#${channelIndex}` : ''
@@ -27,11 +27,14 @@ export default function useImageThicknessAnalysis({ caseId, filename, meta, read
   const [options, setOptions] = useState({ groupBy: 'image', unit: 'nm', observed: false, focus: true })
   const [refreshToken, setRefreshToken] = useState(0)
   const preferenceRef = useRef(null)
+  const initialGapRef = useRef(initialGap)
+  initialGapRef.current = initialGap
   const calibrationKey = JSON.stringify(calibration)
 
   useEffect(() => {
     if (!scope) return
-    preferenceRef.current = loadGapPreference(scope)
+    // A link from Case analysis opens on that analysis's Z sampling.
+    preferenceRef.current = Number.isInteger(initialGapRef.current) ? initialGapRef.current : loadGapPreference(scope)
     setGapState(preferenceRef.current ?? 0)
     setError('')
   }, [scope])

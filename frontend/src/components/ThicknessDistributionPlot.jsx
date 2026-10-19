@@ -86,7 +86,7 @@ const statText = (stats, unit) => ({
 
 export default function ThicknessDistributionPlot({
   groups, unit, observed = false, focus = true, compact = false, chartOnly = false, theme = 'dark', domain,
-  caseGroups = [], collapsedCases = {}, onToggleCase,
+  caseGroups = [], collapsedCases = {}, onToggleCase, linkFor,
 }) {
   const clipId = useId().replace(/:/g, '')
   if (!groups.length) return <p className="ca-empty">Results appear here as Z slices finish. Empty masks add no measurements.</p>
@@ -168,6 +168,7 @@ export default function ThicknessDistributionPlot({
         const titleY = titleLines.length > 1 ? [rowTop + 22, rowTop + 37] : [rowTop + 30]
         const subtitleY = titleLines.length > 1 ? rowTop + 53 : rowTop + 47
         const previous = layout.rows[index - 1]
+        const href = !chartOnly && linkFor ? linkFor(group) : null
         const description = `${groupTitle(group)}: mean ${formatThickness(stats.mean, unit)} (SD ${formatThickness(stats.sd, unit)}), median ${formatThickness(stats.median, unit)}, IQR ${formatThickness(stats.q1, unit, { withUnit: false })}–${formatThickness(stats.q3, unit)}, ${stats.count.toLocaleString()} points`
         return <g key={group.key} role="img" aria-label={description}>
           <title>{description}</title>
@@ -179,7 +180,13 @@ export default function ThicknessDistributionPlot({
             <text x={width - 4} y={rowTop + 27} fill={ink.subtle} fontSize="9.5" textAnchor="end">{`± ${formatThickness(stats.sd, unit, { withUnit: false })} SD`}</text>
           </g> : <>
             <g clipPath={`url(#${clipId}-labels)`}>
-              {titleLines.map((line, i) => <text key={i} x={labelLeft + indent} y={titleY[i]} fill={ink.text} fontSize="12.5" fontWeight="600">{line}</text>)}
+              {href
+                ? <a href={href} className="ca-plot-link"><title>{`Open ${groupTitle(group)} in the viewer`}</title>
+                  {/* The whole title block is clickable, not just the glyphs. */}
+                  <rect x={labelLeft + indent} y={titleY[0] - 14} width={labelWidth - indent} height={titleY.at(-1) - titleY[0] + 19} fill="transparent" />
+                  {titleLines.map((line, i) => <text key={i} x={labelLeft + indent} y={titleY[i]} fill={ink.text} fontSize="12.5" fontWeight="600">{line}</text>)}
+                </a>
+                : titleLines.map((line, i) => <text key={i} x={labelLeft + indent} y={titleY[i]} fill={ink.text} fontSize="12.5" fontWeight="600">{line}</text>)}
               <text x={labelLeft + indent} y={subtitleY} fill={ink.subtle} fontSize="10.5">{middleEllipsis(groupSubtitle(group, { showCase: !sectioned }), labelChars(labelWidth - indent, 10.5))}</text>
             </g>
             <text x={width - 14} y={cy + 1} fill={ink.text} fontSize="14" fontWeight="700" textAnchor="end">{formatThickness(stats.mean, unit, { withUnit: false })}</text>
@@ -208,8 +215,12 @@ export default function ThicknessDistributionPlot({
 
   const tableRow = (group, nested) => {
     const text = statText(group.summary, unit)
+    const label = nested ? groupTitle(group) : group.label
+    const href = linkFor ? linkFor(group) : null
     return <tr key={group.key} className={nested ? 'ca-table-nested' : undefined}>
-      <th scope="row">{!nested && <span className="ca-table-swatch" style={{ background: colorForCase(group.caseId) }} />}{nested ? groupTitle(group) : group.label}</th>
+      <th scope="row">{!nested && <span className="ca-table-swatch" style={{ background: colorForCase(group.caseId) }} />}{href
+        ? <a className="ca-table-link" href={href} title="Open in the viewer">{label}</a>
+        : label}</th>
       <td className="ca-table-mean">{text.mean} <span>± {text.sd}</span></td>
       <td>{text.median}</td><td>{text.iqr}</td><td>{text.whiskers}</td>
       <td>{group.summary.count.toLocaleString()}</td><td>{group.imageCount}</td><td>{group.runs}</td>

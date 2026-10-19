@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { CircleStop, Download, FilePlus2, Loader2, Play } from 'lucide-react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { CircleStop, Download, ExternalLink, FilePlus2, Loader2, Play } from 'lucide-react'
 import {
   analysisGapLabel, analysisTitle, analysisToBatch, batchProgress, comparisonGroups, gapShortLabel,
   monitorSavedAnalysis, savedAnalyses,
@@ -76,6 +76,19 @@ function jobTone(job) {
   return 'idle'
 }
 
+// Link that opens an image in the viewer on this analysis's channel and Z
+// sampling (and Z slice for slice groups); Back returns to the analysis.
+function viewerLink(analysis, caseId, filename, zIndex = null) {
+  const image = analysis.images.find(item => item.caseId === caseId && item.filename === filename)
+  if (!image) return null
+  const params = new URLSearchParams({
+    open: '1', tab: 'thickness', channel: String(image.channelIndex + 1),
+    gap: String(image.gap ?? analysis.gap), return: `case-analysis/analyses/${analysis.id}`,
+  })
+  if (Number.isInteger(zIndex)) params.set('z', String(zIndex + 1))
+  return `#/case/${encodeURIComponent(caseId)}/file/${encodeURIComponent(filename)}?${params}`
+}
+
 function ProgressTree({ batch, analysis, canCancel, onCancel, cancelling }) {
   const tree = useMemo(() => {
     const images = new Map(batch.images.map(image => [image.key, { image, jobs: [] }]))
@@ -106,7 +119,8 @@ function ProgressTree({ batch, analysis, canCancel, onCancel, cancelling }) {
         return <details key={image.key} className="ca-job-group">
           <summary>{image.filename}<span>{progress.complete}/{jobs.length} measured · channel {image.channelIndex + 1} · {gapShortLabel(image.gap ?? analysis.gap)}{progress.queued ? ` · ${progress.queued} queued` : ''}</span></summary>
           <div className="ca-job-group-body">
-            <p className="ca-help">{image.calibration.pixelSizeXUm} µm/px · {image.calibration.expansionEnabled ? `EF ${image.calibration.expansionFactor}` : 'unexpanded'}</p>
+            <p className="ca-help">{image.calibration.pixelSizeXUm} µm/px · {image.calibration.expansionEnabled ? `EF ${image.calibration.expansionFactor}` : 'unexpanded'}
+              {' · '}<a className="ca-table-link" href={viewerLink(analysis, image.caseId, image.filename)}>Open in viewer <ExternalLink size={11} className="inline" /></a></p>
             {canCancel && queued.length > 0 && <button type="button" className="ux-button ux-button-ghost ca-cancel-button" disabled={cancelling} onClick={() => onCancel(queued.map(job => job.id))}>
               <CircleStop size={13} />Cancel {queued.length} queued
             </button>}
@@ -126,15 +140,56 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
   const { analysis, distributions, error, setError, restartWith } = useSavedAnalysis(id)
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState('')
-  const [groupBy, setGroupBy] = useState('case')
-  const [unit, setUnit] = useState('nm')
-  const [observed, setObserved] = useState(false)
-  const [focus, setFocus] = useState(true)
-  const [excluded, setExcluded] = useState([])
+  // View choices are kept per analysis for this tab, so returning from the
+  // viewer (or switching back to an analysis) shows the same comparison.
+  const savedView = caseAnalysisSession.views.get(id) || {}
+  const [groupBy, setGroupBy] = useState(savedView.groupBy || 'case')
+  const [unit, setUnit] = useState(savedView.unit || 'nm')
+  const [observed, setObserved] = useState(Boolean(savedView.observed))
+  const [focus, setFocus] = useState(savedView.focus ?? true)
+  const [excluded, setExcluded] = useState(savedView.excluded || [])
   const [exporting, setExporting] = useState('')
   const [exportError, setExportError] = useState('')
-  const [collapsedCases, setCollapsedCases] = useState({})
-  useEffect(() => { setExcluded([]); setNotice(''); setExportError(''); setCollapsedCases({}) }, [id])
+  const [collapsedCases, setCollapsedCases] = useState(savedView.collapsedCases || {})
+  const rootRef = useRef(null)
+  const scrollRestoredRef = useRef('')
+
+  useEffect(() => {
+    const view = caseAnalysisSession.views.get(id) || {}
+    setGroupBy(view.groupBy || 'case')
+    setUnit(view.unit || 'nm')
+    setObserved(Boolean(view.observed))
+    setFocus(view.focus ?? true)
+    setExcluded(view.excluded || [])
+    setCollapsedCases(view.collapsedCases || {})
+    setNotice('')
+    setExportError('')
+  }, [id])
+
+  useEffect(() => {
+    const view = caseAnalysisSession.views.get(id) || {}
+    caseAnalysisSession.views.set(id, { ...view, groupBy, unit, observed, focus, excluded, collapsedCases })
+  }, [id, groupBy, unit, observed, focus, excluded, collapsedCases])
+
+  // Remember the scroll position when leaving (for example to the viewer)
+  // and put it back on return. Layout effects read and set it while the page
+  // is still attached, without relying on scroll events.
+  const hasAnalysis = Boolean(analysis)
+  useLayoutEffect(() => {
+    const main = rootRef.current?.closest('.ca-main')
+    if (!main) return undefined
+    return () => {
+      const view = caseAnalysisSession.views.get(id) || {}
+      caseAnalysisSession.views.set(id, { ...view, scrollTop: main.scrollTop })
+    }
+  }, [id, hasAnalysis])
+
+  useLayoutEffect(() => {
+    if (!hasAnalysis || scrollRestoredRef.current === id) return
+    scrollRestoredRef.current = id
+    const main = rootRef.current?.closest('.ca-main')
+    if (main) main.scrollTop = caseAnalysisSession.views.get(id)?.scrollTop || 0
+  }, [id, hasAnalysis])
 
   const batch = useMemo(() => analysisToBatch(analysis, distributions), [analysis, distributions])
   const progress = batchProgress(batch?.jobs)
@@ -203,7 +258,7 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
   const sorted = [...(analyses || [])]
   if (!sorted.some(item => item.id === analysis.id)) sorted.unshift(analysis)
 
-  return <div className="ca-sections">
+  return <div className="ca-sections" ref={rootRef}>
     <section className="ux-card ca-card ca-analysis-head">
       <div className="ca-analysis-title">
         <div className="min-w-0">
@@ -284,7 +339,8 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
         <button type="button" className="ux-button ux-button-ghost" onClick={() => setCollapsedCases(Object.fromEntries(plotCases.map(caseId => [caseId, true])))}>Collapse all</button>
       </div>}
       <ThicknessDistributionPlot groups={groups} unit={unit} observed={observed} focus={focus}
-        caseGroups={caseGroups} collapsedCases={collapsedCases} onToggleCase={toggleCase} />
+        caseGroups={caseGroups} collapsedCases={collapsedCases} onToggleCase={toggleCase}
+        linkFor={group => group.filename ? viewerLink(analysis, group.caseId, group.filename, group.zIndex) : null} />
     </section>
   </div>
 }
