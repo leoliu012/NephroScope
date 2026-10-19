@@ -164,6 +164,17 @@
 .ca-export-actions { gap: 8px; }
 .ca-export-actions .ux-button { min-height: 30px; padding: 5px 10px; font-size: 12px; }
 .ca-results-title > h2 { margin-bottom: 0; }
+.ca-case-fold-actions { gap: 4px; margin: 6px 0 0; }
+.ca-case-fold-actions .ca-help { margin-right: 6px; }
+.ca-case-fold-actions .ux-button { min-height: 26px; padding: 3px 8px; font-size: 11px; }
+.ca-plot-case-toggle { cursor: pointer; outline: none; }
+.ca-plot-case-toggle:hover > rect:first-child { fill: var(--accent-soft); }
+.ca-plot-case-toggle:focus-visible > rect:first-child { stroke: var(--accent); stroke-width: 1.5; }
+.ca-table-case { background: var(--surface-2); }
+.ca-table-case th button { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; color: var(--text); cursor: pointer; }
+.ca-table-case th button .ca-table-swatch { margin-right: 0; }
+.ca-table tbody .ca-table-case > th { font-weight: 600; }
+.ca-table tbody .ca-table-nested > th { padding-left: 38px; }
 .ca-comparison-filter { margin-bottom: 8px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 4px 0; }
 
 @media (max-width: 900px) { .ca-gap-options { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
