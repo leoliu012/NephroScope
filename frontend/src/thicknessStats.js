@@ -129,14 +129,35 @@ export function labelChars(widthPx, fontSize, bold = false) {
   return Math.max(4, Math.floor(widthPx / (fontSize * (bold ? 0.64 : 0.57))))
 }
 
-// Wrap at "_", "-", " " or "·" where possible; the last line keeps the end of
-// the name (for example "-3.nd2") with a middle ellipsis.
+const BREAK_MARKS = ['_', '-', ' ', '·']
+
+// Where to split a label that needs two lines: the separator nearest the
+// middle whose two halves both fit, so neither line is a stub like "2.tif".
+export function balancedBreak(text, fits) {
+  let best = -1
+  for (let i = 1; i < text.length - 1; i++) {
+    if (!BREAK_MARKS.includes(text[i])) continue
+    const cut = i + 1
+    if (!fits(text.slice(0, cut).trimEnd()) || !fits(text.slice(cut).trimStart())) continue
+    if (best < 0 || Math.abs(cut - text.length / 2) < Math.abs(best - text.length / 2)) best = cut
+  }
+  return best
+}
+
+// Wrap at "_", "-", " " or "·" where possible (never at the extension dot);
+// a label too long for two lines keeps the end of the name (for example
+// "-3.nd2") after a middle ellipsis.
 export function wrapLabel(text, maxChars, maxLines = 2) {
   let rest = String(text || '')
+  if (rest.length <= maxChars) return [rest]
+  if (maxLines === 2 && rest.length <= maxChars * 2) {
+    const cut = balancedBreak(rest, part => part.length <= maxChars)
+    if (cut > 0) return [rest.slice(0, cut).trimEnd(), rest.slice(cut).trimStart()]
+  }
   const lines = []
   while (rest.length > maxChars && lines.length < maxLines - 1) {
     const window = rest.slice(0, maxChars + 1)
-    const breakAt = Math.max(...['_', '-', ' ', '·', '.'].map(mark => window.lastIndexOf(mark)))
+    const breakAt = Math.max(...BREAK_MARKS.map(mark => window.lastIndexOf(mark)))
     const cut = breakAt >= Math.floor(maxChars * 0.5) && breakAt < maxChars ? breakAt + 1 : maxChars
     lines.push(rest.slice(0, cut).trimEnd())
     rest = rest.slice(cut).trimStart()
@@ -145,7 +166,38 @@ export function wrapLabel(text, maxChars, maxLines = 2) {
   return lines
 }
 
-export function distributionPlotSize(groupCount, compact = false) {
+export const CASE_ROW_HEIGHT = 36
+
+// Image- and slice-level groups are shown under a header per case.
+export function hasCaseSections(groups) {
+  return groups.length > 0 && groups.every(group => group.filename && !group.title)
+}
+
+export function caseSections(groups) {
+  const sections = new Map()
+  for (const group of groups) {
+    if (!sections.has(group.caseId)) sections.set(group.caseId, [])
+    sections.get(group.caseId).push(group)
+  }
+  return [...sections].map(([caseId, members]) => ({ caseId, groups: members }))
+}
+
+// Row positions for the plot: optional case header rows, and group rows that
+// are left out while their case is folded.
+export function distributionLayout(groups, { compact = false, collapsed = {} } = {}) {
   const layout = compact ? PLOT_LAYOUT.compact : PLOT_LAYOUT.full
-  return { width: layout.width, height: layout.top + groupCount * layout.rowHeight + layout.bottom }
+  const rows = []
+  let y = layout.top
+  const pushGroup = group => { rows.push({ type: 'group', group, y, height: layout.rowHeight }); y += layout.rowHeight }
+  if (!compact && hasCaseSections(groups)) {
+    for (const section of caseSections(groups)) {
+      const folded = Boolean(collapsed[section.caseId])
+      rows.push({ type: 'case', caseId: section.caseId, groups: section.groups, folded, y, height: CASE_ROW_HEIGHT })
+      y += CASE_ROW_HEIGHT
+      if (!folded) section.groups.forEach(pushGroup)
+    }
+  } else {
+    groups.forEach(pushGroup)
+  }
+  return { ...layout, rows, rowsBottom: y, height: y + layout.bottom }
 }

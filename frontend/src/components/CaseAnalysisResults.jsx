@@ -133,11 +133,16 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
   const [excluded, setExcluded] = useState([])
   const [exporting, setExporting] = useState('')
   const [exportError, setExportError] = useState('')
-  useEffect(() => { setExcluded([]); setNotice(''); setExportError('') }, [id])
+  const [collapsedCases, setCollapsedCases] = useState({})
+  useEffect(() => { setExcluded([]); setNotice(''); setExportError(''); setCollapsedCases({}) }, [id])
 
   const batch = useMemo(() => analysisToBatch(analysis, distributions), [analysis, distributions])
   const progress = batchProgress(batch?.jobs)
   const groups = useMemo(() => comparisonGroups(batch, { groupBy, unit, observed, excluded }), [batch, groupBy, unit, observed, excluded])
+  // Pooled per-case statistics for the case headers of image/slice comparisons.
+  const caseGroups = useMemo(() => groupBy === 'case' ? [] : comparisonGroups(batch, { groupBy: 'case', unit, observed, excluded }), [batch, groupBy, unit, observed, excluded])
+  const plotCases = [...new Set(groups.map(group => group.caseId))]
+  const toggleCase = caseId => setCollapsedCases(current => ({ ...current, [caseId]: !current[caseId] }))
 
   if (!analysis) {
     return <section className="ux-card ca-card">
@@ -175,7 +180,7 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
     try {
       const { exportCaseAnalysisDistributions } = await import('../thicknessExport.jsx')
       await exportCaseAnalysisDistributions({
-        format, title: analysisTitle(analysis), analysis, gapLabel: analysisGapLabel(analysis), groups, progress,
+        format, title: analysisTitle(analysis), analysis, gapLabel: analysisGapLabel(analysis), groups, caseGroups, progress,
         groupBy, unit, observed, focus, excludedCount: excluded.length,
       })
       authFetch('/agh/api/audit/export', {
@@ -273,7 +278,13 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
       <details className="ca-comparison-filter"><summary>Images in this comparison ({analysis.images.length - excluded.length}/{analysis.images.length})</summary>
         {[...analysis.images].sort((a, b) => compareAlphanumeric(a.caseId, b.caseId) || compareAlphanumeric(a.filename, b.filename)).map(image => <label key={image.key} className="ca-check"><input type="checkbox" checked={!excluded.includes(image.key)} onChange={event => setExcluded(current => event.target.checked ? current.filter(key => key !== image.key) : [...current, image.key])} />{image.caseId} · {image.filename}</label>)}
       </details>
-      <ThicknessDistributionPlot groups={groups} unit={unit} observed={observed} focus={focus} />
+      {groupBy !== 'case' && plotCases.length > 1 && <div className="ca-inline ca-case-fold-actions">
+        <span className="ca-help">{plotCases.length} cases · {plotCases.filter(caseId => collapsedCases[caseId]).length} folded</span>
+        <button type="button" className="ux-button ux-button-ghost" onClick={() => setCollapsedCases({})}>Expand all</button>
+        <button type="button" className="ux-button ux-button-ghost" onClick={() => setCollapsedCases(Object.fromEntries(plotCases.map(caseId => [caseId, true])))}>Collapse all</button>
+      </div>}
+      <ThicknessDistributionPlot groups={groups} unit={unit} observed={observed} focus={focus}
+        caseGroups={caseGroups} collapsedCases={collapsedCases} onToggleCase={toggleCase} />
     </section>
   </div>
 }

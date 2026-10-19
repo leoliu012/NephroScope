@@ -6,7 +6,7 @@ import {
   monitorSavedAnalysis, selectedZSlices, selectionSignature, weightedQuantile,
 } from './caseAnalysis.js'
 import { distributionCacheKey } from './distributionCache.js'
-import { densityCurve, formatThickness, niceScale } from './thicknessStats.js'
+import { CASE_ROW_HEIGHT, PLOT_LAYOUT, densityCurve, distributionLayout, formatThickness, niceScale, wrapLabel } from './thicknessStats.js'
 import { defaultMeasurementSettings, loadMeasurementSettings, saveMeasurementSettings } from './measurementSettings.js'
 
 const calibration = { pixelSizeXUm: 0.5, pixelSizeYUm: 0.5, expansionEnabled: true, expansionFactor: 2 }
@@ -242,4 +242,33 @@ test('requests dropped by a proxy are retried', async () => {
   } finally {
     globalThis.fetch = realFetch
   }
+})
+
+test('image comparisons are laid out under foldable case headers', () => {
+  const group = (caseId, filename) => ({ key: `${caseId}/${filename}`, caseId, filename, summary: { count: 1 } })
+  const groups = [group('#1', 'a'), group('#1', 'b'), group('#5', 'c')]
+  const open = distributionLayout(groups)
+  assert.deepEqual(open.rows.map(row => row.type === 'case' ? row.caseId : row.group.filename), ['#1', 'a', 'b', '#5', 'c'])
+  assert.equal(open.rowsBottom, PLOT_LAYOUT.full.top + 2 * CASE_ROW_HEIGHT + 3 * PLOT_LAYOUT.full.rowHeight)
+  const folded = distributionLayout(groups, { collapsed: { '#1': true } })
+  assert.deepEqual(folded.rows.map(row => row.type === 'case' ? `${row.caseId}${row.folded ? ' (folded)' : ''}` : row.group.filename), ['#1 (folded)', '#5', 'c'])
+  // Case-level comparisons and the compact viewer plot have no headers.
+  assert.equal(distributionLayout([{ key: '#1', caseId: '#1', filename: '', summary: { count: 1 } }]).rows[0].type, 'group')
+  assert.ok(distributionLayout(groups, { compact: true }).rows.every(row => row.type === 'group'))
+})
+
+test('long file names wrap at separators and keep their ending', () => {
+  const lines = wrapLabel('20250917_AGH1_post_DAPI_NHS-488_C3-Cy3_ACTN4-647_60x_botL.nd2', 35)
+  assert.equal(lines.length, 2)
+  assert.ok(lines.every(line => line.length <= 35))
+  assert.ok(lines[0].endsWith('-') || lines[0].endsWith('_'))
+  assert.ok(lines[1].endsWith('botL.nd2'))
+  // Balanced: no stub line, never split at the extension dot.
+  const balanced = wrapLabel('AGH6_post_DAPI_NHS_IgG_glom1_60x.nd2', 30)
+  assert.deepEqual(balanced, ['AGH6_post_DAPI_NHS_', 'IgG_glom1_60x.nd2'])
+  assert.ok(wrapLabel('20250917_AGH1_post_DAPI_NHS-488_C3-Cy3_ACTN4-647_60x_2.nd2', 35).every(line => line.length >= 15))
+  assert.deepEqual(wrapLabel('short.nd2', 35), ['short.nd2'])
+  const long = wrapLabel('x'.repeat(120), 30)
+  assert.equal(long.length, 2)
+  assert.ok(long[1].includes('…'))
 })
