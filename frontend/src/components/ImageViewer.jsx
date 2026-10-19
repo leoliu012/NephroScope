@@ -340,6 +340,10 @@ export default function ImageViewer({
   files = [],
   onNavigateFile,
   initialTab = 'annotations',
+  initialZ = null,
+  initialChannel = null,
+  initialGap = null,
+  backLabel = '',
   user = '',
   role = '',
   firstName = '',
@@ -359,6 +363,9 @@ export default function ImageViewer({
   const [fullImageCacheState, setFullImageCacheState] = useState({ status: 'idle', completedPlanes: 0, totalPlanes: 0, etaMs: 0, persistent: false, error: '' })
   const [modelRunsByZ, setModelRunsByZ] = useState({})
   const [modelInputChannel, setModelInputChannel] = useState(0)
+  // One-shot starting view from a link (for example from Case analysis).
+  const initialViewRef = useRef({ z: initialZ, channel: initialChannel })
+  initialViewRef.current = { z: initialZ, channel: initialChannel }
   const [modelOverlaySettings, setModelOverlaySettings] = useState(() => loadModelOverlaySettings())
   const [modelSkeletonSettings, setModelSkeletonSettings] = useState(() => loadModelSkeletonSettings())
   const [modelRoisByZ, setModelRoisByZ] = useState({})
@@ -537,13 +544,17 @@ export default function ImageViewer({
         const nextMeasurementSettings = sharedState?.measurementSettings
           ? normalizeMeasurementSettings(sharedState.measurementSettings, meta, caseId)
           : loadMeasurementSettings(caseId, filename, meta)
-        const nextZIndex = clampZIndex(sharedState?.zIndex || 0, meta)
+        const linked = initialViewRef.current
+        const nextZIndex = clampZIndex(Number.isInteger(linked.z) ? linked.z : sharedState?.zIndex || 0, meta)
         applyingRemoteViewStateRef.current = Boolean(sharedState?.revision)
         suppressNextViewStatePublishRef.current = Boolean(sharedState?.revision)
         setImgMeta(meta)
         setChannelSettings(nextChannelSettings)
         setMeasurementSettings(nextMeasurementSettings)
-        setModelInputChannel(Math.max(1, Number(meta?.channelCount) || 1) > 1 ? 1 : 0)
+        const channelCount = Math.max(1, Number(meta?.channelCount) || 1)
+        setModelInputChannel(Number.isInteger(linked.channel) && linked.channel < channelCount
+          ? linked.channel
+          : channelCount > 1 ? 1 : 0)
         setZIndex(nextZIndex)
         setZDraftIndex(nextZIndex)
         setViewStateRevision(sharedState?.revision || 0)
@@ -1207,8 +1218,8 @@ export default function ImageViewer({
     : null
   const currentCalibration = calibrationPayload(measurementMeta || {})
   const thicknessAnalysis = useImageThicknessAnalysis({
-    caseId, filename, user, meta: imgMeta, ready: Boolean(imageReady),
-    channelIndex: modelInputChannel, calibration: currentCalibration,
+    caseId, filename, meta: imgMeta, ready: Boolean(imageReady),
+    channelIndex: modelInputChannel, calibration: currentCalibration, initialGap,
   })
   const completedThicknessId = thicknessAnalysis.batch && thicknessAnalysis.progress.total > 0
     && thicknessAnalysis.progress.complete + thicknessAnalysis.progress.failed === thicknessAnalysis.progress.total
@@ -1932,9 +1943,10 @@ export default function ImageViewer({
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="viewer-commandbar flex flex-shrink-0 items-center gap-2 px-2">
           <button onClick={requestClose}
-            className="ux-button ux-button-ghost">
+            className="ux-button ux-button-ghost"
+            title={backLabel ? `Back to ${backLabel}` : 'Back to the files browser'}>
             <ChevronLeft size={14} />
-            Back
+            {backLabel ? `Back to ${backLabel}` : 'Back'}
           </button>
           <div className="min-w-0 flex-1 px-2">
             <p className="truncate text-sm font-semibold text-gray-100">Case: {caseId}</p>

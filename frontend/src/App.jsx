@@ -192,16 +192,37 @@ function parseWorkspaceRoute(hash = window.location.hash) {
   const params = new URLSearchParams(query)
   route.open = params.get('open') === '1'
   route.tab = params.get('tab') || 'annotations'
+  // Links from Case analysis open the viewer on a channel, Z sampling and Z
+  // slice (all 1-based in the URL) and remember where to return.
+  const positive = name => {
+    const value = Number(params.get(name))
+    return Number.isInteger(value) && value >= 1 ? value : null
+  }
+  route.initialZ = positive('z') === null ? null : positive('z') - 1
+  route.initialChannel = positive('channel') === null ? null : positive('channel') - 1
+  route.initialGap = params.has('gap') && /^[0-8]$/.test(params.get('gap')) ? Number(params.get('gap')) : null
+  const returnTo = params.get('return') || ''
+  route.returnTo = returnTo.startsWith('case-analysis') ? returnTo : ''
   return route
 }
 
-function workspaceHash({ case: caseId, filename, open = false, tab = 'annotations' }) {
+function openFileFromRoute(route) {
+  if (!route.open || !route.case || !route.filename) return null
+  return {
+    case: route.case, filename: route.filename, initialTab: route.tab,
+    initialZ: route.initialZ, initialChannel: route.initialChannel, initialGap: route.initialGap,
+    returnTo: route.returnTo,
+  }
+}
+
+function workspaceHash({ case: caseId, filename, open = false, tab = 'annotations', returnTo = '' }) {
   if (!caseId) return ''
   let hash = `#/case/${encodeRoutePart(caseId)}`
   if (filename) hash += `/file/${encodeRoutePart(filename)}`
   const params = new URLSearchParams()
   if (open && filename) params.set('open', '1')
   if (tab && tab !== 'annotations') params.set('tab', tab)
+  if (open && returnTo) params.set('return', returnTo)
   const query = params.toString()
   return query ? `${hash}?${query}` : hash
 }
@@ -519,9 +540,7 @@ export default function App() {
   const [metadataExpanded, setMetadataExpanded] = useState(false)
   const [calibrationOpen, setCalibrationOpen] = useState(false)
   const [efSettingsOpen, setEfSettingsOpen] = useState(false)
-  const [openFile, setOpenFile] = useState(initialRoute.open && initialRoute.case && initialRoute.filename
-    ? { case: initialRoute.case, filename: initialRoute.filename, initialTab: initialRoute.tab }
-    : null)
+  const [openFile, setOpenFile] = useState(() => openFileFromRoute(initialRoute))
   const [adminOpen, setAdminOpen] = useState(initialRoute.admin)
   const [accountOpen, setAccountOpen] = useState(initialRoute.account)
   const [caseAnalysisOpen, setCaseAnalysisOpen] = useState(initialRoute.caseAnalysis)
@@ -568,9 +587,7 @@ export default function App() {
       setCase(route.case)
       setSelectedFile(route.filename)
       setPreviewError(null)
-      setOpenFile(route.open && route.case && route.filename
-        ? { case: route.case, filename: route.filename, initialTab: route.tab }
-        : null)
+      setOpenFile(openFileFromRoute(route))
     }
     window.addEventListener('hashchange', handleHashChange)
     return () => window.removeEventListener('hashchange', handleHashChange)
@@ -1329,6 +1346,10 @@ export default function App() {
           filename={openFile.filename}
           files={displayedFiles}
           initialTab={openFile.initialTab}
+          initialZ={openFile.initialZ}
+          initialChannel={openFile.initialChannel}
+          initialGap={openFile.initialGap}
+          backLabel={openFile.returnTo ? 'Case analysis' : ''}
           user={auth.user}
           role={auth.role}
           firstName={auth.firstName}
@@ -1339,9 +1360,15 @@ export default function App() {
           onNavigateFile={filename => {
             setSelectedFile(filename)
             setPreviewError(null)
-            setOpenFile(current => current ? { ...current, filename, initialTab: 'annotations' } : { case: selectedCase, filename, initialTab: 'annotations' })
+            setOpenFile(current => current
+              ? { ...current, filename, initialTab: 'annotations', initialZ: null, initialChannel: null, initialGap: null }
+              : { case: selectedCase, filename, initialTab: 'annotations' })
           }}
-          onClose={() => setOpenFile(null)}
+          onClose={() => {
+            // Opened from Case analysis: go back to that analysis.
+            if (openFile.returnTo) window.location.replace(`#/${openFile.returnTo}`)
+            else setOpenFile(null)
+          }}
         />
       )}
       {efSettingsOpen && (
