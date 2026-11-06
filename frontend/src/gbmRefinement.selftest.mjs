@@ -9,8 +9,8 @@ globalThis.localStorage = {
 
 const {
   DEFAULT_FILTER_SETTINGS, REASON_INFO, decodeLabel, excludedColorTable, filterIsActive, filterIsWaiting, filterKey, filterLabel,
-  filterPayload, filterTotals, keptPieceTable, loadFilterSettings, loadZStepOverride, normalizeFilterSettings, pieceInfoAt,
-  recalculationMessage, refinedLayers, reportFilterLine, saveFilterSettings, saveZStepOverride,
+  filterPayload, filterTotals, isTemporaryFailure, keptPieceTable, loadFilterSettings, loadZStepOverride, normalizeFilterSettings,
+  pieceInfoAt, recalculationMessage, refinedLayers, reportFilterLine, saveFilterSettings, saveZStepOverride, workerHasStopped,
 } = await import('./gbmRefinement.js')
 const { distributionNeeded, fetchDistributions, monitorSavedAnalysis } = await import('./caseAnalysis.js')
 const { distributionCacheKey } = await import('./distributionCache.js')
@@ -95,6 +95,20 @@ assert.match(recalculationMessage({ fetching: true }), /Recalculating/)
 assert.match(recalculationMessage({ remeasuring: true }), /thickness/)
 assert.match(recalculationMessage({ stack: { state: 'running', job: { progress: { percent: 42 } } } }), /42%/)
 assert.match(recalculationMessage({ stack: { state: 'waiting' }, fetching: true }), /segmentation finishes/)
+// A gone worker is reported as such, not as progress stuck at its last percent.
+const silent = { state: 'running', job: { heartbeatAgeSeconds: 500, progress: { percent: 87 } } }
+assert.equal(workerHasStopped(silent), true)
+assert.equal(workerHasStopped({ state: 'running', job: { heartbeatAgeSeconds: 20 } }), false)
+assert.equal(workerHasStopped({ state: 'running', job: {} }), false)
+assert.equal(workerHasStopped({ state: 'ready', job: { heartbeatAgeSeconds: 500 } }), false)
+assert.doesNotMatch(recalculationMessage({ stack: silent }), /87/)
+assert.match(recalculationMessage({ stack: silent }), /worker/)
+// Dropped requests are tried again; refusals and cancellations are not.
+assert.equal(isTemporaryFailure(new TypeError('Failed to fetch')), true)
+assert.equal(isTemporaryFailure(Object.assign(new Error('bad gateway'), { status: 502 })), true)
+assert.equal(isTemporaryFailure(Object.assign(new Error('refused'), { status: 409 })), false)
+assert.equal(isTemporaryFailure(Object.assign(new Error('server bug'), { status: 500 })), false)
+assert.equal(isTemporaryFailure(Object.assign(new Error('stop'), { name: 'AbortError' })), false)
 assert.equal(normalizeFilterSettings({ brushRadius: 5000 }).brushRadius, 200)
 assert.equal(filterKey(filterPayload({ ...DEFAULT_FILTER_SETTINGS, brushRadius: 40 })), filterKey(auto), 'brush size is not a filter change')
 

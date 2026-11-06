@@ -204,6 +204,11 @@ no segmentation of that image is running, and the previous analysis stays in use
 meanwhile (reported as stale). Its cache key covers the member runs, so any change
 to the segmented slices makes a new one, and the older one is then deleted.
 
+A worker reports every 30 seconds. When it restarts, it queues again whatever a
+worker that no longer exists left running, instead of waiting for that run's lease
+to expire. Until then, the viewer says the worker has stopped rather than showing
+the last progress.
+
 Measurements requested before an analysis is ready return with thickness limits
 applied and `filter.pending = true`, and the UI says so rather than presenting them
 as filtered. A failed analysis is not retried automatically. Browsers cache filtered

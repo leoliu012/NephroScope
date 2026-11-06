@@ -21,12 +21,15 @@ adds what the probability map shows under the brush (see :func:`region_under_ban
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from io import BytesIO
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -61,6 +64,8 @@ from .gbm_cross_section import (
 )
 from .gbm_thickness import ThicknessGeometry, load_thickness_geometry, thickness_geometry_to_arrays
 from .path_guard import image_path
+
+log = logging.getLogger(__name__)
 
 STACK_OPERATION = "gbm-stack-analysis"
 PAINT_KINDS = ("paint-keep", "paint-remove")
@@ -189,7 +194,7 @@ def stack_state(
         state.update(usable=previous, stale=True)
     if job is not None and job["status"] != "CANCELED":
         state["job"] = {"runId": job["runId"], "status": job["status"], "progress": job.get("progress"),
-                        "error": job.get("error")}
+                        "error": job.get("error"), "heartbeatAgeSeconds": _seconds_since(job.get("heartbeatAt"))}
         state["state"] = {"QUEUED": "queued", "RUNNING": "running"}.get(job["status"], "failed")
     else:
         state["state"] = "waiting" if active else "none"
@@ -230,6 +235,16 @@ def filter_tokens(config, store, runs: dict[str, dict], settings: FilterSettings
         tokens[run_id] = filter_token(state, revisions[image], settings.cross_section)
         states[run_id] = state["state"]
     return {"tokens": tokens, "states": states}
+
+
+def _seconds_since(stamp: str | None) -> float | None:
+    if not stamp:
+        return None
+    try:
+        then = datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
 
 
 def _plane_path(config, stack_run: dict, z_index: int) -> Path:
@@ -314,11 +329,13 @@ def execute_stack_analysis(config, job: dict, *, progress=None, before_publish=N
         planes.append(StackPlane(int(member["zIndex"]), float(member["center"]), mask, geometry))
         report(0.1 * (index + 1) / len(members), "Reading saved Z predictions")
 
+    started = time.monotonic()
     results = analyze_stack(
         planes,
         max_window=int(request.get("window") or DEFAULT_MAX_WINDOW),
         progress=lambda fraction, message: report(0.1 + 0.75 * fraction, message),
     )
+    log.info("Stack analysis %s measured %d planes in %.1fs; saving", job["runId"], len(planes), time.monotonic() - started)
     directory = attempt_directory(config.analysis_root, job["runId"], attempt, create=True)
     reach = []
     for index, plane in enumerate(planes):

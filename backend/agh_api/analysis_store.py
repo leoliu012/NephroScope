@@ -376,7 +376,7 @@ class AnalysisStore:
                     f"""
                     SELECT run_id, cache_key, case_id, filename, z_index, channel_index, status,
                            operation, result_json, progress_json, error_code, error_message,
-                           created_at, started_at, finished_at
+                           created_at, started_at, finished_at, heartbeat_at
                     FROM analysis_runs
                     WHERE cache_key IN ({_placeholders(chunk)})
                     ORDER BY created_at DESC, rowid DESC
@@ -704,6 +704,35 @@ class AnalysisStore:
                 })
         return grouped
 
+    def release_orphaned_runs(self, worker_is_alive) -> list[str]:
+        """Queue again the runs of workers that have gone, such as after a restart.
+
+        Their leases would otherwise keep those runs stuck as running for up to an
+        hour. ``worker_is_alive`` is given each run's worker id.
+        """
+        progress = _json_dump({
+            "stage": "queued",
+            "fraction": 0.0,
+            "percent": 0.0,
+            "message": "Waiting for the segmentation worker",
+        })
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT run_id, worker_id FROM analysis_runs WHERE status = 'RUNNING'").fetchall()
+            orphaned = [str(row["run_id"]) for row in rows if not worker_is_alive(row["worker_id"] or "")]
+            for chunk in _chunks(orphaned):
+                conn.execute(
+                    f"""
+                    UPDATE analysis_runs
+                    SET status = 'QUEUED', worker_id = NULL, heartbeat_at = NULL,
+                        lease_expires_at = NULL, progress_json = ?
+                    WHERE run_id IN ({_placeholders(chunk)}) AND status = 'RUNNING'
+                    """,
+                    (progress, *chunk),
+                )
+            conn.commit()
+        return orphaned
+
     def claim_next_run(self, worker_id: str, lease_seconds: int | None = None) -> dict | None:
         if not worker_id:
             raise ValueError("worker_id is required")
@@ -977,6 +1006,7 @@ def _row_to_status_dict(row: sqlite3.Row) -> dict:
         "createdAt": row["created_at"],
         "startedAt": row["started_at"],
         "finishedAt": row["finished_at"],
+        "heartbeatAt": row["heartbeat_at"],
     }
 
 
