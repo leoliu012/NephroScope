@@ -43,7 +43,11 @@ function decodePlane(buffer, bitsPerSample, expectedPixels) {
   throw new Error(`Unsupported channel bit depth: ${bitsPerSample || 'unknown'}`)
 }
 
-const CHANNEL_PLANE_CACHE_MAX_BYTES = 512 * 1024 * 1024
+// Enough for a typical stack, within what the device can spare.
+const DEVICE_MEMORY_GB = typeof navigator !== 'undefined' && Number(navigator.deviceMemory) > 0 ? Number(navigator.deviceMemory) : 4
+const CHANNEL_PLANE_CACHE_MAX_BYTES = Math.round(Math.min(3, Math.max(0.5, DEVICE_MEMORY_GB / 4)) * 1024 * 1024 * 1024)
+// How far around the current slice to load ahead of need.
+const MAX_WARM_RADIUS = 32
 const channelPlaneCache = new Map()
 let channelPlaneCacheBytes = 0
 
@@ -231,6 +235,19 @@ function evictCachedPlanes(protectedKey) {
   }
 }
 
+// Already decoded, without waiting for anything.
+function peekCachedPlane(url, bitsPerSample, expectedPixels) {
+  const key = `${url}|${bitsPerSample}|${expectedPixels}`
+  const entry = channelPlaneCache.get(key)
+  if (!entry?.value) return null
+  touchCachedPlane(key, entry)
+  return entry.value
+}
+
+function planeIsOnItsWay(url, bitsPerSample, expectedPixels) {
+  return channelPlaneCache.has(`${url}|${bitsPerSample}|${expectedPixels}`)
+}
+
 async function loadCachedPlane(url, bitsPerSample, expectedPixels, signal, imageCacheKey = '', persistFullImage = false) {
   if (signal?.aborted) throw abortError()
   const key = `${url}|${bitsPerSample}|${expectedPixels}`
@@ -276,13 +293,15 @@ async function loadCachedPlane(url, bitsPerSample, expectedPixels, signal, image
   return plane
 }
 
-function fillHistograms(plane, min, max) {
+const MAX_STATS_SAMPLES = 1_000_000
+
+function fillHistograms(plane, min, max, stride = 1) {
   const bins = new Array(HISTOGRAM_BINS).fill(0)
   const autoBins = new Array(AUTO_HISTOGRAM_BINS).fill(0)
   const span = Math.max(1, max - min)
   const scale = HISTOGRAM_BINS - 1
   const autoScale = AUTO_HISTOGRAM_BINS - 1
-  for (let index = 0; index < plane.length; index += 1) {
+  for (let index = 0; index < plane.length; index += stride) {
     const normalized = (plane[index] - min) / span
     let bucket = Math.floor(normalized * scale)
     if (bucket < 0) bucket = 0
@@ -312,9 +331,11 @@ export function analyzePlane(plane) {
   const memoized = planeStatsCache.get(plane)
   if (memoized) return memoized
 
+  // Display statistics do not need every pixel of a large plane.
+  const stride = Math.max(1, Math.ceil(plane.length / MAX_STATS_SAMPLES))
   let observedMin = Number(plane[0])
   let observedMax = Number(plane[0])
-  for (let index = 1; index < plane.length; index += 1) {
+  for (let index = stride; index < plane.length; index += stride) {
     const value = Number(plane[index])
     if (value < observedMin) observedMin = value
     if (value > observedMax) observedMax = value
@@ -328,11 +349,11 @@ export function analyzePlane(plane) {
   }
 
   const span = Math.max(1, max - min)
-  const { bins, autoBins } = fillHistograms(plane, min, max)
+  const { bins, autoBins } = fillHistograms(plane, min, max, stride)
   const result = {
     min,
     max,
-    pixelCount: plane.length,
+    pixelCount: Math.ceil(plane.length / stride),
     histogramBins: bins,
     autoHistogramBins: autoBins,
     autoHistogramMin: min,
@@ -796,6 +817,8 @@ export default function MultiChannelCanvas({
   onLoadState,
   cacheAllRequest = 0,
   onCacheProgress,
+  onDisplayedZ,
+  scrubRef,
   zIndex = 0,
   zCount = 1,
   prefetchAllZ = false,
@@ -814,6 +837,10 @@ export default function MultiChannelCanvas({
   const statsTaskRef = useRef(null)
   const renderPendingRef = useRef(null)
   const fullImageCacheActiveRef = useRef(false)
+  const renderedPlanesRef = useRef(null)
+  const scrubSessionRef = useRef(null)
+  const onDisplayedZRef = useRef(onDisplayedZ)
+  onDisplayedZRef.current = onDisplayedZ
   const [planes, setPlanes] = useState(null)
   const [loading, setLoading] = useState(false)
 
@@ -824,6 +851,125 @@ export default function MultiChannelCanvas({
   const channelVersion = rawChannelVersion(meta)
   const stackDepth = Math.max(1, Number(zCount) || 1)
   const fullImageCacheKey = `${apiBase}|${channelVersion}`
+
+  // Scrubbing draws directly, without React. Showing only the newest requested slice would
+  // starve the display during a drag, so anything loaded on the way to the target is shown,
+  // and at most two slices are ever requested at once, so the newest never waits in a queue.
+  useEffect(() => {
+    if (!apiBase || !width || !height) return undefined
+    const expectedPixels = width * height
+    const urlsFor = z => Array.from({ length: channelCount }, (_, index) => rawChannelUrl(apiBase, channelVersion, index, z))
+    const bytesPerSlice = expectedPixels * channelCount * (bitsPerSample === 8 ? 1 : 2)
+    const warmRadius = Math.min(stackDepth, MAX_WARM_RADIUS, Math.floor(0.9 * CHANNEL_PLANE_CACHE_MAX_BYTES / Math.max(1, bytesPerSlice) / 2))
+    const session = { closed: false, target: null, direction: 1, pending: null, frame: null, inFlight: new Set(), warming: false, warmCenter: null }
+
+    const cachedPlanes = z => {
+      const found = []
+      for (const url of urlsFor(z)) {
+        const plane = peekCachedPlane(url, bitsPerSample, expectedPixels)
+        if (!plane) return null
+        found.push(plane)
+      }
+      return found
+    }
+    const load = z => Promise.all(urlsFor(z).map(url => loadCachedPlane(url, bitsPerSample, expectedPixels, undefined, fullImageCacheKey)))
+
+    const flush = () => {
+      session.frame = null
+      const next = session.pending
+      session.pending = null
+      if (!next || session.closed) return
+      const renderer = rendererRef.current
+      if (!renderer?.matches(width, height, bitsPerSample, next.planes.length)) return
+      const shown = renderedPlanesRef.current
+      if (!shown || shown.length !== next.planes.length || next.planes.some((plane, index) => plane !== shown[index])) {
+        renderer.updatePlanes(next.planes)
+        renderedPlanesRef.current = next.planes
+      }
+      renderer.draw(settingsRef.current)
+      displayedZRef.current = next.z
+      onDisplayedZRef.current?.(next.z)
+    }
+    const queueDraw = (z, found) => {
+      session.pending = { z, planes: found }
+      if (session.frame === null) session.frame = window.requestAnimationFrame(flush)
+    }
+    const request = z => {
+      if (session.inFlight.has(z) || session.inFlight.size >= 2) return
+      session.inFlight.add(z)
+      load(z).then(found => {
+        session.inFlight.delete(z)
+        if (session.closed || session.target === null) return
+        const target = session.target
+        const shown = displayedZRef.current
+        const onTheWay = shown === null || z === target
+          || ((z - shown) * (target - shown) > 0 && Math.abs(z - shown) <= Math.abs(target - shown))
+        if (onTheWay) queueDraw(z, found)
+        if (z !== target) {
+          const ready = cachedPlanes(target)
+          if (ready) queueDraw(target, ready)
+          else request(target)
+        }
+      }).catch(() => {
+        session.inFlight.delete(z)
+        if (!session.closed && session.target !== null && session.target !== z) request(session.target)
+      })
+    }
+
+    // One slice at a time in the background, nearest first and ahead of the motion.
+    const nextToWarm = () => {
+      const center = session.warmCenter
+      if (center === null) return null
+      for (let distance = 1; distance <= warmRadius; distance += 1) {
+        for (const z of [center + distance * session.direction, center - distance * session.direction]) {
+          if (z < 0 || z >= stackDepth) continue
+          if (urlsFor(z).some(url => !planeIsOnItsWay(url, bitsPerSample, expectedPixels))) return z
+        }
+      }
+      return null
+    }
+    const warm = async () => {
+      if (session.warming) return
+      session.warming = true
+      try {
+        while (!session.closed && !fullImageCacheActiveRef.current && !document.hidden) {
+          const z = nextToWarm()
+          if (z === null) break
+          await load(z).catch(() => {})
+        }
+      } finally {
+        session.warming = false
+      }
+    }
+
+    session.warmAround = (z, direction) => {
+      session.direction = direction >= 0 ? 1 : -1
+      session.warmCenter = z
+      void warm()
+    }
+    session.settle = z => { session.target = z }
+    session.scrubTo = z => {
+      if (session.closed || !rendererRef.current) return false
+      const previous = session.target ?? displayedZRef.current ?? z
+      if (z !== previous) session.direction = z > previous ? 1 : -1
+      session.target = z
+      const ready = cachedPlanes(z)
+      if (ready) queueDraw(z, ready)
+      else request(z)
+      session.warmAround(z, session.direction)
+      return true
+    }
+    session.cachedPlanes = cachedPlanes
+    scrubSessionRef.current = session
+    if (scrubRef) scrubRef.current = { scrubTo: session.scrubTo }
+
+    return () => {
+      session.closed = true
+      if (session.frame !== null) window.cancelAnimationFrame(session.frame)
+      if (scrubSessionRef.current === session) scrubSessionRef.current = null
+      if (scrubRef) scrubRef.current = null
+    }
+  }, [apiBase, width, height, channelCount, bitsPerSample, channelVersion, stackDepth, fullImageCacheKey, scrubRef])
 
   const scheduleRender = useCallback(() => {
     if (frameRef.current !== null) return
@@ -854,7 +1000,6 @@ export default function MultiChannelCanvas({
   useEffect(() => {
     if (!apiBase || !width || !height) return undefined
     const controller = new AbortController()
-    let prefetchCancelled = false
     if (statsTaskRef.current) {
       const cancel = statsTaskRef.current
       if (cancel.kind === 'idle') window.cancelIdleCallback?.(cancel.id)
@@ -867,6 +1012,16 @@ export default function MultiChannelCanvas({
     const previousZ = previousZRef.current
     const direction = zIndex === previousZ ? 1 : Math.sign(zIndex - previousZ)
     previousZRef.current = zIndex
+    const session = scrubSessionRef.current
+    session?.settle(zIndex)
+    // Already here, usually just drawn by scrubbing: nothing to wait for or announce.
+    const ready = session?.cachedPlanes(zIndex)
+    if (ready) {
+      renderPendingRef.current = { loadSeq, zIndex, channelCount }
+      setPlanes(ready)
+      session.warmAround(zIndex, direction)
+      return undefined
+    }
     setLoading(true)
     onLoadState?.({
       status: 'loading',
@@ -911,34 +1066,7 @@ export default function MultiChannelCanvas({
           channelCount,
         })
 
-        const forward = direction >= 0 ? 1 : -1
-        const nearbySlices = [
-          zIndex + forward,
-          zIndex + (2 * forward),
-          zIndex - forward,
-          zIndex + (3 * forward),
-          zIndex - (2 * forward),
-          zIndex + (4 * forward),
-        ]
-          .filter(nextZ => nextZ >= 0 && nextZ < stackDepth)
-        // Warm neighbours one complete slice at a time. The previous version
-        // launched every neighbouring slice together, which could compete
-        // with the next foreground request on large TIFF/ND2 files.
-        const warmNearbySlices = async () => {
-          for (const nextZ of nearbySlices) {
-            if (prefetchCancelled || fullImageCacheActiveRef.current) return
-            await Promise.all(Array.from({ length: channelCount }, (_, index) => (
-              loadCachedPlane(
-                rawChannelUrl(apiBase, channelVersion, index, nextZ),
-                bitsPerSample,
-                expectedPixels,
-                undefined,
-                fullImageCacheKey,
-              ).catch(() => {})
-            )))
-          }
-        }
-        void warmNearbySlices()
+        scrubSessionRef.current?.warmAround(zIndex, direction)
       })
       .catch(error => {
         if (error.name === 'AbortError') return
@@ -956,7 +1084,6 @@ export default function MultiChannelCanvas({
       })
 
     return () => {
-      prefetchCancelled = true
       controller.abort()
     }
   }, [apiBase, width, height, channelCount, bitsPerSample, channelVersion, zIndex, stackDepth, fullImageCacheKey, onLoad, onError, onChannelStats, onLoadState])
@@ -1076,20 +1203,25 @@ export default function MultiChannelCanvas({
     try {
       const previousRenderer = rendererRef.current
       if (previousRenderer?.matches(width, height, bitsPerSample, planes.length)) {
-        previousRenderer.updatePlanes(planes)
-        previousRenderer.draw(settingsRef.current)
+        const shown = renderedPlanesRef.current
+        if (!shown || shown.length !== planes.length || planes.some((plane, index) => plane !== shown[index])) {
+          previousRenderer.updatePlanes(planes)
+          previousRenderer.draw(settingsRef.current)
+        }
       } else {
         const nextRenderer = createRenderer(canvas, planes, width, height, bitsPerSample)
         rendererRef.current = nextRenderer
         nextRenderer.draw(settingsRef.current)
         previousRenderer?.destroy()
       }
+      renderedPlanesRef.current = planes
 
       const completed = renderPendingRef.current
       if (completed) {
         renderPendingRef.current = null
         if (completed.loadSeq === loadSeqRef.current) {
           displayedZRef.current = completed.zIndex
+          onDisplayedZRef.current?.(completed.zIndex)
           setLoading(false)
           onLoadState?.({
             status: 'ready',
@@ -1107,11 +1239,7 @@ export default function MultiChannelCanvas({
             if (completed.loadSeq !== loadSeqRef.current) return
             onChannelStats?.(planes.map(analyzePlane))
           }
-          if (typeof window.requestIdleCallback === 'function') {
-            statsTaskRef.current = { kind: 'idle', id: window.requestIdleCallback(computeStats, { timeout: 600 }) }
-          } else {
-            statsTaskRef.current = { kind: 'timeout', id: window.setTimeout(computeStats, 0) }
-          }
+          statsTaskRef.current = { kind: 'timeout', id: window.setTimeout(computeStats, 200) }
         }
       }
     } catch (error) {
