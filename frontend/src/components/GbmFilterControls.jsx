@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Loader2, RotateCcw, Undo2 } from 'lucide-react'
-import { DEFAULT_FILTER_SETTINGS, REASON_INFO } from '../gbmRefinement.js'
+import { DEFAULT_FILTER_SETTINGS, REASON_INFO, workerHasStopped } from '../gbmRefinement.js'
 import './gbmFilter.css'
 
 // A number field that commits on blur or Enter, so typing "3400" does not
@@ -34,6 +34,9 @@ function stackMessage(stack, summary) {
   const state = stack.state
   if (state === 'waiting') return { tone: 'busy', text: `Z analysis starts when the running segmentation finishes${stack.planes ? ` (${stack.planes} Z so far)` : ''}.` }
   if (state === 'queued') return { tone: 'busy', text: `Z analysis is queued for ${stack.planes} Z.` }
+  if (workerHasStopped(stack)) {
+    return { tone: 'error', text: 'The analysis worker has stopped responding. This analysis starts again when the worker restarts.' }
+  }
   if (state === 'running') {
     const percent = Math.round(stack.job?.progress?.percent || 0)
     return { tone: 'busy', text: `Analysing ${stack.planes} Z across the stack${percent ? ` · ${percent}%` : ''}…` }

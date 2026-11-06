@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  analysisIsActive, createPredictionEdit, excludedColorTable, fetchLabel, fetchRefinement, filterKey, keptPieceTable,
-  pieceInfoAt, refinedLayers, removePredictionEdits, retryStackAnalysis,
+  analysisIsActive, createPredictionEdit, excludedColorTable, fetchLabel, fetchRefinement, filterKey, isTemporaryFailure,
+  keptPieceTable, pieceInfoAt, refinedLayers, removePredictionEdits, retryStackAnalysis,
 } from './gbmRefinement.js'
 
 const POLL_MS = 2500
+// Keep asking after a failed request, more slowly, instead of showing old progress forever.
+const FAILED_POLL_MS = 8000
 const SCRUB_DELAY_MS = 120
 
 // What the viewer draws and offers for the displayed Z slice. The response for
@@ -18,6 +20,7 @@ export default function useGbmRefinement({
   const [clickState, setClickState] = useState({ busy: false, message: '', error: '' })
   const [version, setVersion] = useState(0)
   const [pollTick, setPollTick] = useState(0)
+  const [settled, setSettled] = useState({ count: 0, failed: false })
   const onEditedRef = useRef(onEdited)
   onEditedRef.current = onEdited
   const calibrationKey = JSON.stringify(calibration)
@@ -38,8 +41,11 @@ export default function useGbmRefinement({
         if (controller.signal.aborted) return
         setView({ ...next, filterKey: key })
         setError('')
+        setSettled(current => ({ count: current.count + 1, failed: false }))
       } catch (err) {
-        if (err.name !== 'AbortError') setError(err.message || 'Unable to read the prediction filter')
+        if (err.name === 'AbortError') return
+        setError(err.message || 'Unable to read the prediction filter')
+        setSettled(current => ({ count: current.count + 1, failed: isTemporaryFailure(err) }))
       }
     }, SCRUB_DELAY_MS)
     return () => { controller.abort(); clearTimeout(timer) }
@@ -50,11 +56,13 @@ export default function useGbmRefinement({
   const stack = known?.stack || null
   const updating = analysisIsActive(stack)
 
+  // The next request is timed from the end of the last one, so a slow server is not
+  // cut off and a failed request does not end the polling.
   useEffect(() => {
-    if (!enabled || !runId || !updating) return undefined
-    const timer = setTimeout(() => setPollTick(value => value + 1), POLL_MS)
+    if (!enabled || !runId || !(updating || settled.failed)) return undefined
+    const timer = setTimeout(() => setPollTick(value => value + 1), settled.failed ? FAILED_POLL_MS : POLL_MS)
     return () => clearTimeout(timer)
-  }, [enabled, runId, updating, known])
+  }, [enabled, runId, updating, settled])
 
   const labelToken = current?.pieces ? current.labelToken : null
   const window = filter?.window

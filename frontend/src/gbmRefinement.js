@@ -137,6 +137,7 @@ export function filterLabel(settings) {
 // Which settings change results, as opposed to how they are displayed. Changing
 // only these starts a recalculation.
 export function recalculationMessage({ stack, fetching, remeasuring }) {
+  if (workerHasStopped(stack)) return 'Recalculation is waiting for the analysis worker to restart…'
   if (stack?.state === 'running') {
     const percent = Math.round(stack.job?.progress?.percent || 0)
     return `Recalculating across Z${percent ? ` · ${percent}%` : ''}…`
@@ -295,6 +296,35 @@ export function pieceInfoAt(label, view, x, y) {
 
 // ---- Requests ---------------------------------------------------------------
 
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer)
+      const error = new Error('Request was cancelled')
+      error.name = 'AbortError'
+      reject(error)
+    }
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', abort); resolve() }, ms)
+    signal?.addEventListener('abort', abort, { once: true })
+  })
+}
+
+// Proxies drop requests now and then. Reads try again; a click is never sent twice.
+export function isTemporaryFailure(error) {
+  return error?.name !== 'AbortError' && (!error?.status || [502, 503, 504].includes(error.status))
+}
+
+async function withRetries(attempt, { signal, retries = 2, waitMs = 400 } = {}) {
+  for (let tried = 0; ; tried += 1) {
+    try {
+      return await attempt()
+    } catch (error) {
+      if (tried >= retries || !isTemporaryFailure(error)) throw error
+      await delay(waitMs * 3 ** tried, signal)
+    }
+  }
+}
+
 async function requestJson(url, options = {}) {
   const response = await authFetch(url, {
     ...options,
@@ -313,12 +343,19 @@ async function requestJson(url, options = {}) {
   return body
 }
 
+// A worker that has not reported for this long has gone; it reports every 30 seconds.
+const WORKER_SILENT_SECONDS = 120
+
+export function workerHasStopped(stack) {
+  return stack?.state === 'running' && Number(stack.job?.heartbeatAgeSeconds) > WORKER_SILENT_SECONDS
+}
+
 const runUrl = runId => `/agh/api/analysis-runs/${encodeURIComponent(runId)}`
 
 export function fetchRefinement(runId, { calibration, filter }, { signal } = {}) {
-  return requestJson(`${runUrl(runId)}/refinement`, {
+  return withRetries(() => requestJson(`${runUrl(runId)}/refinement`, {
     method: 'POST', body: JSON.stringify({ calibration, filter }), signal,
-  })
+  }), { signal })
 }
 
 export function createPredictionEdit(runId, { kind, x, y, stroke, radius, calibration, filter }, { signal } = {}) {
@@ -353,11 +390,16 @@ export async function fetchLabel(runId, token, window, { signal } = {}) {
     labelCache.set(id, hit)
     return hit
   }
-  const response = await authFetch(labelUrl(runId, token, window), { signal, headers: { Accept: 'image/png' } })
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({}))
-    throw new Error(body?.error || `Label request failed with ${response.status}`)
-  }
+  const response = await withRetries(async () => {
+    const result = await authFetch(labelUrl(runId, token, window), { signal, headers: { Accept: 'image/png' } })
+    if (!result.ok) {
+      const body = await result.json().catch(() => ({}))
+      const error = new Error(body?.error || `Label request failed with ${result.status}`)
+      error.status = result.status
+      throw error
+    }
+    return result
+  }, { signal })
   // Exact pixel values matter here, so decode without any colour conversion.
   const bitmap = await createImageBitmap(await response.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' })
   const canvas = document.createElement('canvas')

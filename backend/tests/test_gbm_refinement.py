@@ -468,6 +468,83 @@ class RefinementApiTests(unittest.TestCase):
         for path in attempt_directory(self.config.analysis_root, source, 1).iterdir():
             shutil.copy2(path, destination / path.name)
 
+    def test_a_restarted_worker_picks_up_what_a_dead_one_left_running(self):
+        import socket
+        import subprocess
+        import sys
+        import worker
+
+        self.distribution()
+        # A worker on this host that has exited, like one killed during a restart.
+        gone = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, text=True)
+        worker_id = f"{socket.gethostname()}-{int(gone.stdout)}-abc123"
+        job = self.store.claim_next_run(worker_id)
+        self.store.update_progress(job["runId"], worker_id, {"stage": "stack", "percent": 87.0, "fraction": 0.87})
+        state = self.distribution()["filter"]
+        self.assertEqual(state["state"], "running")
+        self.assertIsNone(self.store.claim_next_run("other-worker"), "its lease has not expired")
+
+        self.assertEqual(self.store.release_orphaned_runs(worker._worker_is_alive), [job["runId"]])
+        self.assertEqual(self.distribution()["filter"]["state"], "queued")
+        result = self.run_stack_job()
+        self.assertEqual(result["planes"], len(self.runs))
+        self.assertTrue(self.distribution()["filter"]["applied"])
+
+    def test_a_running_worker_or_one_elsewhere_keeps_its_runs(self):
+        import os
+        import socket
+        import worker
+
+        self.distribution()
+        here = f"{socket.gethostname()}-{os.getpid()}-abc123"
+        self.assertTrue(worker._worker_is_alive(here))
+        self.assertTrue(worker._worker_is_alive("another-host-99999-abc123"), "another host cannot be checked")
+        self.assertTrue(worker._worker_is_alive("test-worker"))
+        job = self.store.claim_next_run(here)
+        self.assertEqual(self.store.release_orphaned_runs(worker._worker_is_alive), [])
+        self.assertEqual(self.store.get_run(job["runId"])["status"], "RUNNING")
+
+    def test_status_says_how_long_the_worker_has_been_silent(self):
+        from datetime import timedelta
+        from agh_api.analysis_store import utc_now
+        from agh_api.gbm_refinement import stack_state
+
+        self.distribution()
+        job = self.store.claim_next_run("test-worker")
+        fresh = stack_state(self.config, self.store, "case1", "stack.tif", 0)
+        self.assertLess(fresh["job"]["heartbeatAgeSeconds"], 30)
+        from datetime import datetime
+        old = (datetime.fromisoformat(utc_now()) - timedelta(minutes=10)).isoformat()
+        with self.store._connect() as conn:
+            conn.execute("UPDATE analysis_runs SET heartbeat_at = ? WHERE run_id = ?", (old, job["runId"]))
+        stale = stack_state(self.config, self.store, "case1", "stack.tif", 0)
+        self.assertGreater(stale["job"]["heartbeatAgeSeconds"], 500)
+
+    def test_stacks_with_awkward_planes_are_analysed_without_failing(self):
+        from agh_api.gbm_cross_section import FilterSettings, StackPlane, analyze_stack, classify_pieces
+        from agh_api.gbm_refinement import _encode_label, _save_plane
+        from agh_api.gbm_thickness import prepare_thickness_geometry
+
+        size = 120
+        masks = [np.zeros((size, size), dtype=bool) for _ in range(7)]  # 0: empty
+        masks[1][60, 60] = True  # one pixel
+        masks[2][40:44, 20:24] = True  # a dot
+        masks[3][58:62, 10:110] = True  # a line that appears once
+        masks[4][:, 50:70] = True  # touches the image edges
+        masks[5][20:100, 20:100] = True  # a solid block
+        masks[5][40:80, 40:80] = False  # with a hole
+        # 6: empty at the end
+        planes = [StackPlane(z, float(z), mask, prepare_thickness_geometry(mask)) for z, mask in enumerate(masks)]
+        results = analyze_stack(planes)
+        self.assertEqual(sorted(results), list(range(7)))
+        for plane in planes:
+            analysis = results[plane.z_index]
+            for z_step in (Z_STEP_UM, None):
+                decided = classify_pieces(analysis, FilterSettings(), pixel_size_um=PIXEL_UM, z_step_um=z_step)
+                self.assertEqual(decided["reasons"].size, analysis.piece_samples.size)
+            self.assertTrue(_encode_label(plane.geometry, plane.mask, analysis.sample_piece, analysis.sample_artifact))
+            _save_plane(Path(self.tmp.name) / f"plane_{plane.z_index}.npz", analysis)
+
     def test_deleting_a_prediction_removes_its_corrections(self):
         self.distribution()
         self.run_stack_job()

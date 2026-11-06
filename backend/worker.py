@@ -43,6 +43,9 @@ def main(argv=None) -> int:
     config.ensure_directories()
     store = AnalysisStore(config.analysis_db, config.analysis_lease_seconds)
     worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    released = store.release_orphaned_runs(_worker_is_alive)
+    if released:
+        log.warning("Queued again %d analysis run(s) left running by a worker that has gone", len(released))
 
     while True:
         job = store.claim_next_run(worker_id)
@@ -108,6 +111,24 @@ def main(argv=None) -> int:
 
         if args.once:
             return 0
+
+
+def _worker_is_alive(worker_id: str) -> bool:
+    """Whether a run's worker may still be running. Only this host's can be checked."""
+    try:
+        host, pid, _ = worker_id.rsplit("-", 2)
+        process = int(pid)
+    except ValueError:
+        return True
+    if host != socket.gethostname():
+        return True
+    try:
+        os.kill(process, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # it exists, under another user
+    return True
 
 
 def _heartbeat_loop(store, run_id, worker_id, stop_event, lease_lost):
