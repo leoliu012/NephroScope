@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  analysisIsActive, createPredictionEdit, fetchLabel, fetchRefinement, filterKey, keptPieceTable, pieceInfoAt,
-  refinedAlpha, removePredictionEdits, retryStackAnalysis,
+  analysisIsActive, createPredictionEdit, excludedColorTable, fetchLabel, fetchRefinement, filterKey, keptPieceTable,
+  pieceInfoAt, refinedLayers, removePredictionEdits, retryStackAnalysis,
 } from './gbmRefinement.js'
 
 const POLL_MS = 2500
@@ -71,27 +71,34 @@ export default function useGbmRefinement({
   const hasCorrections = (current?.edits?.length || 0) > 0 || (current?.editCount || 0) > 0
   const refined = useMemo(() => {
     if (!activeLabel || !current?.pieces || !(filterActive || hasCorrections)) return null
-    return refinedAlpha(activeLabel, keptPieceTable(current.pieces.reason, current.pieces.reasonNames))
+    const { reason, reasonNames } = current.pieces
+    return refinedLayers(activeLabel, keptPieceTable(reason, reasonNames), excludedColorTable(reason, reasonNames))
   }, [activeLabel, current, filterActive, hasCorrections])
 
   const pieceAt = useCallback((x, y) => pieceInfoAt(activeLabel, current, x, y), [activeLabel, current])
 
-  const click = useCallback(async (kind, x, y) => {
+  const applyEdit = useCallback(async (target, message) => {
     if (!runId) return
     setClickState({ busy: true, message: '', error: '' })
     try {
-      const response = await createPredictionEdit(runId, { kind, x, y, calibration, filter })
+      const response = await createPredictionEdit(runId, { ...target, calibration, filter })
       setView({ ...response.refinement, filterKey: key })
-      const added = response.edit.kind === 'add'
-      setClickState({
-        busy: false, error: '',
-        message: added ? 'Added GBM around this point.' : kind === 'positive' ? 'Marked as GBM; similar GBM nearby is included too.' : 'Removed this piece.',
-      })
+      setClickState({ busy: false, error: '', message: message(response.edit.kind) })
       onEditedRef.current?.()
     } catch (err) {
       setClickState({ busy: false, message: '', error: err.message || 'Unable to apply this correction' })
     }
   }, [runId, calibrationKey, filter, key])
+
+  const click = useCallback((kind, x, y) => applyEdit({ kind, x, y }, resolved => {
+    if (resolved === 'add') return 'Added GBM around this point.'
+    return kind === 'positive' ? 'Marked as GBM; similar GBM nearby is included too.' : 'Removed this piece.'
+  }), [applyEdit])
+
+  const paint = useCallback((kind, stroke, radius) => applyEdit(
+    { kind, stroke, radius },
+    () => (kind === 'positive' ? 'Kept or added what this stroke covers.' : 'Removed what this stroke covers.'),
+  ), [applyEdit])
 
   const removeEdits = useCallback(async (options, message) => {
     if (!runId) return
@@ -126,7 +133,8 @@ export default function useGbmRefinement({
   }, [caseId, filename, channelIndex, window])
 
   return {
-    view: known, current, stack, updating, refined, error, clickState, pieceAt, click, undo, restore, retry,
+    view: known, current, stack, updating, refined, error, clickState, pieceAt, click, paint, undo, restore, retry,
+    fetching: Boolean(enabled && runId && known && known.filterKey !== key),
     canUndo: Boolean(lastEdit), sliceEditCount: current?.edits?.length || 0, imageEditCount: current?.editCount || 0,
   }
 }

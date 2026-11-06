@@ -118,21 +118,27 @@ wide en-face patch. All of that biases thickness upwards.
 
 ### Measuring tilt
 
-Every centerline sample of every segmented slice gets two independent measurements
-from the masks of neighbouring slices. Both are stored in pixels per plane, so a
-new pixel size or Z step needs no recomputation (`tan θ = stored × pixel / dz`).
+What matters is the tilt **at this slice**. A loop that is vertical here and curves
+away further up or down is a true cross-section here. So each short length of
+centerline is followed into neighbouring slices, by finding the nearest centerline
+there, and its sideways displacement along its own normal is recorded per plane.
+The tilt is the slope of that displacement at this slice.
 
-- **Axial chord.** Follow the medial point through Z until it leaves the mask. A
-  slab with lateral chord `w` and axial chord `a` has `tan θ = w / a`, and because
-  this is a ratio, Z projection and axial blur cancel out.
-- **Level-set drift.** With a signed distance function `φ` of each mask, the tilt of
-  a boundary from vertical is `atan |∂φ/∂z|`. Each boundary face is followed
-  outwards only until it has moved 0.4 of the local thickness, because beyond that
-  `φ` no longer reports the same surface.
+- **Signed.** A tilted sheet moves steadily one way, whereas mask jitter between
+  slices averages out. Measuring magnitudes instead turns jitter into apparent tilt.
+- **Local quadratic fit, centred here.** Curvature goes into the quadratic term, so
+  the equator of a sphere reads as vertical. Fits are robust to occasional jumps.
+- **Own Z window.** A piece is followed only until it has moved by its own thickness
+  or is missing from two sampled slices in a row, up to the configured maximum
+  (default ±30). The Z window setting only changes that maximum.
+- **Uncertain means kept.** The fit reports a standard error, allowing for how the Z
+  projection makes nearby slices repeat each other's noise. A piece counts as tilted
+  only when the low end of that range is over the limit, or when the measured tilt
+  is over it and the piece is also more than 20% wider than the best-oriented GBM,
+  since a tilted sheet is wider.
 
-That second rule is also how the Z window is chosen on the fly: steep surfaces use
-nearby planes and near-vertical ones use a long lever arm, up to the configured
-maximum (default ±30). The Z window setting only changes that maximum.
+Everything is stored in pixels per plane, so a new pixel size or Z step needs no
+recomputation (`tan θ = stored × pixel / dz`).
 
 ### Deciding
 
@@ -143,19 +149,19 @@ over neighbouring pieces. A piece is excluded as:
 
 | Reason | Meaning |
 |---|---|
-| Oblique | Tilt above the limit |
-| En-face | Tilt above both the limit and 60° |
-| Brief in Z | Chord no longer than the projection itself, and not cut off by the stack's ends |
-| Speck | Its 3D component has less area than about 6 thickness² |
-| Compact | Its component is shorter than twice its width |
+| Oblique | Tilted beyond the limit (see above) |
+| En-face | Tilted beyond both the limit and 60° |
+| Wide patch | Over 2.5 times the width of the best-oriented GBM, with nothing showing it is vertical |
+| Brief in Z | Neither its medial point nor its followed centerline lasts longer than the projection plus 2 planes, and it is not cut off by the stack's ends. Not judged when slices are sampled too sparsely to tell |
+| Speck | Its 3D component has less area than about 4 thickness², and it does not persist through Z |
+| Compact | Its component is shorter than 1.5 times its width, and it does not persist through Z |
 | Skeleton artifact | Mostly taper, spur or junction samples (these samples are also dropped from kept pieces) |
-| Wide patch | One plane only: over twice the typical width |
 | Below minimum / Above maximum | Thickness limits, per sample |
 | Removed by you | A correction |
 
 The automatic tilt limit is the largest tilt at which apparent thickening stays
-within 25%, given the Z step and the reference thickness of the best-oriented
-pieces, and held between 15° and 35°. A coarser Z step therefore earns a stricter
+within 35%, given the Z step and the reference thickness of the best-oriented
+pieces, and held between 20° and 40°. A coarser Z step therefore earns a stricter
 limit.
 
 ### When the file records no Z step
@@ -165,14 +171,21 @@ that image. It is **never estimated**: an estimate from the expected distributio
 orientations was off by up to five times on test stacks, which would exclude good
 GBM. Without a Z step the angle is unknown, but what tilt does to the measurement
 is not: the projection smears a sheet sideways by `(planes − 1) × drift` pixels,
-whatever the Z step is. GBM is excluded when that smear exceeds 25% of the reference
-thickness (en-face above 100%). On the test stacks this matched the known-Z result
-closely, except at a fine Z step of 0.2 µm, where it kept more oblique GBM.
+whatever the Z step is. GBM is excluded when that smear exceeds 35% of the reference
+thickness (en-face above 100%). On the test stacks this behaved like the known-Z
+result, except at a fine Z step of 0.2 µm, where it excluded almost nothing.
 
 ### Corrections
 
 Corrections live in the `prediction_edits` table, keyed by image, channel and source
 version; saved masks are never touched, so removing them restores the prediction.
+
+A **brush stroke** is exact: the centerline samples owning painted mask pixels become
+their own pieces, kept or removed (later corrections win), and nothing nearby changes.
+Where a keeping stroke crosses background, what it adds is cut from the smoothed
+probability map at half height between the signal under the brush and the local
+background, so thickness comes from the image and not the brush. A **click** also
+changes thresholds around it:
 
 | Click | Effect |
 |---|---|
@@ -200,25 +213,28 @@ distributions under a token of analysis run and corrections.
 
 Tested only on synthetic stacks: tube shells and spheres of known orientation and
 true thickness 2.5 µm, imaged like the pipeline (blur, 5-plane projection, thresholding
-with boundary noise and dropouts), with non-GBM specks and fibres added.
+with boundary noise and dropouts), with non-GBM specks and fibres added. "Kept" columns
+are shares of centerline with that true tilt.
 
-| Stack | Mean, unfiltered → kept (µm) | Kept GBM truly ≤ 30° | Near-vertical GBM kept |
-|---|---|---|---|
-| dz 0.4 µm, 60 planes | 3.74 → 2.67 | 99% | 86% |
-| dz 0.2 µm | 2.79 → 2.63 | 98% | 87% |
-| dz 0.8 µm, 30 planes | 4.46 → 2.76 | 97% | 81% |
-| Every 4th slice segmented | 3.86 → 2.66 | 99% | 83% |
-| 15 planes only | 2.76 → 2.78 | 97% | 75% |
-| One plane (shape rules only) | 3.74 → 3.13 | — | 93% |
+| Stack | Mean, unfiltered → kept (µm) | Median kept | Kept, tilt < 10° | Kept, 30–45° |
+|---|---|---|---|---|
+| dz 0.4 µm, 60 planes | 3.74 → 2.72 | 2.58 | 93% | 15% |
+| dz 0.2 µm | 2.79 → 2.71 | 2.60 | 92% | 35% |
+| dz 0.8 µm, 30 planes | 4.46 → 2.89 | 2.58 | 90% | 19% |
+| Every 4th slice segmented | 3.86 → 2.86 | 2.60 | 92% | 30% |
+| 15 planes only | 2.76 → 2.71 | 2.71 | 88% | 41% |
+| Noisy masks (±5 px jitter, dropouts) | 2.27 → 2.07 | 2.18 | 63% | 28% |
 
-Non-GBM distractors fell from 3338 to 272 samples on the first stack. With very
-noisy masks (±5 px boundary jitter) it stays precise but conservative, keeping about
-23% of near-vertical GBM.
+Compared with the first version of this filter, which used unsigned drift and axial
+chords, near-vertical GBM kept rose from 86% to 93% on the first stack and from 23% to
+63% on noisy masks. In exchange more oblique GBM stays (kept GBM truly under 30° fell
+from 99% to 89%), and the mean rose from 2.67 to 2.72 µm. On noisy masks most of what
+is still lost is skeleton artifacts rather than tilt.
 
 **It has not been validated on real images.** Real masks may behave differently from
 these, so the defaults should be checked against expert review before results are
 relied on. To do that, compare a few images with the filter on and off, looking at
-what the red outlines exclude.
+what the coloured overlays exclude.
 
 ## Persistence and Z status
 

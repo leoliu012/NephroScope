@@ -45,14 +45,15 @@ import ChannelControls from './ChannelControls.jsx'
 import ModelMaskOverlay from './ModelMaskOverlay.jsx'
 import ModelRoiLayer from './ModelRoiLayer.jsx'
 import ModelSkeletonOverlay from './ModelSkeletonOverlay.jsx'
+import ModelClassOverlay from './ModelClassOverlay.jsx'
 import ModelEditLayer from './ModelEditLayer.jsx'
 import ImageThicknessPanel from './ImageThicknessPanel.jsx'
-import GbmFilterControls, { GbmCorrectionControls } from './GbmFilterControls.jsx'
+import GbmFilterControls, { GbmCorrectionControls, GbmRecalculatingPopup } from './GbmFilterControls.jsx'
 import useImageThicknessAnalysis from '../useImageThicknessAnalysis.js'
 import useGbmRefinement from '../useGbmRefinement.js'
 import {
   REASON_INFO, filterIsActive, filterKey, filterPayload, loadFilterSettings, loadZStepOverride, normalizeFilterSettings,
-  saveFilterSettings, saveZStepOverride,
+  recalculationMessage, saveFilterSettings, saveZStepOverride,
 } from '../gbmRefinement.js'
 import MultiChannelCanvas from './MultiChannelCanvas.jsx'
 import ZSliceSlider from './ZSliceSlider.jsx'
@@ -1233,13 +1234,17 @@ export default function ImageViewer({
   useEffect(() => { setGbmZStepOverride(loadZStepOverride(caseId, filename)) }, [caseId, filename])
   const gbmFilterPayload = useMemo(() => filterPayload(gbmFilter, gbmZStepOverride), [gbmFilter, gbmZStepOverride])
   const gbmFilterKey = filterKey(gbmFilterPayload)
+  // The popup follows a change someone made, not the first load of a slice.
+  const [gbmRecalculating, setGbmRecalculating] = useState(false)
   const updateGbmFilter = useCallback(next => {
     const normalized = normalizeFilterSettings(next)
+    if (filterKey(filterPayload(gbmFilter)) !== filterKey(filterPayload(normalized))) setGbmRecalculating(true)
     setGbmFilter(normalized)
     saveFilterSettings(normalized)
-  }, [])
+  }, [gbmFilter])
   const updateGbmZStepOverride = useCallback(value => {
     setGbmZStepOverride(value)
+    setGbmRecalculating(true)
     saveZStepOverride(caseId, filename, value)
   }, [caseId, filename])
   const thicknessAnalysis = useImageThicknessAnalysis({
@@ -1255,10 +1260,18 @@ export default function ImageViewer({
     calibration: currentCalibration,
     filter: gbmFilterPayload,
     filterActive: filterIsActive(gbmFilter),
-    onEdited: () => setGbmEditsVersion(value => value + 1),
+    onEdited: () => { setGbmEditsVersion(value => value + 1); setGbmRecalculating(true) },
     // More segmented Z means a new Z analysis, which this slice should pick up.
     refreshKey: `${thicknessAnalysis.activeCount}|${Object.values(modelRunsByZ).filter(run => run?.status === 'SUCCEEDED').length}`,
   })
+  const gbmRecalculationMessage = gbmRecalculating ? recalculationMessage({
+    stack: gbmRefinement.stack,
+    fetching: gbmRefinement.fetching,
+    remeasuring: thicknessAnalysis.remeasuring,
+  }) : ''
+  useEffect(() => {
+    if (gbmRecalculating && !gbmRecalculationMessage) setGbmRecalculating(false)
+  }, [gbmRecalculating, gbmRecalculationMessage])
   const gbmTool = activeTool === 'gbm-add' || activeTool === 'gbm-remove'
   const gbmRefinedOverlay = modelOverlayAligned ? gbmRefinement.refined : null
   const gbmToolsAvailable = Boolean(currentMaskReady && currentSkeletonAvailable && canAnnotate)
@@ -1282,10 +1295,10 @@ export default function ImageViewer({
         piece.tiltDeg !== null && piece.tiltDeg !== undefined ? `tilt ${Math.round(piece.tiltDeg)}°` : null,
         piece.widthNm !== null && piece.widthNm !== undefined ? `${piece.widthNm.toLocaleString()} nm` : null,
       ].filter(Boolean)
-      const action = adding ? (kept ? 'already measured' : 'click to keep') : (kept ? 'click to remove' : 'already excluded')
+      const action = adding ? (kept ? 'already measured' : 'paint or click to keep') : (kept ? 'paint or click to remove' : 'already excluded')
       text = `${details.join(' · ')} — ${action}`
     } else {
-      text = adding ? 'Click faint GBM here to add it' : 'No GBM predicted here'
+      text = adding ? 'Paint or click faint GBM to add it' : 'No GBM predicted here'
     }
     element.textContent = text
     element.style.display = 'block'
@@ -1299,6 +1312,25 @@ export default function ImageViewer({
   const handleGbmClick = useCallback((x, y) => {
     void gbmRefinement.click(activeTool === 'gbm-add' ? 'positive' : 'negative', x, y)
   }, [activeTool, gbmRefinement.click])
+  const handleGbmStroke = useCallback(points => {
+    void gbmRefinement.paint(activeTool === 'gbm-add' ? 'positive' : 'negative', points, gbmFilter.brushRadius)
+  }, [activeTool, gbmFilter.brushRadius, gbmRefinement.paint])
+  const updateGbmBrush = useCallback(radius => {
+    const next = normalizeFilterSettings({ ...gbmFilter, brushRadius: radius })
+    setGbmFilter(next)
+    saveFilterSettings(next)
+  }, [gbmFilter])
+  useEffect(() => {
+    if (!gbmTool) return undefined
+    const onKey = event => {
+      const target = event.target
+      if (target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return
+      if (event.key === '[') updateGbmBrush(gbmFilter.brushRadius - Math.max(1, Math.round(gbmFilter.brushRadius / 5)))
+      else if (event.key === ']') updateGbmBrush(gbmFilter.brushRadius + Math.max(1, Math.round(gbmFilter.brushRadius / 5)))
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [gbmFilter.brushRadius, gbmTool, updateGbmBrush])
 
   const gbmFilterProps = {
     settings: gbmFilter,
@@ -1312,6 +1344,7 @@ export default function ImageViewer({
     onSegmentNearby: zCount > 1 && modelOverlayAligned ? () => thicknessAnalysis.runNearby(zIndex) : null,
     nearbyBusy: thicknessAnalysis.busy === 'nearby' || thicknessAnalysis.activeCount > 0,
     nearbyError: thicknessAnalysis.error,
+    keptColor: modelOverlaySettings.color,
   }
   const gbmCorrectionProps = {
     correction: gbmRefinement,
@@ -1319,6 +1352,8 @@ export default function ImageViewer({
     onSelectTool: setActiveTool,
     disabled: !gbmToolsAvailable,
     canAnnotate,
+    brushRadius: gbmFilter.brushRadius,
+    onBrushRadius: updateGbmBrush,
   }
   // Slices run from here appear on the Z bar and in the viewer once they finish.
   const thicknessActiveCount = thicknessAnalysis.activeCount
@@ -2070,7 +2105,7 @@ export default function ImageViewer({
           disabled={!gbmToolsAvailable}
           onClick={() => setActiveTool(current => current === 'gbm-add' ? 'select' : 'gbm-add')}
           className={`ux-tool-button ${activeTool === 'gbm-add' ? 'ux-tool-button-active' : ''}`}
-          title={gbmToolsAvailable ? 'Add GBM: click excluded or faint GBM' : canAnnotate ? 'Run the model on this Z slice to correct its prediction' : 'Viewer role cannot correct predictions'}
+          title={gbmToolsAvailable ? 'Add GBM: paint or click excluded or faint GBM' : canAnnotate ? 'Run the model on this Z slice to correct its prediction' : 'Viewer role cannot correct predictions'}
           aria-label="Add GBM"
           aria-pressed={activeTool === 'gbm-add'}
         >
@@ -2081,7 +2116,7 @@ export default function ImageViewer({
           disabled={!gbmToolsAvailable}
           onClick={() => setActiveTool(current => current === 'gbm-remove' ? 'select' : 'gbm-remove')}
           className={`ux-tool-button ${activeTool === 'gbm-remove' ? 'ux-tool-button-active' : ''}`}
-          title={gbmToolsAvailable ? 'Remove GBM: click a wrong prediction' : canAnnotate ? 'Run the model on this Z slice to correct its prediction' : 'Viewer role cannot correct predictions'}
+          title={gbmToolsAvailable ? 'Remove GBM: paint or click a wrong prediction' : canAnnotate ? 'Run the model on this Z slice to correct its prediction' : 'Viewer role cannot correct predictions'}
           aria-label="Remove GBM"
           aria-pressed={activeTool === 'gbm-remove'}
         >
@@ -2165,6 +2200,7 @@ export default function ImageViewer({
           onMouseUp={handleMouseUp}
         >
           <div ref={gbmHoverRef} className="gf-hover" role="status" style={{ display: 'none' }} />
+          <GbmRecalculatingPopup message={gbmRecalculationMessage} />
           {canAnnotate && annotationToolsOpen && (
             <div
               ref={toolbarRef}
@@ -2301,20 +2337,6 @@ export default function ImageViewer({
                   onCacheProgress={handleFullImageCacheProgress}
                 />
               )}
-              {modelOverlayAligned && currentModelRun?.runId && gbmRefinedOverlay && gbmFilter.showExcluded && (
-                <ModelMaskOverlay
-                  key={`${imageKey}:${currentModelRun.runId}:excluded`}
-                  alphaData={gbmRefinedOverlay.excluded}
-                  className="model-excluded-overlay"
-                  ariaLabel="GBM predictions excluded by the filter"
-                  width={imgMeta?.width}
-                  height={imgMeta?.height}
-                  color="#f43f5e"
-                  opacity={Math.min(0.6, modelOverlaySettings.opacity)}
-                  visible={modelOverlaySettings.visible}
-                  displayMode="contour"
-                />
-              )}
               {modelOverlayAligned && currentModelRun?.runId && (
                 <ModelMaskOverlay
                   key={`${imageKey}:${currentModelRun.runId}`}
@@ -2344,6 +2366,14 @@ export default function ImageViewer({
                   visible={modelSkeletonSettings.visible}
                   onReady={handleModelSkeletonReady}
                   onError={handleModelSkeletonError}
+                />
+              )}
+              {modelOverlayAligned && gbmRefinedOverlay && gbmFilter.showExcluded && (
+                <ModelClassOverlay
+                  layer={gbmRefinedOverlay.excluded}
+                  opacity={modelOverlaySettings.opacity}
+                  visible={modelOverlaySettings.visible}
+                  lineThickness={modelSkeletonSettings.thickness}
                 />
               )}
               {imgMeta && (
@@ -2387,7 +2417,9 @@ export default function ImageViewer({
                   tool={activeTool}
                   edits={gbmRefinement.current?.edits}
                   busy={gbmRefinement.clickState.busy}
+                  brushRadius={gbmFilter.brushRadius}
                   onClick={handleGbmClick}
+                  onStroke={handleGbmStroke}
                   onHover={updateGbmHover}
                 />
               )}

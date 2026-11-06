@@ -177,6 +177,29 @@ class RefinementApiTests(unittest.TestCase):
         self.assertLess(np.nanmedian(tilt[reasons == 0]), 20.0)
         self.assertGreater(np.nanmedian(tilt[reasons != 0]), 25.0)
 
+    def test_gbm_that_is_vertical_here_is_kept_even_if_it_curves_away_elsewhere(self):
+        from agh_api.gbm_cross_section import FilterSettings, StackPlane, analyze_stack, classify_pieces
+        from agh_api.gbm_thickness import prepare_thickness_geometry
+
+        # A sphere shell, 20 px thick, sliced near its equator. Every wall here is
+        # vertical in the middle plane and tilted further up and down.
+        planes, count, size, radius = [], 41, 400, 130.0
+        yy, xx = np.mgrid[:size, :size]
+        axial = Z_STEP_UM / PIXEL_UM
+        rng = np.random.default_rng(3)
+        for z in range(count):
+            distance = np.sqrt((yy - 200) ** 2 + (xx - 200) ** 2 + ((z - 20) * axial) ** 2)
+            jitter = rng.normal(0.0, 1.0)  # how masks differ between slices
+            mask = np.abs(distance - radius) < 10.0 + jitter
+            planes.append(StackPlane(z, float(z), mask, prepare_thickness_geometry(mask)))
+        middle = analyze_stack(planes)[20]
+        decided = classify_pieces(
+            middle, FilterSettings(thickness_limits=False), pixel_size_um=PIXEL_UM, z_step_um=Z_STEP_UM,
+        )
+        kept = (decided["reasons"] == 0)[middle.sample_piece]
+        self.assertGreater(kept.mean(), 0.9)
+        self.assertLess(np.nanmedian(decided["tilt_deg"]), 8.0)
+
     def test_toggle_and_thickness_limits_are_independent(self):
         self.distribution()
         self.run_stack_job()
@@ -286,6 +309,80 @@ class RefinementApiTests(unittest.TestCase):
 
         self.client.delete(f"/agh/api/analysis-runs/{self.middle}/edits?scope=slice")
         self.assertEqual(self.distribution()["counts"], before["counts"])
+
+    def paint(self, kind, stroke, radius=6, status=201):
+        response = self.client.post(f"/agh/api/analysis-runs/{self.middle}/edits", json={
+            "calibration": self.calibration, "filter": self.filter, "kind": kind, "stroke": stroke, "radius": radius,
+        })
+        self.assertEqual(response.status_code, status, response.get_json())
+        return response.get_json()
+
+    def test_removing_with_the_brush_takes_only_what_it_covers(self):
+        self.distribution()
+        self.run_stack_job()
+        before = self.distribution()
+        # Across the ring wall on its right side, about 12 pixels of brush.
+        x = RING[1] + RING[2]
+        painted = self.paint("negative", [[x - 15, RING[0]], [x + 15, RING[0]]])
+        self.assertEqual(painted["edit"]["kind"], "paint-remove")
+        after = self.distribution()
+        removed = before["sampleCount"] - after["sampleCount"]
+        self.assertGreater(removed, 5)
+        self.assertLess(removed, 45, "only the painted length of the wall goes")
+        self.assertGreater(after["filter"]["byReason"].get("manual", 0), 0)
+        # Nothing else changed its decision.
+        reasons = painted["refinement"]["pieces"]["reasonNames"]
+        names = [reasons[str(code)] for code in painted["refinement"]["pieces"]["reason"]]
+        self.assertLessEqual(names.count("manual"), 2, "a stroke can straddle two pieces, no more")
+        # Undo restores it exactly.
+        self.client.delete(f"/agh/api/analysis-runs/{self.middle}/edits?edit={painted['edit']['id']}")
+        self.assertEqual(self.distribution()["counts"], before["counts"])
+
+    def test_keeping_with_the_brush_returns_only_what_it_covers(self):
+        self.filter = {**self.filter, "maxNm": 9000}
+        self.distribution()
+        self.run_stack_job()
+        before = self.distribution()
+        center = 170 + Z_STEP_UM / PIXEL_UM * np.tan(np.radians(TILT_DEG)) * (12 - PLANES / 2) * 0.6
+        painted = self.paint("positive", [[center - 40, 200.0], [center + 40, 200.0]], radius=8)
+        self.assertEqual(painted["edit"]["kind"], "paint-keep")
+        after = self.distribution()
+        gained = after["sampleCount"] - before["sampleCount"]
+        self.assertGreater(gained, 5)
+        self.assertLess(gained, 40, "a stroke does not bring back GBM beyond it, unlike a click")
+        # The rest of the sheet is still excluded.
+        self.assertGreater(after["filter"]["byReason"].get("oblique", 0), 0)
+
+    def test_painting_over_a_faint_line_adds_it_at_its_own_width(self):
+        self.distribution()
+        self.run_stack_job()
+        before = self.distribution()
+        wide = self.paint("positive", [[185.0, 20.0], [265.0, 20.0]], radius=25)
+        self.assertEqual(wide["edit"]["kind"], "paint-keep")
+        after = self.distribution()
+        self.assertGreater(after["sampleCount"], before["sampleCount"] + 40)
+        # Thickness comes from the probability map (12 pixels), not the 50 pixel brush.
+        added = np.repeat(after["valuesUm"], after["counts"])
+        self.assertLess(np.percentile(added, 5), 1.5)
+        self.assertLess(max(after["valuesUm"]), 3.4)
+
+    def test_a_later_click_overrides_an_earlier_stroke(self):
+        self.distribution()
+        self.run_stack_job()
+        x = RING[1] + RING[2]
+        self.paint("negative", [[x - 15, RING[0]], [x + 15, RING[0]]])
+        removed = self.distribution()["sampleCount"]
+        self.click("positive", x, RING[0])
+        self.assertGreater(self.distribution()["sampleCount"], removed)
+
+    def test_brushes_outside_anything_are_refused(self):
+        self.distribution()
+        self.run_stack_job()
+        self.assertIn("error", self.paint("negative", [[10.0, 290.0], [30.0, 290.0]], status=409))
+        self.assertIn("error", self.paint("positive", [[10.0, 290.0], [30.0, 290.0]], status=409))
+        self.paint("negative", "nope", status=400)
+        self.paint("negative", [[1, 2, 3]], status=400)
+        self.paint("negative", [[10.0, 290.0]], radius=-3, status=400)
 
     def test_clicking_empty_background_finds_nothing(self):
         self.distribution()

@@ -7,27 +7,24 @@ vertical, a sheet of thickness ``t`` looks wider (``t / cos θ``), and the
 sheet drifts across the projection (``4 dz tan θ``). Lying flat, it becomes a
 wide en-face patch. Thickness statistics are biased by all of these.
 
-Two independent measurements of ``θ`` come from the masks of neighbouring
-planes. Both work per centerline sample and are calibration independent: they
-are stored in pixels per plane, so changing the pixel size or Z step later
-needs no recomputation (``tan θ = stored * pixel_size / z_step``).
+What matters is the tilt *at this plane*. A loop that is vertical here and curves
+away further up or down is a true cross-section here, so tilt is the local slope
+of the sheet's medial surface through Z. Each piece of centerline is followed into
+neighbouring planes by finding the nearest centerline there, and its sideways
+displacement along its own normal is recorded per plane:
 
-Axial chord
-    Follow the medial point along Z until it leaves the mask. A slab has
-    lateral chord ``w`` and axial chord ``a`` with ``tan θ = w / a`` exactly,
-    whatever the slab thickness, and Z projection or axial blur (which dilate
-    the slab along Z) cancel out of the ratio. This also measures how long a
-    structure persists through the stack.
+* Displacement is signed. A tilted sheet moves steadily one way, whereas mask
+  jitter between planes averages out. (Taking magnitudes would turn jitter into
+  apparent tilt.)
+* The slope is a local quadratic fit centred on this plane. Curvature goes into the
+  quadratic term, so the equator of a sphere reads as vertical.
+* Each piece is followed only while it stays the same sheet and has not moved more
+  than its own thickness, so every piece measures its own usable Z window.
+* The fit reports its standard error. A piece only counts as tilted when even the
+  low end of that range is over the limit: uncertain means kept.
 
-Level-set drift
-    With a signed distance function ``φ_z`` of each mask (``|∇φ| = 1``), the
-    normal speed of a boundary through the stack is ``∂φ/∂z``, and the tilt of
-    that boundary from vertical is ``atan |∂φ/∂z|``. Each boundary face is
-    followed outwards through the planes only until it has moved by a fraction
-    of the local thickness, because beyond that the distance field no longer
-    reports the same surface. Steep surfaces therefore use nearby planes and
-    near-vertical ones use a long lever arm: every sample measures its own
-    usable Z window, up to the configured maximum.
+Everything is stored in pixels per plane, so changing the pixel size or Z step
+later needs no recomputation (``tan θ = stored * pixel_size / z_step``).
 
 Decisions are made on *pieces*: short lengths of centerline about two
 thicknesses long with their share of the mask, so a wall that turns oblique
@@ -46,15 +43,23 @@ import numpy as np
 
 from .gbm_thickness import ThicknessGeometry
 
-ALGORITHM_VERSION = "gbm-cross-section-v1"
+ALGORITHM_VERSION = "gbm-cross-section-v2"
 MIP_PLANES = 5
 DEFAULT_MAX_WINDOW = 30
 EN_FACE_TILT_DEG = 60.0
 DEFAULT_MIN_THICKNESS_NM = 30.0
 DEFAULT_MAX_THICKNESS_NM = 3400.0
 
-# A boundary is followed until it has moved by this fraction of the thickness.
-DRIFT_PASSAGE_FRACTION = 0.4
+# A piece is followed through Z until it has moved by this multiple of its own
+# thickness, or is missing from two sampled planes in a row.
+TRACK_MAX_MOVE = 1.0
+TRACK_MAX_MISSES = 1
+TRACK_MIN_HIT_FRACTION = 0.5
+# Half-width of the local slope fit, in planes, as a fraction of thickness in pixels.
+SLOPE_WINDOW_FRACTION = 0.5
+SLOPE_MIN_WINDOW_PLANES = 4.0
+# Decisions use tilt minus this many standard errors.
+SLOPE_ERROR_MARGIN = 1.0
 # The medial point counts as inside a neighbouring mask up to this fraction of
 # the thickness away, and may miss this many planes, so jitter and small holes
 # in a prediction do not end its axial chord.
@@ -87,6 +92,7 @@ class PlaneAnalysis:
     sample_artifact: np.ndarray
     sample_tan_chord: np.ndarray
     sample_tan_drift: np.ndarray
+    sample_tan_error: np.ndarray
     sample_chord_censored: np.ndarray
     sample_chord_planes: np.ndarray
     sample_window_planes: np.ndarray
@@ -96,6 +102,8 @@ class PlaneAnalysis:
     piece_width_px: np.ndarray
     piece_tan_chord: np.ndarray
     piece_tan_drift: np.ndarray
+    piece_tan_error: np.ndarray
+    piece_track_planes: np.ndarray
     piece_censored: np.ndarray
     piece_chord_planes: np.ndarray
     piece_artifact: np.ndarray
@@ -116,6 +124,7 @@ class PlaneAnalysis:
             "sample_artifact": self.sample_artifact.astype(np.uint8),
             "sample_tan_chord": self.sample_tan_chord.astype(np.float32),
             "sample_tan_drift": self.sample_tan_drift.astype(np.float32),
+            "sample_tan_error": self.sample_tan_error.astype(np.float32),
             "sample_chord_censored": self.sample_chord_censored.astype(bool),
             "sample_chord_planes": self.sample_chord_planes.astype(np.float32),
             "sample_window_planes": self.sample_window_planes.astype(np.float32),
@@ -125,6 +134,8 @@ class PlaneAnalysis:
             "piece_width_px": self.piece_width_px.astype(np.float32),
             "piece_tan_chord": self.piece_tan_chord.astype(np.float32),
             "piece_tan_drift": self.piece_tan_drift.astype(np.float32),
+            "piece_tan_error": self.piece_tan_error.astype(np.float32),
+            "piece_track_planes": self.piece_track_planes.astype(np.float32),
             "piece_censored": self.piece_censored.astype(np.float32),
             "piece_chord_planes": self.piece_chord_planes.astype(np.float32),
             "piece_artifact": self.piece_artifact.astype(np.float32),
@@ -149,6 +160,7 @@ class PlaneAnalysis:
             sample_artifact=np.asarray(values["sample_artifact"]),
             sample_tan_chord=np.asarray(values["sample_tan_chord"]),
             sample_tan_drift=np.asarray(values["sample_tan_drift"]),
+            sample_tan_error=np.asarray(values["sample_tan_error"]),
             sample_chord_censored=np.asarray(values["sample_chord_censored"]),
             sample_chord_planes=np.asarray(values["sample_chord_planes"]),
             sample_window_planes=np.asarray(values["sample_window_planes"]),
@@ -158,6 +170,8 @@ class PlaneAnalysis:
             piece_width_px=np.asarray(values["piece_width_px"]),
             piece_tan_chord=np.asarray(values["piece_tan_chord"]),
             piece_tan_drift=np.asarray(values["piece_tan_drift"]),
+            piece_tan_error=np.asarray(values["piece_tan_error"]),
+            piece_track_planes=np.asarray(values["piece_track_planes"]),
             piece_censored=np.asarray(values["piece_censored"]),
             piece_chord_planes=np.asarray(values["piece_chord_planes"]),
             piece_artifact=np.asarray(values["piece_artifact"]),
@@ -232,83 +246,160 @@ def _axial_chord(
     return up, down, open_up, open_down
 
 
-def _chord_tangent(
-    width: np.ndarray,
-    up: np.ndarray,
-    down: np.ndarray,
-    open_up: np.ndarray,
-    open_down: np.ndarray,
-    typical_width: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """``tan θ`` in pixels per plane from lateral and axial chords.
-
-    The closer end of the chord is the local measure: a wall that continues far
-    in one direction but ends just above this plane is curving away here. A
-    chord that runs off the available planes in both directions is only an
-    upper bound on the tilt, reported through ``censored``.
-    """
-    effective_width = width + 2.0 * CHORD_TOLERANCE_FRACTION * np.minimum(width, typical_width)
-    closed = np.minimum(np.where(open_up, np.inf, up), np.where(open_down, np.inf, down))
-    both_open = open_up & open_down
-    planes = np.where(both_open, up + down + 1.0, 2.0 * closed + 1.0)
-    return effective_width / np.maximum(planes, 1.0), both_open, up + down + 1.0
+def _chord_planes(up: np.ndarray, down: np.ndarray, open_up: np.ndarray, open_down: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Planes the medial point stays inside the mask, and whether that ran off the stack."""
+    return up + down + 1.0, open_up | open_down
 
 
-def _boundary_drift(
-    y: np.ndarray,
+def _group_median(values: np.ndarray, groups: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Median per group, with the number of values in each."""
+    medians = np.full(count, np.nan)
+    sizes = np.bincount(groups, minlength=count)
+    if values.size == 0:
+        return medians, sizes
+    order = np.lexsort((values, groups))
+    ordered = values[order]
+    starts = np.concatenate([[0], np.cumsum(sizes)])
+    present = np.nonzero(sizes)[0]
+    low = starts[present] + (sizes[present] - 1) // 2
+    high = starts[present] + sizes[present] // 2
+    medians[present] = 0.5 * (ordered[low] + ordered[high])
+    return medians, sizes
+
+
+def _piece_normals(x: np.ndarray, y: np.ndarray, piece: np.ndarray, count: int) -> tuple[np.ndarray, np.ndarray]:
+    """Unit normal of each piece, from the principal axis of its centerline."""
+    size = np.maximum(np.bincount(piece, minlength=count), 1).astype(np.float64)
+    mean_x = np.bincount(piece, x, minlength=count) / size
+    mean_y = np.bincount(piece, y, minlength=count) / size
+    dx, dy = x - mean_x[piece], y - mean_y[piece]
+    sxx = np.bincount(piece, dx * dx, minlength=count)
+    syy = np.bincount(piece, dy * dy, minlength=count)
+    sxy = np.bincount(piece, dx * dy, minlength=count)
+    angle = 0.5 * np.arctan2(2.0 * sxy, sxx - syy)
+    return -np.sin(angle), np.cos(angle)
+
+
+def _probe_samples(piece: np.ndarray, count: int, per_piece: int = 12) -> np.ndarray:
+    """A spread of up to ``per_piece`` centerline samples from every piece."""
+    size = np.bincount(piece, minlength=count)
+    order = np.argsort(piece, kind="stable")
+    starts = np.concatenate([[0], np.cumsum(size)[:-1]])
+    rank = np.empty(piece.size, dtype=np.int64)
+    rank[order] = np.arange(piece.size) - starts[piece[order]]
+    stride = np.maximum(size // per_piece, 1)
+    return np.nonzero(rank % stride[piece] == 0)[0]
+
+
+def _track_pieces(
     x: np.ndarray,
-    vy: np.ndarray,
-    vx: np.ndarray,
+    y: np.ndarray,
+    piece: np.ndarray,
+    piece_count: int,
     width: np.ndarray,
-    distance_fields: Sequence[np.ndarray],
-    target: int,
+    trees: Sequence[Any],
+    positions: Sequence[np.ndarray],
     relative: np.ndarray,
     usable: np.ndarray,
-    factor: int,
-    typical_width: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """``|∂φ/∂z|`` of the two boundary faces, per sample, in pixels per plane."""
-    count = y.size
-    # A floor keeps boundary jitter from ending the walk on thin necks.
-    passage = np.maximum(DRIFT_PASSAGE_FRACTION * width, max(0.25 * typical_width, 2.0 * factor))
-    order = usable[np.argsort(np.abs(relative[usable]))]
-    faces = []
-    reach = np.zeros(count)
-    for sign in (-1.0, 1.0):
-        py, px = y + sign * vy, x + sign * vx
-        base = _probe(distance_fields[target], py, px, factor)
-        sum_xy = np.zeros(count)
-        sum_xx = np.zeros(count)
-        alive_up = np.ones(count, dtype=bool)
-        alive_down = np.ones(count, dtype=bool)
-        reached = np.zeros(count)
-        for index in order:
-            step = relative[index]
-            moved = base - _probe(distance_fields[index], py, px, factor)
-            alive = alive_up if step > 0 else alive_down
-            sum_xy[alive] += step * moved[alive]
-            sum_xx[alive] += step * step
-            reached[alive] = np.maximum(reached[alive], abs(step))
-            alive &= np.abs(moved) < passage
-        slope = np.divide(sum_xy, sum_xx, out=np.full(count, np.nan), where=sum_xx > 0)
-        faces.append(np.abs(slope))
-        reach = np.maximum(reach, reached)
-    return np.fmax(faces[0], faces[1]), reach
+) -> np.ndarray:
+    """Signed sideways displacement of each piece in each usable plane (NaN if lost)."""
+    normal_x, normal_y = _piece_normals(x, y, piece, piece_count)
+    displacement = np.full((piece_count, usable.size), np.nan)
+    radius = np.maximum(TRACK_MAX_MOVE * width, 6.0)
+    probes = _probe_samples(piece, piece_count)
+    probe_piece = piece[probes]
+    probe_x = x[probes].astype(np.float64)
+    probe_y = y[probes].astype(np.float64)
+    column_of = {int(plane): column for column, plane in enumerate(usable)}
+    above = usable[relative[usable] > 0]
+    below = usable[relative[usable] < 0]
+    for direction in (above[np.argsort(relative[above])], below[np.argsort(-relative[below])]):
+        current = np.zeros(piece_count)
+        misses = np.zeros(piece_count, dtype=np.int32)
+        alive = np.ones(piece_count, dtype=bool)
+        for plane in direction:
+            active = alive[probe_piece]
+            if not active.any():
+                break
+            ok = np.zeros(piece_count, dtype=bool)
+            if trees[plane] is not None:
+                groups = probe_piece[active]
+                shift = current[groups]
+                sx, sy = normal_x[groups], normal_y[groups]
+                query = np.column_stack([probe_x[active] + sx * shift, probe_y[active] + sy * shift])
+                distance, nearest = trees[plane].query(query, distance_upper_bound=float(radius.max()))
+                found = distance <= radius[groups]
+                if found.any():
+                    target = positions[plane][nearest[found]]
+                    moved = (target[:, 0] - probe_x[active][found]) * sx[found] + (target[:, 1] - probe_y[active][found]) * sy[found]
+                    median, hits = _group_median(moved, groups[found], piece_count)
+                    wanted = np.bincount(groups, minlength=piece_count)
+                    ok = alive & (hits >= TRACK_MIN_HIT_FRACTION * np.maximum(wanted, 1)) & (hits > 0)
+                    displacement[ok, column_of[int(plane)]] = median[ok]
+                    current[ok] = median[ok]
+            misses = np.where(ok, 0, misses + 1)
+            alive &= (misses <= TRACK_MAX_MISSES) & (np.abs(current) <= TRACK_MAX_MOVE * width)
+    return displacement
 
 
-def fuse_tangent(tan_chord: Any, tan_drift: Any, censored: Any) -> np.ndarray:
-    """One tilt tangent from both estimators (same units in, same units out).
+def _local_slope(
+    displacement: np.ndarray,
+    steps: np.ndarray,
+    half_window: np.ndarray,
+    correlated_planes: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Slope at this plane with its standard error and the Z reach used, per piece.
 
-    The chord over-reads when a prediction has holes and the drift under-reads
-    when planes are sparse, so they are averaged. A chord running off the
-    available planes is only an upper bound, so there the drift decides.
+    A robust local fit ``d = a + b k + c k²``, weighted towards this plane. The piece
+    itself counts as one point at ``k = 0``. Without enough support on both sides
+    the curvature term cannot be told from the slope, so the fit is linear there.
     """
-    chord = np.asarray(tan_chord, dtype=np.float64)
-    drift = np.asarray(tan_drift, dtype=np.float64)
-    both = 0.5 * (chord + drift)
-    fused = np.where(np.asarray(censored, dtype=bool), drift, both)
-    fused = np.where(np.isfinite(drift), fused, chord)
-    return np.where(np.isfinite(chord), fused, drift)
+    count = displacement.shape[0]
+    slope = np.full(count, np.nan)
+    error = np.full(count, np.nan)
+    reach = np.zeros(count)
+    if displacement.shape[1] == 0 or count == 0:
+        return slope, error, reach
+    k = np.broadcast_to(steps, displacement.shape)
+    scaled = k / half_window[:, None]
+    weights = np.where(np.abs(scaled) < 1.0, (1.0 - scaled ** 2) ** 2, 0.0)
+    weights = np.where(np.isfinite(displacement), weights, 0.0)
+    values = np.nan_to_num(displacement)
+    # The piece's own position, as a point at k = 0.
+    k = np.column_stack([k, np.zeros(count)])
+    values = np.column_stack([values, np.zeros(count)])
+    weights = np.column_stack([weights, np.ones(count)])
+    sampled = weights[:, :-1] > 0
+    above = (sampled & (k[:, :-1] > 0)).sum(axis=1)
+    below = (sampled & (k[:, :-1] < 0)).sum(axis=1)
+    quadratic = (above >= 2) & (below >= 2)
+    linear = ~quadratic & (above + below >= 2)
+    for mask, terms in ((quadratic, 3), (linear, 2)):
+        rows = np.nonzero(mask)[0]
+        if rows.size == 0:
+            continue
+        design = np.stack([k[rows] ** power for power in range(terms)], axis=-1)
+        y = values[rows]
+        robust = weights[rows].copy()
+        for _ in range(3):
+            xtw = design * robust[..., None]
+            normal = np.einsum("nki,nkj->nij", xtw, design) + 1e-9 * np.eye(terms)
+            beta = np.linalg.solve(normal, np.einsum("nki,nk->ni", xtw, y)[..., None])[..., 0]
+            residual = y - np.einsum("nki,ni->nk", design, beta)
+            used = weights[rows] > 0
+            spread = np.where(used, np.abs(residual), np.nan)
+            scale = np.maximum(1.4826 * np.nanmedian(spread, axis=1), 0.5)
+            robust = weights[rows] * np.minimum(1.0, 2.0 * scale[:, None] / np.maximum(np.abs(residual), 1e-9))
+        slope[rows] = np.abs(beta[:, 1])
+        total = robust.sum(axis=1)
+        degrees = np.maximum(total - terms, 1.0)
+        variance = np.maximum((robust * residual ** 2).sum(axis=1) / degrees, 0.25)
+        inverse = np.linalg.inv(np.einsum("nki,nkj->nij", design * robust[..., None], design) + 1e-9 * np.eye(terms))
+        # The Z projection shares planes between slices, so nearby slices repeat
+        # each other's noise and count for less than independent points would.
+        error[rows] = np.sqrt(variance * inverse[:, 1, 1] * correlated_planes)
+        reach[rows] = np.max(np.abs(k[rows]) * (weights[rows] > 0), axis=1)
+    return slope, error, reach
 
 
 def smooth_over_pieces(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -540,11 +631,23 @@ def analyze_stack(
     median_width = float(np.median(np.concatenate(widths))) if widths else 0.0
     factor = working_factor(median_width) if median_width else 1
     fields = []
+    built = []
+    trees: list[Any] = []
+    positions: list[np.ndarray] = []
+    from scipy.spatial import cKDTree
+
     for index, plane in enumerate(planes):
         fields.append(signed_distance(plane.mask, factor))
+        piece, artifact, edges = build_pieces(plane.geometry)
+        built.append((piece, artifact, edges))
+        clean = artifact == SAMPLE_OK
+        where = np.column_stack([plane.geometry.skeleton_x[clean], plane.geometry.skeleton_y[clean]]).astype(np.float64)
+        positions.append(where)
+        trees.append(cKDTree(where) if where.size else None)
         if progress:
-            progress(0.5 * (index + 1) / len(planes), "Reading neighbouring Z predictions")
+            progress(0.4 * (index + 1) / len(planes), "Reading neighbouring Z predictions")
     cc_ids, cc_samples, cc_span = _connected_3d(planes)
+    spacing = float(np.median(np.diff(centers))) if centers.size > 1 else 1.0
 
     results: dict[int, PlaneAnalysis] = {}
     for index, plane in enumerate(planes):
@@ -555,38 +658,55 @@ def analyze_stack(
         width = geometry.local_thickness_pixels.astype(np.float64)
         relative = centers - centers[index]
         usable = np.nonzero((np.abs(relative) <= max_window) & (np.abs(relative) > 1e-6))[0]
-        piece, artifact, edges = build_pieces(geometry)
+        piece, artifact, edges = built[index]
         piece_count = int(piece.max()) + 1 if count else 0
+        clean = artifact == SAMPLE_OK
+        piece_width = _aggregate(piece, piece_count, width, clean)
+        slope = np.full(piece_count, np.nan)
+        error = np.full(piece_count, np.nan)
+        reach = np.zeros(piece_count)
+        track_planes = np.ones(piece_count)
         if usable.size and count:
-            vy = geometry.nearest_background_dy_pixels.astype(np.float64)
-            vx = geometry.nearest_background_dx_pixels.astype(np.float64)
             up, down, open_up, open_down = _axial_chord(y, x, width, fields, relative, usable, factor, median_width)
-            tan_chord, censored, chord_planes = _chord_tangent(width, up, down, open_up, open_down, median_width)
-            tan_drift, reach = _boundary_drift(y, x, vy, vx, width, fields, index, relative, usable, factor, median_width)
+            chord_planes, censored = _chord_planes(up, down, open_up, open_down)
+            tan_chord = width / np.maximum(chord_planes, 1.0)
+            track_width = np.where(np.isfinite(piece_width), piece_width, median_width)
+            displacement = _track_pieces(x, y, piece, piece_count, track_width, trees, positions, relative, usable)
+            half_window = np.clip(
+                np.maximum(SLOPE_WINDOW_FRACTION * track_width, max(SLOPE_MIN_WINDOW_PLANES, 2.0 * spacing) + 1.0),
+                1.0, float(max_window) + 1.0,
+            )
+            slope, error, reach = _local_slope(
+                displacement, relative[usable], half_window, max(1.0, MIP_PLANES / max(spacing, 1.0)),
+            )
+            tracked = np.isfinite(displacement)
+            up_steps = np.where(tracked & (relative[usable] > 0), relative[usable], 0.0).max(axis=1)
+            down_steps = np.where(tracked & (relative[usable] < 0), -relative[usable], 0.0).max(axis=1)
+            track_planes = up_steps + down_steps + 1.0
         else:
             tan_chord = np.full(count, np.nan)
-            tan_drift = np.full(count, np.nan)
             censored = np.ones(count, dtype=bool)
             chord_planes = np.full(count, np.nan)
-            reach = np.zeros(count)
 
-        clean = artifact == SAMPLE_OK
         results[plane.z_index] = PlaneAnalysis(
             z_index=plane.z_index,
             shape=tuple(geometry.shape),
             sample_piece=piece,
             sample_artifact=artifact,
             sample_tan_chord=tan_chord,
-            sample_tan_drift=tan_drift,
+            sample_tan_drift=slope[piece] if count else np.empty(0),
+            sample_tan_error=error[piece] if count else np.empty(0),
             sample_chord_censored=censored,
             sample_chord_planes=chord_planes,
-            sample_window_planes=reach,
+            sample_window_planes=reach[piece] if count else np.empty(0),
             piece_samples=np.bincount(piece, minlength=piece_count) if count else np.empty(0, dtype=np.int64),
             piece_center_x=_aggregate(piece, piece_count, x.astype(np.float64), clean),
             piece_center_y=_aggregate(piece, piece_count, y.astype(np.float64), clean),
-            piece_width_px=_aggregate(piece, piece_count, width, clean),
+            piece_width_px=piece_width,
             piece_tan_chord=_aggregate(piece, piece_count, tan_chord, clean),
-            piece_tan_drift=_aggregate(piece, piece_count, tan_drift, clean),
+            piece_tan_drift=slope,
+            piece_tan_error=error,
+            piece_track_planes=track_planes,
             piece_censored=_aggregate(piece, piece_count, censored.astype(np.float64), clean),
             piece_chord_planes=_aggregate(piece, piece_count, chord_planes, clean),
             piece_artifact=_aggregate(piece, piece_count, (~clean).astype(np.float64), np.ones(count, dtype=bool)),
@@ -598,7 +718,7 @@ def analyze_stack(
             median_width_px=median_width,
         )
         if progress:
-            progress(0.5 + 0.5 * (index + 1) / len(planes), "Measuring GBM orientation")
+            progress(0.4 + 0.6 * (index + 1) / len(planes), "Measuring GBM orientation")
     return results
 
 
@@ -632,16 +752,21 @@ CROSS_SECTION_REASONS = (
     REASON_OBLIQUE, REASON_EN_FACE, REASON_TRANSIENT, REASON_SPECK, REASON_COMPACT, REASON_ARTIFACT, REASON_WIDE_PATCH,
 )
 
-AUTO_TILT_INFLATION = 1.25
-AUTO_TILT_RANGE_DEG = (15.0, 35.0)
+AUTO_TILT_INFLATION = 1.35
+AUTO_TILT_RANGE_DEG = (20.0, 40.0)
 # With no Z step on record: a sheet smeared sideways by this multiple of its own
 # thickness cannot be measured as a cross-section at all.
 EN_FACE_SMEAR = 1.0
 # Also then, only to turn planes into a rough lateral distance for area and for
 # choosing which pieces to take the reference thickness from.
 ASSUMED_AXIAL_PX_PER_PLANE = 4.0
-SPECK_AREA_THICKNESSES = 6.0
-COMPACT_ASPECT = 2.0
+SPECK_AREA_THICKNESSES = 4.0
+WIDTH_CONFIRMS_TILT = 1.2
+COMPACT_ASPECT = 1.5
+# Sheets persist through Z; only something this brief can be called not a sheet.
+BRIEF_MARGIN_PLANES = 2.0
+# Far wider than the best-oriented GBM, with no sign of being vertical.
+WIDE_PATCH_FACTOR = 2.5
 
 
 def apparent_inflation(tilt_deg: float, z_step_um: float, thickness_um: float, mip_planes: int) -> float:
@@ -672,12 +797,25 @@ def auto_max_tilt_deg(z_step_um: float, thickness_um: float, mip_planes: int = M
     return round(0.5 * (low + high), 1)
 
 
+def piece_tan_bound(analysis: PlaneAnalysis) -> np.ndarray:
+    """Lowest tilt (pixels per plane) each piece's measurement supports.
+
+    A lone uncertain piece follows its neighbours; a real change of orientation
+    spans several pieces and survives.
+    """
+    slope = np.asarray(analysis.piece_tan_drift, dtype=np.float64)
+    error = np.nan_to_num(np.asarray(analysis.piece_tan_error, dtype=np.float64))
+    return smooth_over_pieces(np.maximum(slope - SLOPE_ERROR_MARGIN * error, 0.0), analysis.piece_edges)
+
+
 def piece_tilt_deg(analysis: PlaneAnalysis, pixel_size_um: float, z_step_um: float) -> np.ndarray:
-    """Tilt of each piece from vertical, in degrees; NaN where no neighbours exist."""
-    scale = float(pixel_size_um) / float(z_step_um)
-    fused = fuse_tangent(analysis.piece_tan_chord, analysis.piece_tan_drift, analysis.piece_censored > 0.5)
-    smoothed = smooth_over_pieces(fused, analysis.piece_edges)
-    return np.degrees(np.arctan(smoothed * scale))
+    """Measured tilt of each piece from vertical, in degrees; NaN where unmeasured."""
+    return np.degrees(np.arctan(np.asarray(analysis.piece_tan_drift, dtype=np.float64) * float(pixel_size_um) / float(z_step_um)))
+
+
+def piece_tilt_bound_deg(analysis: PlaneAnalysis, pixel_size_um: float, z_step_um: float) -> np.ndarray:
+    """The tilt decisions use: what the piece is at least tilted by."""
+    return np.degrees(np.arctan(piece_tan_bound(analysis) * float(pixel_size_um) / float(z_step_um)))
 
 
 def reference_width_px(analysis: PlaneAnalysis, tilt_deg: np.ndarray | None = None) -> float:
@@ -728,20 +866,16 @@ def classify_pieces(
     width = np.asarray(analysis.piece_width_px, dtype=np.float64)
     has_neighbours = analysis.neighbour_planes > 0
     has_tilt = bool(z_step_um) and has_neighbours
-    drift = None
+    bound = piece_tan_bound(analysis) if has_neighbours and count else np.full(count, np.nan)
     if has_tilt:
         tilt = piece_tilt_deg(analysis, pixel_size_um, z_step_um)
         reference_px = reference_width_px(analysis, tilt)
     else:
         tilt = np.full(count, np.nan)
-        if has_neighbours:
-            drift = smooth_over_pieces(
-                fuse_tangent(analysis.piece_tan_chord, analysis.piece_tan_drift, analysis.piece_censored > 0.5),
-                analysis.piece_edges,
-            )
-            reference_px = reference_width_px(analysis, np.degrees(np.arctan(drift / ASSUMED_AXIAL_PX_PER_PLANE)))
-        else:
-            reference_px = reference_width_px(analysis)
+        reference_px = (
+            reference_width_px(analysis, np.degrees(np.arctan(bound / ASSUMED_AXIAL_PX_PER_PLANE)))
+            if has_neighbours else reference_width_px(analysis)
+        )
     reference_um = reference_px * float(pixel_size_um)
     if not has_tilt:
         limit = None
@@ -754,39 +888,55 @@ def classify_pieces(
     if settings.cross_section and count:
         artifact = np.asarray(analysis.piece_artifact) >= 0.5
         reasons[artifact] = REASON_ARTIFACT
-        planes = np.asarray(analysis.piece_chord_planes, dtype=np.float64)
+        chord = np.asarray(analysis.piece_chord_planes, dtype=np.float64)
+        tracked = np.asarray(analysis.piece_track_planes, dtype=np.float64)
         open_ended = np.asarray(analysis.piece_censored) >= 0.5
         if has_neighbours:
             with np.errstate(invalid="ignore"):
+                # A tilted sheet is also wider. When the slope alone is uncertain,
+                # that independent evidence settles it; narrow GBM with a noisy
+                # slope stays.
+                measured_tan = np.asarray(analysis.piece_tan_drift, dtype=np.float64)
+                widened = width > WIDTH_CONFIRMS_TILT * max(reference_px, 1.0)
+                evidence_tan = np.where(widened, measured_tan, bound)
                 if has_tilt:
-                    en_face = tilt > np.maximum(field_, EN_FACE_TILT_DEG)
-                    oblique = (tilt > field_) & ~en_face
+                    evidence_deg = np.degrees(np.arctan(evidence_tan * float(pixel_size_um) / float(z_step_um)))
+                    en_face = evidence_deg > np.maximum(field_, EN_FACE_TILT_DEG)
+                    oblique = (evidence_deg > field_) & ~en_face
                     scale = float(z_step_um) / float(pixel_size_um)
                 else:
                     # Without a Z step the angle is unknown, but what it does to the
                     # measurement is not: the projection smears a sheet sideways by
                     # its drift per plane, in pixels, whatever the Z step is.
-                    smear = max(0, settings.mip_planes - 1) * drift / max(reference_px, 1.0)
+                    smear = max(0, settings.mip_planes - 1) * evidence_tan / max(reference_px, 1.0)
                     en_face = smear > EN_FACE_SMEAR
                     oblique = (smear > AUTO_TILT_INFLATION - 1.0) & ~en_face
                     scale = ASSUMED_AXIAL_PX_PER_PLANE
-                # A structure no longer than the Z projection itself is not a
-                # sheet running through the stack.
-                transient = (planes <= settings.mip_planes + 2.0) & ~open_ended
+                # A structure no longer than the Z projection itself, neither under
+                # its medial point nor followed sideways, is not a sheet. Sparse
+                # sampling cannot show that, so it is only judged on close planes.
+                brief_limit = settings.mip_planes + BRIEF_MARGIN_PLANES
+                judged = float(settings.plane_step) <= 0.5 * brief_limit
+                transient = judged & (chord <= brief_limit) & (tracked <= brief_limit) & ~open_ended
+                # Lying flat, a sheet is far too wide and cannot be followed as a line.
+                unsure = ~np.isfinite(np.asarray(analysis.piece_tan_drift, dtype=np.float64)) | (bound > 0.0)
+                patch = (width > WIDE_PATCH_FACTOR * max(reference_px, 1.0)) & unsure
+                # Blobs and specks only when nothing says they run through the stack.
+                persistent = (tracked > 2.0 * brief_limit) | (chord > 2.0 * brief_limit)
             area = np.asarray(analysis.piece_cc_samples, dtype=np.float64) * scale * float(settings.plane_step)
-            speck = area < SPECK_AREA_THICKNESSES * max(reference_px, 1.0) ** 2
+            speck = (area < SPECK_AREA_THICKNESSES * max(reference_px, 1.0) ** 2) & ~persistent
+            compact = (np.asarray(analysis.piece_component_aspect) < COMPACT_ASPECT) & ~persistent
             for mask, code in (
                 (speck, REASON_SPECK), (transient, REASON_TRANSIENT),
-                (oblique, REASON_OBLIQUE), (en_face, REASON_EN_FACE),
+                (en_face, REASON_EN_FACE), (oblique, REASON_OBLIQUE), (patch, REASON_WIDE_PATCH),
+                (compact, REASON_COMPACT),
             ):
                 reasons[mask & (reasons == 0)] = code
-            compact = np.asarray(analysis.piece_component_aspect) < COMPACT_ASPECT
-            reasons[compact & (reasons == 0)] = REASON_COMPACT
         else:
             # One plane only: shape is all there is. Wide, short patches are
             # what en-face sheet looks like; compact islands are not sheets.
             aspect = np.asarray(analysis.piece_component_aspect)
-            wide = width > 2.0 * max(reference_px, 1.0)
+            wide = width > WIDE_PATCH_FACTOR * max(reference_px, 1.0)
             reasons[wide & (reasons == 0)] = REASON_WIDE_PATCH
             reasons[(aspect < COMPACT_ASPECT) & (reasons == 0)] = REASON_COMPACT
         if trusted_reasons is not None:
@@ -806,6 +956,5 @@ __all__ = [name for name in globals() if name.isupper()] + [
     "StackPlane",
     "analyze_stack",
     "build_pieces",
-    "fuse_tangent",
     "signed_distance",
 ]

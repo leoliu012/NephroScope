@@ -53,7 +53,7 @@ function zStepText(zStep) {
 // plane's refinement in the viewer; Case analysis passes ``totals`` instead.
 export default function GbmFilterControls({
   settings, onChange, view, totals, showDisplayOptions = false, zStepOverride, onZStepOverride, onRetry, error, children,
-  onSegmentNearby, nearbyBusy = false,
+  onSegmentNearby, nearbyBusy = false, keptColor = null,
 }) {
   const patch = change => onChange({ ...settings, ...change })
   const summary = view?.summary
@@ -62,7 +62,7 @@ export default function GbmFilterControls({
   const kept = summary?.keptSamples ?? totals?.kept
   const total = summary?.totalSamples ?? totals?.total
   const byReason = summary?.byReason || totals?.byReason || {}
-  const reasons = Object.entries(byReason).filter(([name]) => name !== 'kept').sort((a, b) => b[1] - a[1])
+  const reasons = Object.entries(byReason).sort((a, b) => (a[0] === 'kept' ? -1 : b[0] === 'kept' ? 1 : b[1] - a[1]))
   const percent = total ? Math.round(100 * kept / total) : null
   const singlePlane = view?.hasNeighbours === false || (totals?.singlePlane > 0 && totals.singlePlane === totals.measured)
   const noZStep = Boolean(view?.pieces) && !view?.zStep?.um && view?.hasNeighbours !== false
@@ -115,7 +115,7 @@ export default function GbmFilterControls({
 
     {showDisplayOptions && <label className="gf-switch">
       <input type="checkbox" checked={settings.showExcluded} onChange={event => patch({ showExcluded: event.target.checked })} />
-      <span>Show excluded in red</span>
+      <span>Show excluded, coloured by reason</span>
     </label>}
 
     {message && <p className={`gf-status gf-status-${message.tone}`} role="status">
@@ -139,7 +139,8 @@ export default function GbmFilterControls({
       {reasons.length > 0 && <ul className="gf-reasons">
         {reasons.map(([name, count]) => {
           const info = REASON_INFO[name] || { label: name, color: '#94a3b8' }
-          return <li key={name} title={info.hint}><i style={{ background: info.color }} />{info.label}<span>{count.toLocaleString()}</span></li>
+          const color = name === 'kept' && keptColor ? keptColor : info.color
+          return <li key={name} title={info.hint}><i style={{ background: color }} />{info.label}<span>{count.toLocaleString()}</span></li>
         })}
       </ul>}
     </div>}
@@ -147,7 +148,16 @@ export default function GbmFilterControls({
   </section>
 }
 
-export function GbmCorrectionControls({ correction, activeTool, onSelectTool, disabled, canAnnotate }) {
+// What is being recalculated, while it is. ``message`` is empty when nothing is.
+export function GbmRecalculatingPopup({ message }) {
+  if (!message) return null
+  return <div className="gf-popup" role="status" aria-live="polite">
+    <Loader2 size={15} className="animate-spin" />
+    <span>{message}</span>
+  </div>
+}
+
+export function GbmCorrectionControls({ correction, activeTool, onSelectTool, disabled, canAnnotate, brushRadius, onBrushRadius }) {
   const { clickState, canUndo, undo, restore, sliceEditCount, imageEditCount } = correction
   return <div className="gf-corrections">
     <p className="gf-label">Corrections</p>
@@ -158,12 +168,18 @@ export function GbmCorrectionControls({ correction, activeTool, onSelectTool, di
         <button type="button" disabled={disabled} className={`ux-button ux-button-secondary${activeTool === 'gbm-remove' ? ' gf-tool-active' : ''}`}
           aria-pressed={activeTool === 'gbm-remove'} onClick={() => onSelectTool(activeTool === 'gbm-remove' ? 'select' : 'gbm-remove')}>Remove GBM</button>
       </div>
+      <label className="gf-slider gf-brush">
+        <span className="gf-brush-label">Brush</span>
+        <input type="range" min="1" max="100" step="1" value={Math.min(100, brushRadius)} aria-label="Brush radius in pixels"
+          onChange={event => onBrushRadius(Number(event.target.value))} />
+        <span>{brushRadius} px</span>
+      </label>
       <div className="gf-tool-row">
         <button type="button" className="ux-button ux-button-ghost" disabled={!canUndo || clickState.busy} onClick={undo}><Undo2 size={13} />Undo</button>
         <button type="button" className="ux-button ux-button-ghost" disabled={!sliceEditCount || clickState.busy} onClick={() => restore('slice')}><RotateCcw size={13} />Restore Z</button>
         <button type="button" className="ux-button ux-button-ghost" disabled={!imageEditCount || clickState.busy} onClick={() => restore('image')}><RotateCcw size={13} />Restore image</button>
       </div>
-      <p className="gf-note">{imageEditCount ? `${sliceEditCount} on this Z · ${imageEditCount} on this image. The saved model prediction is unchanged.` : 'Click excluded GBM to bring it and similar GBM nearby back, or click faint GBM to add it. Corrections apply across nearby Z.'}</p>
+      <p className="gf-note">{imageEditCount ? `${sliceEditCount} on this Z · ${imageEditCount} on this image. The saved model prediction is unchanged.` : 'Paint to keep, add or remove exactly what the brush covers. Click to also adjust similar GBM nearby, including on nearby Z. [ and ] change the brush size.'}</p>
     </> : <p className="gf-note">Your role can view corrections but not change them.</p>}
     {clickState.busy && <p className="gf-status gf-status-busy" role="status"><Loader2 size={12} className="animate-spin" /><span>Applying…</span></p>}
     {clickState.message && <p className="gf-note" role="status">{clickState.message}</p>}

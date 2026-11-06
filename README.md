@@ -53,18 +53,22 @@ tabs and in Case analysis) compares each slice's prediction with the other
 segmented slices of the image, measures how tilted each short length of GBM is,
 and leaves out oblique and en-face GBM, as well as predictions too short-lived or
 small through the stack to be a sheet. **Thickness limits** (default 30–3400 nm,
-after EF) work independently. Excluded GBM is outlined in red, and thickness plots,
-ROI measurements, overlays and exports only use what is kept.
+after EF) work independently. Excluded GBM and its centerline are drawn in the colour
+of the reason it was excluded, matching the legend beside it, and thickness plots, ROI
+measurements and exports only use what is kept. A popup shows when a change of
+settings or a correction is being recalculated.
 
-To correct a prediction, use **Add GBM** or **Remove GBM** on the tool rail and
-click:
+To correct a prediction, choose **Add GBM** or **Remove GBM** on the tool rail, set
+the brush size (`[` and `]` also change it), and paint or click:
 
-- Clicking excluded GBM keeps it, and raises the tilt limit nearby (also on nearby
-  Z slices), so similar GBM around it returns.
-- Clicking faint GBM the model missed lowers the probability threshold around that
-  point and adds what it finds.
-- Clicking wrong GBM removes that piece. If its tilt was close to the limit, the
-  limit also tightens nearby.
+- **Painting** acts on exactly what the brush covers, and nothing else: it keeps or
+  removes that centerline. Painting Add GBM over faint GBM adds what the probability
+  map shows under the brush, at its own width and not the brush's.
+- **Clicking** also adjusts what is around it, including on nearby Z slices. Clicking
+  excluded GBM raises the tilt limit nearby, so similar GBM returns. Clicking wrong
+  GBM removes that piece, and tightens the limit nearby if its tilt was close to it.
+  Clicking faint GBM lowers the probability threshold around that point and adds
+  what it finds.
 
 The saved model prediction never changes. **Undo**, **Restore Z** and **Restore
 image** remove corrections and give back exactly what the algorithm decided.

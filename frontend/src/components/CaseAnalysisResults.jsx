@@ -7,9 +7,10 @@ import {
 import { authFetch } from '../auth.js'
 import { caseAnalysisSession } from '../caseAnalysisSession.js'
 import {
-  filterKey, filterPayload, filterTotals, loadFilterSettings, loadZStepOverride, normalizeFilterSettings, reportFilterLine, saveFilterSettings,
+  filterKey, filterPayload, filterTotals, loadFilterSettings, loadZStepOverride, normalizeFilterSettings, recalculationMessage,
+  reportFilterLine, saveFilterSettings,
 } from '../gbmRefinement.js'
-import GbmFilterControls from './GbmFilterControls.jsx'
+import GbmFilterControls, { GbmRecalculatingPopup } from './GbmFilterControls.jsx'
 import { compareAlphanumeric } from '../collectionOrganization.js'
 import { AnalysisStatusBadge, analysisStatusText } from './CaseAnalysisStatus.jsx'
 import ThicknessDistributionPlot from './ThicknessDistributionPlot.jsx'
@@ -20,6 +21,7 @@ function useSavedAnalysis(id, filterSettings) {
   const [version, setVersion] = useState(0)
   const nextRef = useRef(null)
   const filterIdentity = filterKey(filterPayload(filterSettings))
+  const [measuredFor, setMeasuredFor] = useState('')
 
   useEffect(() => {
     setState(caseAnalysisSession.analysisState.get(id) || null)
@@ -39,6 +41,7 @@ function useSavedAnalysis(id, filterSettings) {
           signal,
           distributions: known?.distributions,
           filterFor: image => filterPayload(filterSettings, image ? loadZStepOverride(image.caseId, image.filename) : null),
+          onPassFinished: () => setMeasuredFor(filterIdentity),
           onChange: next => {
             caseAnalysisSession.analysisState.set(id, next)
             setState(next)
@@ -58,7 +61,10 @@ function useSavedAnalysis(id, filterSettings) {
     setState(next)
     setVersion(value => value + 1)
   }
-  return { analysis: state?.analysis || null, distributions: state?.distributions || new Map(), error, setError, restartWith }
+  return {
+    analysis: state?.analysis || null, distributions: state?.distributions || new Map(), error, setError, restartWith,
+    remeasuring: measuredFor !== filterIdentity,
+  }
 }
 
 function jobLabel(job) {
@@ -150,9 +156,12 @@ function ProgressTree({ batch, analysis, canCancel, onCancel, cancelling }) {
 
 export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNewAnalysis, onChanged }) {
   const [filterSettings, setFilterSettings] = useState(loadFilterSettings)
-  const { analysis, distributions, error, setError, restartWith } = useSavedAnalysis(id, filterSettings)
+  const { analysis, distributions, error, setError, restartWith, remeasuring } = useSavedAnalysis(id, filterSettings)
+  // The popup follows a change someone made, not opening the analysis.
+  const [recalculating, setRecalculating] = useState(false)
   const updateFilterSettings = next => {
     const normalized = normalizeFilterSettings(next)
+    if (filterKey(filterPayload(normalized)) !== filterKey(filterPayload(filterSettings))) setRecalculating(true)
     setFilterSettings(normalized)
     saveFilterSettings(normalized)
   }
@@ -217,6 +226,12 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
   const plotCases = [...new Set(groups.map(group => group.caseId))]
   const measuredDistributions = useMemo(() => (batch?.jobs || []).filter(job => !excluded.includes(job.imageKey)).map(job => job.distribution).filter(Boolean), [batch, excluded])
   const totals = useMemo(() => filterTotals(measuredDistributions), [measuredDistributions])
+  const recalculationText = !recalculating ? '' : remeasuring
+    ? recalculationMessage({ remeasuring: true })
+    : totals.pending > 0 ? `Recalculating across Z for ${totals.pending} Z…` : ''
+  useEffect(() => {
+    if (recalculating && !recalculationText) setRecalculating(false)
+  }, [recalculating, recalculationText])
   const toggleCase = caseId => setCollapsedCases(current => ({ ...current, [caseId]: !current[caseId] }))
 
   if (!analysis) {
@@ -280,6 +295,7 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
   if (!sorted.some(item => item.id === analysis.id)) sorted.unshift(analysis)
 
   return <div className="ca-sections" ref={rootRef}>
+    <GbmRecalculatingPopup message={recalculationText} />
     <section className="ux-card ca-card ca-analysis-head">
       <div className="ca-analysis-title">
         <div className="min-w-0">
