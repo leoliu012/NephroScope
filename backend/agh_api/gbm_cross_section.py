@@ -20,16 +20,19 @@ displacement along its own normal is recorded per plane:
   quadratic term, so the equator of a sphere reads as vertical.
 * Each piece is followed only while it stays the same sheet and has not moved more
   than its own thickness, so every piece measures its own usable Z window.
-* The fit reports its standard error. A piece only counts as tilted when even the
-  low end of that range is over the limit: uncertain means kept.
+* The fit reports its standard error, so uncertain slopes carry less weight.
 
 Everything is stored in pixels per plane, so changing the pixel size or Z step
 later needs no recomputation (``tan θ = stored * pixel_size / z_step``).
 
-Decisions are made on *pieces*: short lengths of centerline about two
-thicknesses long with their share of the mask, so a wall that turns oblique
-part-way along is only excluded where it does. Pieces are also what a person
-clicks on when correcting the result.
+GBM is continuous, and decisions respect that. Each piece of centerline gets a score
+from its tilt (weighted by how certain the slope is), its width (a tilted sheet is
+wider) and how line-like its part of the prediction is. Then the runs of equally
+judged pieces along the centerline are compared: a run flips to match its neighbours
+unless its evidence outweighs the break it would cause. So a short noisy stretch of a
+long wall stays with the wall, while a long stretch that is clearly tilted is excluded
+as a whole. Pieces are lengths of centerline about two thicknesses long, starting at
+endpoints and junctions, and they are also what a person clicks on.
 
 SciPy is imported lazily, so importing this module stays cheap for the web API.
 """
@@ -58,8 +61,6 @@ TRACK_MIN_HIT_FRACTION = 0.5
 # Half-width of the local slope fit, in planes, as a fraction of thickness in pixels.
 SLOPE_WINDOW_FRACTION = 0.5
 SLOPE_MIN_WINDOW_PLANES = 4.0
-# Decisions use tilt minus this many standard errors.
-SLOPE_ERROR_MARGIN = 1.0
 # The medial point counts as inside a neighbouring mask up to this fraction of
 # the thickness away, and may miss this many planes, so jitter and small holes
 # in a prediction do not end its axial chord.
@@ -761,7 +762,27 @@ EN_FACE_SMEAR = 1.0
 # choosing which pieces to take the reference thickness from.
 ASSUMED_AXIAL_PX_PER_PLANE = 4.0
 SPECK_AREA_THICKNESSES = 4.0
+# A piece's score is positive when evidence says to exclude it. A piece this many
+# degrees past the limit, with a certain slope, scores 1.
+TILT_SCORE_DEGREES = 8.0
+# The same with no Z step, in fractions of the thickness smeared sideways.
+SMEAR_SCORE_FRACTION = 0.15
+TILT_SCORE_RANGE = (-2.0, 3.0)
+# Width above this multiple of the best-oriented GBM counts towards tilt.
 WIDTH_CONFIRMS_TILT = 1.2
+WIDTH_SCORE_SPAN = 0.3
+WIDTH_SCORE_RANGE = (-0.5, 1.5)
+# A connected part this long, in thicknesses, is neutral; longer is more line-like.
+LINE_NEUTRAL_ASPECT = 6.0
+LINE_SCORE_WEIGHT = 0.25
+NOT_SHEET_SCORE = 1.0
+WIDE_PATCH_SCORE = 1.5
+# What a break in the centerline costs, per break, against a run's evidence (its length
+# in thicknesses times its score). Bridging a gap in kept GBM is favoured over
+# dropping a kept stretch, since kept GBM that is removed cannot be measured.
+GAP_BREAK_COST = 1.5
+ISLAND_BREAK_COST = 1.0
+RUN_SCORE_LIMIT = 2.0
 COMPACT_ASPECT = 1.5
 # Sheets persist through Z; only something this brief can be called not a sheet.
 BRIEF_MARGIN_PLANES = 2.0
@@ -797,25 +818,76 @@ def auto_max_tilt_deg(z_step_um: float, thickness_um: float, mip_planes: int = M
     return round(0.5 * (low + high), 1)
 
 
-def piece_tan_bound(analysis: PlaneAnalysis) -> np.ndarray:
-    """Lowest tilt (pixels per plane) each piece's measurement supports.
-
-    A lone uncertain piece follows its neighbours; a real change of orientation
-    spans several pieces and survives.
-    """
-    slope = np.asarray(analysis.piece_tan_drift, dtype=np.float64)
-    error = np.nan_to_num(np.asarray(analysis.piece_tan_error, dtype=np.float64))
-    return smooth_over_pieces(np.maximum(slope - SLOPE_ERROR_MARGIN * error, 0.0), analysis.piece_edges)
-
-
 def piece_tilt_deg(analysis: PlaneAnalysis, pixel_size_um: float, z_step_um: float) -> np.ndarray:
     """Measured tilt of each piece from vertical, in degrees; NaN where unmeasured."""
     return np.degrees(np.arctan(np.asarray(analysis.piece_tan_drift, dtype=np.float64) * float(pixel_size_um) / float(z_step_um)))
 
 
-def piece_tilt_bound_deg(analysis: PlaneAnalysis, pixel_size_um: float, z_step_um: float) -> np.ndarray:
-    """The tilt decisions use: what the piece is at least tilted by."""
-    return np.degrees(np.arctan(piece_tan_bound(analysis) * float(pixel_size_um) / float(z_step_um)))
+def decide_along_centerline(
+    excluded: np.ndarray,
+    score: np.ndarray,
+    length: np.ndarray,
+    edges: np.ndarray,
+    *,
+    gap_cost: float = GAP_BREAK_COST,
+    island_cost: float = ISLAND_BREAK_COST,
+) -> np.ndarray:
+    """Final decisions, given that GBM runs on continuously along its centerline.
+
+    A run of equally judged pieces keeps its decision only if the evidence for it
+    (length in thicknesses times score) outweighs the breaks it makes. Weakest runs
+    flip first, which can merge neighbours into a run that then holds. A run with no
+    neighbours has nothing to be continuous with, so its evidence stands alone.
+    """
+    decided = np.asarray(excluded, dtype=bool).copy()
+    count = decided.size
+    pairs = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    if count == 0 or pairs.size == 0:
+        return decided
+    neighbours: list[list[int]] = [[] for _ in range(count)]
+    for first, second in pairs:
+        if first != second:
+            neighbours[first].append(int(second))
+            neighbours[second].append(int(first))
+    worth = np.asarray(length, dtype=np.float64) * np.clip(np.nan_to_num(score), -RUN_SCORE_LIMIT, RUN_SCORE_LIMIT)
+    for _ in range(12):
+        run_of = np.full(count, -1, dtype=np.int64)
+        members: list[list[int]] = []
+        for start in range(count):
+            if run_of[start] >= 0 or not neighbours[start]:
+                continue
+            label = len(members)
+            run_of[start] = label
+            stack = [start]
+            run = [start]
+            while stack:
+                for other in neighbours[stack.pop()]:
+                    if run_of[other] < 0 and decided[other] == decided[start]:
+                        run_of[other] = label
+                        stack.append(other)
+                        run.append(other)
+            members.append(run)
+        candidates = []
+        for label, run in enumerate(members):
+            breaks = sum(1 for piece in run for other in neighbours[piece] if run_of[other] != label)
+            if breaks == 0:
+                continue
+            evidence = float(worth[run].sum()) * (1.0 if decided[run[0]] else -1.0)
+            margin = evidence - breaks * (gap_cost if decided[run[0]] else island_cost)
+            if margin < 0.0:
+                candidates.append((margin, label))
+        if not candidates:
+            break
+        candidates.sort()
+        flipped: set[int] = set()
+        for _, label in candidates:
+            run = members[label]
+            # A neighbouring run that flipped this pass changes what this one borders.
+            if any(run_of[other] in flipped for piece in run for other in neighbours[piece] if run_of[other] != label):
+                continue
+            decided[run] = ~decided[run]
+            flipped.add(label)
+    return decided
 
 
 def reference_width_px(analysis: PlaneAnalysis, tilt_deg: np.ndarray | None = None) -> float:
@@ -866,15 +938,15 @@ def classify_pieces(
     width = np.asarray(analysis.piece_width_px, dtype=np.float64)
     has_neighbours = analysis.neighbour_planes > 0
     has_tilt = bool(z_step_um) and has_neighbours
-    bound = piece_tan_bound(analysis) if has_neighbours and count else np.full(count, np.nan)
+    slope = np.asarray(analysis.piece_tan_drift, dtype=np.float64)
     if has_tilt:
         tilt = piece_tilt_deg(analysis, pixel_size_um, z_step_um)
         reference_px = reference_width_px(analysis, tilt)
     else:
         tilt = np.full(count, np.nan)
         reference_px = (
-            reference_width_px(analysis, np.degrees(np.arctan(bound / ASSUMED_AXIAL_PX_PER_PLANE)))
-            if has_neighbours else reference_width_px(analysis)
+            reference_width_px(analysis, np.degrees(np.arctan(slope / ASSUMED_AXIAL_PX_PER_PLANE)))
+            if has_neighbours and count else reference_width_px(analysis)
         )
     reference_um = reference_px * float(pixel_size_um)
     if not has_tilt:
@@ -886,32 +958,37 @@ def classify_pieces(
     field_ = np.full(count, np.nan if limit is None else limit) if tilt_limit_field is None else np.asarray(tilt_limit_field, dtype=np.float64)
 
     if settings.cross_section and count:
+        # Tapers, spurs and junctions are not measured, sample by sample, but they are
+        # still part of the GBM. Having no opinion, they take after what they join.
         artifact = np.asarray(analysis.piece_artifact) >= 0.5
-        reasons[artifact] = REASON_ARTIFACT
+        length = np.asarray(analysis.piece_samples, dtype=np.float64) / max(reference_px, 1.0)
+        aspect = np.maximum(np.nan_to_num(np.asarray(analysis.piece_component_aspect, dtype=np.float64), nan=LINE_NEUTRAL_ASPECT), 0.5)
+        ratio = np.nan_to_num(width / max(reference_px, 1.0), nan=1.0)
         chord = np.asarray(analysis.piece_chord_planes, dtype=np.float64)
         tracked = np.asarray(analysis.piece_track_planes, dtype=np.float64)
         open_ended = np.asarray(analysis.piece_censored) >= 0.5
         if has_neighbours:
+            # Along a continuous line one piece's slope should not stand out from its
+            # neighbours', so a lone reading follows them.
+            steady = smooth_over_pieces(slope, analysis.piece_edges)
+            uncertainty = np.nan_to_num(np.asarray(analysis.piece_tan_error, dtype=np.float64))
             with np.errstate(invalid="ignore"):
-                # A tilted sheet is also wider. When the slope alone is uncertain,
-                # that independent evidence settles it; narrow GBM with a noisy
-                # slope stays.
-                measured_tan = np.asarray(analysis.piece_tan_drift, dtype=np.float64)
-                widened = width > WIDTH_CONFIRMS_TILT * max(reference_px, 1.0)
-                evidence_tan = np.where(widened, measured_tan, bound)
                 if has_tilt:
-                    evidence_deg = np.degrees(np.arctan(evidence_tan * float(pixel_size_um) / float(z_step_um)))
-                    en_face = evidence_deg > np.maximum(field_, EN_FACE_TILT_DEG)
-                    oblique = (evidence_deg > field_) & ~en_face
-                    scale = float(z_step_um) / float(pixel_size_um)
+                    scale = float(pixel_size_um) / float(z_step_um)
+                    angle = np.degrees(np.arctan(steady * scale))
+                    spread = np.degrees(np.arctan((steady + uncertainty) * scale)) - angle
+                    tilt_score = (angle - field_) / (TILT_SCORE_DEGREES + spread)
+                    en_face = angle > np.maximum(field_, EN_FACE_TILT_DEG)
+                    axial_scale = float(z_step_um) / float(pixel_size_um)
                 else:
                     # Without a Z step the angle is unknown, but what it does to the
                     # measurement is not: the projection smears a sheet sideways by
                     # its drift per plane, in pixels, whatever the Z step is.
-                    smear = max(0, settings.mip_planes - 1) * evidence_tan / max(reference_px, 1.0)
+                    sweep = max(0, settings.mip_planes - 1) / max(reference_px, 1.0)
+                    smear = sweep * steady
+                    tilt_score = (smear - (AUTO_TILT_INFLATION - 1.0)) / (SMEAR_SCORE_FRACTION + sweep * uncertainty)
                     en_face = smear > EN_FACE_SMEAR
-                    oblique = (smear > AUTO_TILT_INFLATION - 1.0) & ~en_face
-                    scale = ASSUMED_AXIAL_PX_PER_PLANE
+                    axial_scale = ASSUMED_AXIAL_PX_PER_PLANE
                 # A structure no longer than the Z projection itself, neither under
                 # its medial point nor followed sideways, is not a sheet. Sparse
                 # sampling cannot show that, so it is only judged on close planes.
@@ -919,26 +996,40 @@ def classify_pieces(
                 judged = float(settings.plane_step) <= 0.5 * brief_limit
                 transient = judged & (chord <= brief_limit) & (tracked <= brief_limit) & ~open_ended
                 # Lying flat, a sheet is far too wide and cannot be followed as a line.
-                unsure = ~np.isfinite(np.asarray(analysis.piece_tan_drift, dtype=np.float64)) | (bound > 0.0)
-                patch = (width > WIDE_PATCH_FACTOR * max(reference_px, 1.0)) & unsure
+                unsure = ~np.isfinite(slope) | (np.nan_to_num(tilt_score) > 0.0)
+                patch = (ratio > WIDE_PATCH_FACTOR) & unsure
+                unmeasured = ~np.isfinite(slope)
                 # Blobs and specks only when nothing says they run through the stack.
                 persistent = (tracked > 2.0 * brief_limit) | (chord > 2.0 * brief_limit)
-            area = np.asarray(analysis.piece_cc_samples, dtype=np.float64) * scale * float(settings.plane_step)
+            area = np.asarray(analysis.piece_cc_samples, dtype=np.float64) * axial_scale * float(settings.plane_step)
             speck = (area < SPECK_AREA_THICKNESSES * max(reference_px, 1.0) ** 2) & ~persistent
-            compact = (np.asarray(analysis.piece_component_aspect) < COMPACT_ASPECT) & ~persistent
+            compact = (aspect < COMPACT_ASPECT) & ~persistent
+            score = (
+                np.clip(np.nan_to_num(tilt_score), *TILT_SCORE_RANGE)
+                + np.clip((ratio - WIDTH_CONFIRMS_TILT) / WIDTH_SCORE_SPAN, *WIDTH_SCORE_RANGE)
+                - LINE_SCORE_WEIGHT * np.clip(np.log2(aspect / LINE_NEUTRAL_ASPECT), -1.0, 1.0)
+            )
+            not_sheet = speck | transient | compact
+            score = np.where(not_sheet, np.maximum(score, NOT_SHEET_SCORE), score)
+            score = np.where(patch, np.maximum(score, WIDE_PATCH_SCORE), score)
+            score = np.where(artifact, 0.0, score)
+            final = decide_along_centerline((score > 0.0) & ~artifact, score, length, analysis.piece_edges)
+            # Anything excluded for continuity alone is a stretch of oblique GBM.
+            reasons[final] = REASON_OBLIQUE
             for mask, code in (
-                (speck, REASON_SPECK), (transient, REASON_TRANSIENT),
-                (en_face, REASON_EN_FACE), (oblique, REASON_OBLIQUE), (patch, REASON_WIDE_PATCH),
-                (compact, REASON_COMPACT),
+                (compact & ~patch, REASON_COMPACT), (patch & unmeasured, REASON_WIDE_PATCH), (en_face, REASON_EN_FACE),
+                (transient, REASON_TRANSIENT), (speck, REASON_SPECK),
             ):
-                reasons[mask & (reasons == 0)] = code
+                reasons[mask & final] = code
         else:
             # One plane only: shape is all there is. Wide, short patches are
             # what en-face sheet looks like; compact islands are not sheets.
-            aspect = np.asarray(analysis.piece_component_aspect)
-            wide = width > WIDE_PATCH_FACTOR * max(reference_px, 1.0)
-            reasons[wide & (reasons == 0)] = REASON_WIDE_PATCH
-            reasons[(aspect < COMPACT_ASPECT) & (reasons == 0)] = REASON_COMPACT
+            wide = ratio > WIDE_PATCH_FACTOR
+            compact = aspect < COMPACT_ASPECT
+            excluded = (wide | compact) & ~artifact
+            final = decide_along_centerline(excluded, np.where(excluded, 1.0, np.where(artifact, 0.0, -0.5)), length, analysis.piece_edges)
+            reasons[final] = REASON_COMPACT
+            reasons[final & wide] = REASON_WIDE_PATCH
         if trusted_reasons is not None:
             trusted = (np.asarray(trusted_reasons) == reasons) & (reasons != REASON_KEPT)
             reasons[trusted] = REASON_KEPT

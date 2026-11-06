@@ -200,6 +200,65 @@ class RefinementApiTests(unittest.TestCase):
         self.assertGreater(kept.mean(), 0.9)
         self.assertLess(np.nanmedian(decided["tilt_deg"]), 8.0)
 
+    def test_a_short_noisy_stretch_stays_with_the_wall_it_belongs_to(self):
+        from agh_api.gbm_cross_section import decide_along_centerline
+
+        # Ten pieces in a line, each two thicknesses long.
+        edges = np.array([[i, i + 1] for i in range(9)])
+        length = np.full(10, 2.0)
+        score = np.full(10, -1.0)
+
+        lone_wobble = score.copy()
+        lone_wobble[5] = 0.3
+        kept = ~decide_along_centerline(lone_wobble > 0, lone_wobble, length, edges)
+        self.assertTrue(kept.all(), "one slightly tilted piece does not break the line")
+
+        real_run = score.copy()
+        real_run[3:7] = 2.0
+        decided = decide_along_centerline(real_run > 0, real_run, length, edges)
+        np.testing.assert_array_equal(np.nonzero(decided)[0], [3, 4, 5, 6])
+
+        # A kept scrap in the middle of clearly tilted GBM goes with it.
+        scrap = np.full(10, 2.0)
+        scrap[5] = -0.2
+        self.assertTrue(decide_along_centerline(scrap > 0, scrap, length, edges).all())
+
+        # Pieces of no opinion, like junctions, take after what they join.
+        neutral = score.copy()
+        neutral[5] = 0.0
+        self.assertFalse(decide_along_centerline(np.zeros(10, bool), neutral, length, edges).any())
+        tilted = np.full(10, 2.0)
+        tilted[5] = 0.0
+        self.assertTrue(decide_along_centerline(tilted > 0, tilted, length, edges).all())
+
+        # With nothing to be continuous with, evidence stands alone.
+        alone = decide_along_centerline(np.array([True, False]), np.array([0.1, -0.1]), np.ones(2), np.empty((0, 2)))
+        np.testing.assert_array_equal(alone, [True, False])
+
+    def test_decisions_do_not_fragment_a_noisy_wall(self):
+        from agh_api.gbm_cross_section import FilterSettings, StackPlane, analyze_stack, classify_pieces
+        from agh_api.gbm_thickness import prepare_thickness_geometry
+
+        # A vertical ring whose edges wander between slices, as model masks do.
+        size, count = 420, 25
+        yy, xx = np.mgrid[:size, :size]
+        rng = np.random.default_rng(5)
+        angle = np.arctan2(yy - 210, xx - 210)
+        planes = []
+        for z in range(count):
+            wobble = sum(rng.normal(0, 1.8) * np.sin(k * angle + rng.uniform(0, 6.28)) for k in (3, 5, 9, 13))
+            mask = np.abs(np.hypot(yy - 210, xx - 210) + wobble - 150) < 11 + rng.normal(0, 1.0)
+            planes.append(StackPlane(z, float(z), mask, prepare_thickness_geometry(mask)))
+        results = analyze_stack(planes)
+        for z in (6, 12, 18):
+            analysis = results[z]
+            decided = classify_pieces(analysis, FilterSettings(thickness_limits=False), pixel_size_um=PIXEL_UM, z_step_um=Z_STEP_UM)
+            kept = decided["reasons"] == 0
+            edges = analysis.piece_edges
+            breaks = (kept[edges[:, 0]] != kept[edges[:, 1]]).sum() if edges.size else 0
+            self.assertLessEqual(breaks, 2, f"Z{z} was cut into pieces")
+            self.assertGreater(kept[analysis.sample_piece].mean(), 0.85)
+
     def test_toggle_and_thickness_limits_are_independent(self):
         self.distribution()
         self.run_stack_job()

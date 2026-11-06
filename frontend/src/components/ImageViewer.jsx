@@ -2358,7 +2358,7 @@ export default function ImageViewer({
                 <ModelSkeletonOverlay
                   key={`${imageKey}:${currentModelRun.runId}:skeleton`}
                   skeletonUrl={modelSkeletonUrl(currentModelRun.runId)}
-                  alphaData={gbmRefinedOverlay?.skeleton || null}
+                  alphaData={(gbmFilter.showExcluded ? gbmRefinedOverlay?.skeleton : gbmRefinedOverlay?.wholeSkeleton) || null}
                   width={imgMeta?.width}
                   height={imgMeta?.height}
                   color={modelSkeletonSettings.color}

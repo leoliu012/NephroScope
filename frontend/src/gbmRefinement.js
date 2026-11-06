@@ -244,6 +244,7 @@ export function refinedLayers(label, keptTable, colorTable) {
   const count = pieces.length
   const kept = new Uint8ClampedArray(count)
   const skeleton = new Uint8ClampedArray(count)
+  const wholeSkeleton = new Uint8ClampedArray(count)
   const fill = new Uint8ClampedArray(count * 4)
   const lines = new Uint8ClampedArray(count * 4)
   const artifact = hexColor(REASON_INFO.artifact.color)
@@ -253,6 +254,7 @@ export function refinedLayers(label, keptTable, colorTable) {
     const target = index * 4
     if (keptTable[piece]) {
       kept[index] = 255
+      if (center[index]) wholeSkeleton[index] = 255
       if (center[index] === 255) skeleton[index] = 255
       else if (center[index]) {
         // Tapers and spurs of kept GBM are not measured either.
@@ -278,6 +280,9 @@ export function refinedLayers(label, keptTable, colorTable) {
   return {
     kept: { alpha: kept, width, height },
     skeleton: { alpha: skeleton, width, height },
+    // With the coloured layer hidden, nothing else would draw tapers and junctions,
+    // and the centerline of continuous GBM would look broken.
+    wholeSkeleton: { alpha: wholeSkeleton, width, height },
     excluded: { fill, lines, width, height },
   }
 }
