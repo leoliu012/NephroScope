@@ -20,21 +20,22 @@ export const DEFAULT_FILTER_SETTINGS = Object.freeze({
   minNm: 30,
   maxNm: 3400,
   showExcluded: true,
+  brushRadius: 12,
 })
 
 // Reason codes come from the server; these say what each means to a person.
 export const REASON_INFO = Object.freeze({
   kept: { label: 'Kept', hint: 'Measured', color: '#22c55e' },
-  oblique: { label: 'Oblique', hint: 'Tilted past the limit, so it looks wider than it is', color: '#f59e0b' },
-  'en-face': { label: 'En-face', hint: 'Lies nearly flat in the image', color: '#ef4444' },
-  transient: { label: 'Brief in Z', hint: 'Does not persist beyond the Z projection', color: '#a855f7' },
+  oblique: { label: 'Oblique', hint: 'Tilted past the limit at this slice, so it looks wider than it is', color: '#ef4444' },
+  'en-face': { label: 'En-face', hint: 'Lies nearly flat in the image', color: '#a855f7' },
+  transient: { label: 'Brief in Z', hint: 'Does not persist beyond the Z projection', color: '#f9a8d4' },
   speck: { label: 'Speck', hint: 'Too little sheet area across the stack', color: '#ec4899' },
-  compact: { label: 'Compact', hint: 'A blob rather than a line', color: '#d946ef' },
-  artifact: { label: 'Skeleton artifact', hint: 'Mostly a taper, spur or junction', color: '#94a3b8' },
-  'wide-patch': { label: 'Wide patch', hint: 'Far wider than typical GBM (no Z neighbours to confirm)', color: '#f97316' },
-  'too-thin': { label: 'Below minimum', hint: 'Thinner than the lower limit', color: '#38bdf8' },
-  'too-thick': { label: 'Above maximum', hint: 'Thicker than the upper limit', color: '#0ea5e9' },
-  manual: { label: 'Removed by you', hint: 'Excluded by a correction', color: '#f43f5e' },
+  compact: { label: 'Compact', hint: 'A blob rather than a line', color: '#c084fc' },
+  artifact: { label: 'Skeleton artifact', hint: 'A taper, spur or junction of the centerline', color: '#94a3b8' },
+  'wide-patch': { label: 'Wide patch', hint: 'Far wider than typical GBM, with nothing showing it is vertical', color: '#f97316' },
+  'too-thin': { label: 'Below minimum', hint: 'Thinner than the lower limit', color: '#84cc16' },
+  'too-thick': { label: 'Above maximum', hint: 'Thicker than the upper limit', color: '#10b981' },
+  manual: { label: 'Removed by you', hint: 'Excluded by a correction', color: '#ff00ff' },
 })
 
 const ANALYSIS_ACTIVE = new Set(['waiting', 'queued', 'running'])
@@ -64,6 +65,7 @@ export function normalizeFilterSettings(raw) {
     minNm: valid ? minNm : base.minNm,
     maxNm: valid ? maxNm : base.maxNm,
     showExcluded: value.showExcluded !== false,
+    brushRadius: clamp(Math.round(finite(value.brushRadius, base.brushRadius)), 1, 200),
   }
 }
 
@@ -130,6 +132,20 @@ export function filterLabel(settings) {
   }
   if (value.thicknessLimits) parts.push(`thickness ${value.minNm}–${value.maxNm} nm`)
   return parts.length ? parts.join(' · ') : 'All model predictions'
+}
+
+// Which settings change results, as opposed to how they are displayed. Changing
+// only these starts a recalculation.
+export function recalculationMessage({ stack, fetching, remeasuring }) {
+  if (stack?.state === 'running') {
+    const percent = Math.round(stack.job?.progress?.percent || 0)
+    return `Recalculating across Z${percent ? ` · ${percent}%` : ''}…`
+  }
+  if (stack?.state === 'queued') return 'Recalculating across Z: queued…'
+  if (stack?.state === 'waiting') return 'Recalculating across Z once segmentation finishes…'
+  if (fetching) return 'Recalculating with the new settings…'
+  if (remeasuring) return 'Recalculating thickness…'
+  return ''
 }
 
 export function filterIsActive(settings) {
@@ -203,26 +219,65 @@ export function keptPieceTable(reasons, reasonNames) {
   return kept
 }
 
-// Alpha rasters for what is measured and what was left out.
-export function refinedAlpha(label, keptTable) {
+function hexColor(value) {
+  const number = Number.parseInt(String(value).slice(1), 16)
+  return [(number >> 16) & 255, (number >> 8) & 255, number & 255]
+}
+
+// One colour per piece for what was left out; 0 means the piece is kept.
+export function excludedColorTable(reasons, reasonNames) {
+  const table = new Uint8Array(((reasons?.length || 0) + 1) * 3)
+  ;(reasons || []).forEach((code, index) => {
+    const name = reasonNames?.[String(code)]
+    if (name === 'kept') return
+    const color = hexColor((REASON_INFO[name] || REASON_INFO.artifact).color)
+    table.set(color, (index + 1) * 3)
+  })
+  return table
+}
+
+// Rasters of what is measured and what was left out. Excluded GBM is drawn filled
+// and its centerline solid, each in the colour of its reason, so it reads at a glance.
+export function refinedLayers(label, keptTable, colorTable) {
   const { pieces, center, width, height } = label
-  const kept = new Uint8ClampedArray(pieces.length)
-  const excluded = new Uint8ClampedArray(pieces.length)
-  const skeleton = new Uint8ClampedArray(pieces.length)
-  for (let index = 0; index < pieces.length; index += 1) {
+  const count = pieces.length
+  const kept = new Uint8ClampedArray(count)
+  const skeleton = new Uint8ClampedArray(count)
+  const fill = new Uint8ClampedArray(count * 4)
+  const lines = new Uint8ClampedArray(count * 4)
+  const artifact = hexColor(REASON_INFO.artifact.color)
+  for (let index = 0; index < count; index += 1) {
     const piece = pieces[index]
     if (!piece) continue
+    const target = index * 4
     if (keptTable[piece]) {
       kept[index] = 255
       if (center[index] === 255) skeleton[index] = 255
-    } else {
-      excluded[index] = 255
+      else if (center[index]) {
+        // Tapers and spurs of kept GBM are not measured either.
+        lines[target] = artifact[0]
+        lines[target + 1] = artifact[1]
+        lines[target + 2] = artifact[2]
+        lines[target + 3] = 255
+      }
+      continue
+    }
+    const source = piece * 3
+    fill[target] = colorTable[source]
+    fill[target + 1] = colorTable[source + 1]
+    fill[target + 2] = colorTable[source + 2]
+    fill[target + 3] = 255
+    if (center[index]) {
+      lines[target] = colorTable[source]
+      lines[target + 1] = colorTable[source + 1]
+      lines[target + 2] = colorTable[source + 2]
+      lines[target + 3] = 255
     }
   }
   return {
     kept: { alpha: kept, width, height },
-    excluded: { alpha: excluded, width, height },
     skeleton: { alpha: skeleton, width, height },
+    excluded: { fill, lines, width, height },
   }
 }
 
@@ -266,9 +321,10 @@ export function fetchRefinement(runId, { calibration, filter }, { signal } = {})
   })
 }
 
-export function createPredictionEdit(runId, { kind, x, y, calibration, filter }, { signal } = {}) {
+export function createPredictionEdit(runId, { kind, x, y, stroke, radius, calibration, filter }, { signal } = {}) {
+  const target = stroke ? { stroke, radius } : { x, y }
   return requestJson(`${runUrl(runId)}/edits`, {
-    method: 'POST', body: JSON.stringify({ kind, x, y, calibration, filter }), signal,
+    method: 'POST', body: JSON.stringify({ kind, ...target, calibration, filter }), signal,
   })
 }
 

@@ -5,7 +5,7 @@ on request from three things: the saved prediction, the stack analysis in
 :mod:`gbm_cross_section`, and a list of corrections people have made. Removing the
 corrections restores the model's prediction exactly.
 
-A correction is a click, and it changes thresholds around it:
+A click is a suggestion, and it changes thresholds around it:
 
 * Marking excluded GBM as real pins that piece and relaxes the tilt limit nearby,
   in 3D, up to the clicked piece's tilt, so similar neighbours come back too.
@@ -13,6 +13,10 @@ A correction is a click, and it changes thresholds around it:
   same way.
 * Clicking where the model predicted nothing lowers the *probability* threshold
   around the click to take in what is there (see :func:`find_region_at_click`).
+
+A brush stroke is an instruction: exactly the centerline under it is kept or
+removed, and nothing nearby changes. Where a keeping stroke crosses background, it
+adds what the probability map shows under the brush (see :func:`region_under_band`).
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from .analysis_artifacts import (
     attempt_directory,
@@ -59,6 +63,10 @@ from .gbm_thickness import ThicknessGeometry, load_thickness_geometry, thickness
 from .path_guard import image_path
 
 STACK_OPERATION = "gbm-stack-analysis"
+PAINT_KINDS = ("paint-keep", "paint-remove")
+# Corrections that change the plane's mask or pieces, not only decisions about them.
+STRUCTURAL_KINDS = ("add", *PAINT_KINDS)
+MAX_STROKE_POINTS = 5000
 SEGMENTATION_OPERATION = "gbm-segmentation"
 MAX_WINDOW_LIMIT = 200
 # A correction's influence falls off over this many typical thicknesses (Gaussian
@@ -177,7 +185,7 @@ def stack_state(
         state["job"] = {"runId": job["runId"], "status": job["status"], "progress": job.get("progress")}
         return state
     previous = store.latest_stack_run(case, filename, channel, window, operation=STACK_OPERATION)
-    if previous is not None and ((previous.get("request") or {}).get("sourceKey") == request["sourceKey"]):
+    if previous is not None and all((previous.get("request") or {}).get(name) == request[name] for name in ("sourceKey", "algorithm")):
         state.update(usable=previous, stale=True)
     if job is not None and job["status"] != "CANCELED":
         state["job"] = {"runId": job["runId"], "status": job["status"], "progress": job.get("progress"),
@@ -418,6 +426,7 @@ def _new_plane_from_geometry(geometry: ThicknessGeometry, base: PlaneAnalysis | 
     piece_count = int(piece.max()) + 1 if count else 0
     tan_chord = np.full(count, np.nan)
     tan_drift = np.full(count, np.nan)
+    tan_error = np.full(count, np.nan)
     censored = np.ones(count, dtype=bool)
     planes = np.full(count, np.nan)
     reach = np.zeros(count)
@@ -429,6 +438,7 @@ def _new_plane_from_geometry(geometry: ThicknessGeometry, base: PlaneAnalysis | 
         found = np.isfinite(distance)
         tan_chord[found] = base.sample_tan_chord[nearest[found]]
         tan_drift[found] = base.sample_tan_drift[nearest[found]]
+        tan_error[found] = base.sample_tan_error[nearest[found]]
         censored[found] = base.sample_chord_censored[nearest[found]]
         planes[found] = base.sample_chord_planes[nearest[found]]
         reach[found] = base.sample_window_planes[nearest[found]]
@@ -446,6 +456,7 @@ def _new_plane_from_geometry(geometry: ThicknessGeometry, base: PlaneAnalysis | 
         sample_artifact=artifact,
         sample_tan_chord=tan_chord,
         sample_tan_drift=tan_drift,
+        sample_tan_error=tan_error,
         sample_chord_censored=censored,
         sample_chord_planes=planes,
         sample_window_planes=reach,
@@ -455,6 +466,8 @@ def _new_plane_from_geometry(geometry: ThicknessGeometry, base: PlaneAnalysis | 
         piece_width_px=_aggregate(piece, piece_count, width, clean),
         piece_tan_chord=_aggregate(piece, piece_count, tan_chord, clean),
         piece_tan_drift=_aggregate(piece, piece_count, tan_drift, clean),
+        piece_tan_error=_aggregate(piece, piece_count, tan_error, clean),
+        piece_track_planes=_aggregate(piece, piece_count, planes, clean),
         piece_censored=_aggregate(piece, piece_count, censored.astype(np.float64), clean),
         piece_chord_planes=_aggregate(piece, piece_count, planes, clean),
         piece_artifact=_aggregate(piece, piece_count, (~clean).astype(np.float64), np.ones(count, dtype=bool)),
@@ -502,6 +515,8 @@ class PlaneView:
     edits: list[dict]
     all_edits: list[dict]
     piece_added: np.ndarray | None
+    piece_paint: np.ndarray | None
+    piece_paint_edit: np.ndarray | None
     revision: str
 
 
@@ -529,11 +544,13 @@ def plane_view(config, store, run: dict, options: dict, *, ensure: bool = True) 
     path = image_path(config.active_data_root, case, filename)
     all_edits = store.list_prediction_edits(case, filename, channel, _source_key(path))
     edits = [edit for edit in all_edits if edit["zIndex"] == z_index]
-    additions = [edit for edit in edits if edit["kind"] == "add"]
-    piece_added = None
-    if additions:
-        geometry, analysis, piece_added = _effective_plane(config, run, geometry, analysis, additions, stack_run)
-    return PlaneView(geometry, analysis, stack_run, state, edits, all_edits, piece_added, edits_revision(all_edits))
+    structural = [edit for edit in edits if edit["kind"] in STRUCTURAL_KINDS]
+    piece_added = piece_paint = piece_paint_edit = None
+    if structural:
+        geometry, analysis, piece_added, piece_paint, piece_paint_edit = _effective_plane(
+            config, run, geometry, analysis, structural, stack_run,
+        )
+    return PlaneView(geometry, analysis, stack_run, state, edits, all_edits, piece_added, piece_paint, piece_paint_edit, edits_revision(all_edits))
 
 
 def _require_scipy() -> None:
@@ -547,43 +564,152 @@ def _require_scipy() -> None:
         ) from exc
 
 
-def _effective_plane(config, run, base_geometry, base_analysis, additions, stack_run):
+def _effective_key(structural: list[dict], stack_run: dict | None) -> str:
+    return _digest({"edits": [edit["id"] for edit in structural], "stack": (stack_run or {}).get("runId"), "algorithm": ALGORITHM_VERSION})[:20]
+
+
+def stroke_band(stroke: list, radius: float, shape: tuple[int, int]) -> np.ndarray:
+    """Pixels under a brush stroke."""
+    height, width = shape
+    image = Image.new("1", (width, height), 0)
+    draw = ImageDraw.Draw(image)
+    points = [(float(x), float(y)) for x, y in stroke]
+    if len(points) > 1:
+        draw.line(points, fill=1, width=max(1, int(round(2.0 * radius))))
+    for x, y in points:
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=1)
+    return np.asarray(image, dtype=bool)
+
+
+def _sample_owner(geometry: ThicknessGeometry) -> np.ndarray:
+    """Index of the nearest centerline sample of every pixel."""
+    from scipy.ndimage import distance_transform_edt
+
+    height, width = geometry.shape
+    skeleton = np.ones((height, width), dtype=bool)
+    skeleton[geometry.skeleton_y, geometry.skeleton_x] = False
+    nearest = distance_transform_edt(skeleton, return_distances=False, return_indices=True)
+    sample = np.zeros((height, width), dtype=np.int32)
+    sample[geometry.skeleton_y, geometry.skeleton_x] = np.arange(geometry.skeleton_y.size, dtype=np.int32)
+    return sample[nearest[0], nearest[1]]
+
+
+def _split_for_paint(
+    analysis: PlaneAnalysis, geometry: ThicknessGeometry, mask: np.ndarray, strokes: list[dict], piece_added: np.ndarray,
+) -> tuple[PlaneAnalysis, np.ndarray, np.ndarray, np.ndarray]:
+    """Make painted centerline its own pieces, so a stroke acts on exactly what it covers.
+
+    A sample is painted when a stroke covers mask pixels it owns: the same rule that
+    colours the overlay. Later strokes win. New pieces keep the tilt evidence of the
+    piece they came from.
+    """
+    from .gbm_cross_section import _aggregate
+
+    count = geometry.skeleton_y.size
+    state = np.zeros(count, dtype=np.int64)
+    latest = np.full(count, -1, dtype=np.int64)
+    empty = np.empty(0, dtype=np.int64)
+    if count == 0:
+        return analysis, piece_added, empty, empty
+    owner = _sample_owner(geometry)
+    for index, edit in enumerate(strokes):
+        payload = edit.get("payload") or {}
+        band = stroke_band(payload.get("stroke") or [], float(payload.get("radius") or 1.0), tuple(geometry.shape))
+        touched = np.unique(owner[band & mask])
+        state[touched] = 1 if edit["kind"] == "paint-keep" else 2
+        latest[touched] = index
+    keys = np.stack([analysis.sample_piece.astype(np.int64), state, latest], axis=1)
+    _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    inverse = inverse.reshape(-1).astype(np.int32)
+    source = analysis.sample_piece[first]
+    new_count = first.size
+    clean = analysis.sample_artifact == SAMPLE_OK
+    every = np.ones(count, dtype=bool)
+    representative = np.full(int(source.max()) + 1, -1, dtype=np.int64)
+    representative[source[::-1]] = np.arange(new_count)[::-1]
+    edges = [[representative[a], representative[b]] for a, b in np.asarray(analysis.piece_edges, dtype=np.int64)
+             if representative[a] >= 0 and representative[b] >= 0]
+    edges += [[representative[source[piece]], piece] for piece in range(new_count) if representative[source[piece]] != piece]
+    width = geometry.local_thickness_pixels.astype(np.float64)
+    split = PlaneAnalysis(
+        z_index=analysis.z_index,
+        shape=analysis.shape,
+        sample_piece=inverse,
+        sample_artifact=analysis.sample_artifact,
+        sample_tan_chord=analysis.sample_tan_chord,
+        sample_tan_drift=analysis.sample_tan_drift,
+        sample_tan_error=analysis.sample_tan_error,
+        sample_chord_censored=analysis.sample_chord_censored,
+        sample_chord_planes=analysis.sample_chord_planes,
+        sample_window_planes=analysis.sample_window_planes,
+        piece_samples=np.bincount(inverse, minlength=new_count),
+        piece_center_x=_aggregate(inverse, new_count, geometry.skeleton_x.astype(np.float64), clean),
+        piece_center_y=_aggregate(inverse, new_count, geometry.skeleton_y.astype(np.float64), clean),
+        piece_width_px=_aggregate(inverse, new_count, width, clean),
+        piece_tan_chord=analysis.piece_tan_chord[source],
+        piece_tan_drift=analysis.piece_tan_drift[source],
+        piece_tan_error=analysis.piece_tan_error[source],
+        piece_track_planes=analysis.piece_track_planes[source],
+        piece_censored=analysis.piece_censored[source],
+        piece_chord_planes=analysis.piece_chord_planes[source],
+        piece_artifact=_aggregate(inverse, new_count, (~clean).astype(np.float64), every),
+        piece_component_aspect=analysis.piece_component_aspect[source],
+        piece_cc_samples=analysis.piece_cc_samples[source],
+        piece_cc_span=analysis.piece_cc_span[source],
+        piece_edges=np.asarray(edges, dtype=np.int32).reshape(-1, 2),
+        neighbour_planes=analysis.neighbour_planes,
+        median_width_px=analysis.median_width_px,
+    )
+    return split, np.asarray(piece_added, dtype=bool)[source], state[first], latest[first]
+
+
+def _effective_plane(config, run, base_geometry, base_analysis, structural, stack_run):
+    """The plane with added regions and painted pieces. Saved predictions stay as they are."""
     from .gbm_thickness import prepare_thickness_geometry
 
-    key = _digest({"edits": [edit["id"] for edit in additions], "stack": (stack_run or {}).get("runId"), "algorithm": ALGORITHM_VERSION})[:20]
-    directory = _effective_directory(config, run, key)
+    directory = _effective_directory(config, run, _effective_key(structural, stack_run))
     plane_file = directory / "plane.npz"
     geometry_file = directory / "thickness_geometry.npz"
-    added_file = directory / "added.npy"
-    if plane_file.is_file() and geometry_file.is_file() and added_file.is_file():
+    extras_file = directory / "extras.npz"
+    if plane_file.is_file() and geometry_file.is_file() and extras_file.is_file():
         with np.load(plane_file, allow_pickle=False) as archive:
             analysis = PlaneAnalysis.from_arrays(archive)
-        return load_thickness_geometry(geometry_file), analysis, np.load(added_file, allow_pickle=False)
+        with np.load(extras_file, allow_pickle=False) as extras:
+            return (
+                load_thickness_geometry(geometry_file), analysis,
+                extras["added"], extras["paint"], extras["paint_edit"],
+            )
     _require_scipy()
     attempt = (run.get("result") or {}).get("artifactAttempt")
     mask = read_mask(config.analysis_root, run["runId"], attempt=attempt).copy()
-    for edit in additions:
-        _rle_paint(mask, (edit.get("payload") or {}).get("region") or {})
-    geometry = prepare_thickness_geometry(mask)
-    analysis, piece_added = _new_plane_from_geometry(geometry, base_analysis, base_geometry)
+    regions = [(edit.get("payload") or {}).get("region") for edit in structural]
+    regions = [region for region in regions if region and region.get("h")]
+    for region in regions:
+        _rle_paint(mask, region)
+    geometry = prepare_thickness_geometry(mask) if regions else base_geometry
+    if regions or base_analysis is None:
+        analysis, added = _new_plane_from_geometry(geometry, base_analysis, base_geometry if base_analysis is not None else None)
+    else:
+        analysis, added = base_analysis, np.zeros(base_analysis.piece_samples.size, dtype=bool)
+    strokes = [edit for edit in structural if edit["kind"] in PAINT_KINDS]
+    analysis, added, paint, paint_edit = _split_for_paint(analysis, geometry, mask, strokes, added)
     payload = BytesIO()
     np.savez_compressed(payload, **thickness_geometry_to_arrays(geometry))
     write_bytes_atomic(geometry_file, payload.getvalue())
     _save_plane(plane_file, analysis)
     write_bytes_atomic(directory / "label.png", _encode_label(geometry, mask, analysis.sample_piece, analysis.sample_artifact))
     buffer = BytesIO()
-    np.save(buffer, piece_added, allow_pickle=False)
-    write_bytes_atomic(added_file, buffer.getvalue())
-    return geometry, analysis, piece_added
+    np.savez(buffer, added=added, paint=paint, paint_edit=paint_edit)
+    write_bytes_atomic(extras_file, buffer.getvalue())
+    return geometry, analysis, added, paint, paint_edit
 
 
 def label_file(config, store, run: dict, options: dict) -> Path:
     """The label raster to display for this plane."""
     view = plane_view(config, store, run, options, ensure=False)
-    additions = [edit for edit in view.edits if edit["kind"] == "add"]
-    if additions:
-        key = _digest({"edits": [edit["id"] for edit in additions], "stack": (view.stack_run or {}).get("runId"), "algorithm": ALGORITHM_VERSION})[:20]
-        path = _effective_directory(config, run, key) / "label.png"
+    structural = [edit for edit in view.edits if edit["kind"] in STRUCTURAL_KINDS]
+    if structural:
+        path = _effective_directory(config, run, _effective_key(structural, view.stack_run)) / "label.png"
         if path.is_file():
             return path
     if view.stack_run is None:
@@ -618,13 +744,29 @@ def decide(view: PlaneView, settings: FilterSettings, calibration: dict, z_step:
         added = np.asarray(view.piece_added, dtype=bool)
         reasons[added] = REASON_KEPT
         pinned |= added
-    for edit in view.edits:
+    # When each piece was last painted, as a position in this plane's corrections.
+    painted_at = np.full(reasons.size, -1, dtype=np.int64)
+    if view.piece_paint is not None and view.piece_paint.size == reasons.size:
+        positions = [index for index, edit in enumerate(view.edits) if edit["kind"] in PAINT_KINDS]
+        keep = view.piece_paint == 1
+        remove = view.piece_paint == 2
+        reasons[keep] = REASON_KEPT
+        pinned[keep] = True
+        clicked[keep] = True
+        reasons[remove] = REASON_MANUAL
+        pinned[remove] = False
+        clicked[remove] = False
+        touched = view.piece_paint_edit >= 0
+        painted_at[touched] = np.asarray(positions, dtype=np.int64)[view.piece_paint_edit[touched]]
+    for position, edit in enumerate(view.edits):
         if edit["kind"] not in ("include", "exclude"):
             continue
         index, _ = _nearest_sample(view.geometry, edit["x"], edit["y"])
         if index < 0:
             continue
         piece = int(analysis.sample_piece[index])
+        if position < painted_at[piece]:
+            continue
         reasons[piece] = REASON_KEPT if edit["kind"] == "include" else REASON_MANUAL
         pinned[piece] = edit["kind"] == "include"
         clicked[piece] = edit["kind"] == "include"
@@ -729,7 +871,7 @@ def refinement_view(config, store, run: dict, settings: FilterSettings, options:
     response["medianReachPlanes"] = ((view.stack_run or {}).get("result") or {}).get("medianReachPlanes")
     response["labelToken"] = _digest({
         "stack": (view.stack_run or {}).get("runId"),
-        "adds": [edit["id"] for edit in view.edits if edit["kind"] == "add"],
+        "structural": [edit["id"] for edit in view.edits if edit["kind"] in STRUCTURAL_KINDS],
     })[:20]
     return response
 
@@ -753,6 +895,7 @@ def _public_edit(edit: dict) -> dict:
     payload = edit.get("payload") or {}
     return {
         "id": edit["id"], "kind": edit["kind"], "x": edit["x"], "y": edit["y"], "zIndex": edit["zIndex"],
+        "stroke": payload.get("stroke"), "radius": payload.get("radius"),
         "createdBy": edit.get("createdBy"), "createdAt": edit.get("createdAt"),
         "tiltDeg": payload.get("tiltDeg"), "reason": payload.get("reason"), "tau": payload.get("tau"),
         "probabilitySource": payload.get("probabilitySource"),
@@ -814,6 +957,102 @@ def find_region_at_click(probability: np.ndarray, mask: np.ndarray, x: float, y:
         full[y0:y1, x0:x1] = new
         return {"tau": round(level, 3), "radius": round(radius, 1), "region": _rle_encode(full), "area": int(new.sum())}
     return None
+
+
+def region_under_band(probability: np.ndarray, mask: np.ndarray, band: np.ndarray, reference_px: float) -> dict | None:
+    """What a keeping stroke adds where it crosses background.
+
+    The brush says where; the map says how wide. Within the stroke, the region is
+    cut at half height between the signal under the brush and the local background,
+    so thickness still comes from the image and not from the size of the brush.
+    """
+    from scipy.ndimage import binary_fill_holes, binary_opening, gaussian_filter, label as component_label
+
+    fresh = band & ~mask
+    if not fresh.any():
+        return None
+    ys, xs = np.nonzero(band)
+    margin = int(max(3.0 * reference_px, 24.0))
+    y0, y1 = max(0, int(ys.min()) - margin), min(band.shape[0], int(ys.max()) + margin + 1)
+    x0, x1 = max(0, int(xs.min()) - margin), min(band.shape[1], int(xs.max()) + margin + 1)
+    crop = gaussian_filter(probability[y0:y1, x0:x1].astype(np.float32), max(1.0, 0.06 * reference_px))
+    fresh_crop = fresh[y0:y1, x0:x1]
+    outside = crop[~(mask[y0:y1, x0:x1] | band[y0:y1, x0:x1])]
+    background = float(np.percentile(outside, 20.0)) if outside.size else 0.0
+    peak = float(np.percentile(crop[fresh_crop], 90.0))
+    contrast = peak - background
+    if contrast < 0.05:
+        return None
+    level = background + 0.5 * contrast
+    passing = binary_fill_holes(binary_opening(fresh_crop & (crop >= level), np.ones((3, 3), dtype=bool))) & fresh_crop
+    labels, count = component_label(passing, structure=np.ones((3, 3), dtype=bool))
+    if count == 0:
+        return None
+    sizes = np.bincount(labels.ravel(), minlength=count + 1)
+    sizes[0] = 0
+    keep = sizes >= max(0.25 * reference_px * reference_px, 12.0)
+    if not keep.any():
+        return None
+    full = np.zeros(probability.shape, dtype=bool)
+    full[y0:y1, x0:x1] = keep[labels]
+    return {"tau": round(level, 3), "region": _rle_encode(full), "area": int(full.sum())}
+
+
+def _simplified_stroke(stroke: list, radius: float, width: int, height: int) -> list[list[float]]:
+    """In-bounds stroke points, without those closer together than the brush can show."""
+    spacing = max(1.0, 0.25 * radius)
+    points: list[list[float]] = []
+    for x, y in stroke:
+        point = [float(np.clip(x, 0, width - 1)), float(np.clip(y, 0, height - 1))]
+        if not points or math.hypot(point[0] - points[-1][0], point[1] - points[-1][1]) >= spacing:
+            points.append([round(point[0], 1), round(point[1], 1)])
+    return points
+
+
+def create_stroke_edit(config, store, run: dict, kind: str, stroke: list, radius: float, actor: str, options: dict) -> dict:
+    """Turn a brush stroke into a correction of exactly what it covers."""
+    if kind not in ("positive", "negative"):
+        raise BadRequest("kind must be positive or negative")
+    source = (run.get("request") or {}).get("source") or {}
+    width, height = int(source.get("width") or 0), int(source.get("height") or 0)
+    points = _simplified_stroke(stroke, radius, width, height)
+    if not points:
+        raise BadRequest("The stroke is empty")
+    _require_scipy()
+    case, filename = run["case"], run["filename"]
+    channel, z_index = int(run["channelIndex"]), int(run["zIndex"])
+    path = image_path(config.active_data_root, case, filename)
+    attempt = (run.get("result") or {}).get("artifactAttempt")
+    view = plane_view(config, store, run, options)
+    mask = read_mask(config.analysis_root, run["runId"], attempt=attempt).copy()
+    for edit in view.edits:
+        region = (edit.get("payload") or {}).get("region")
+        if region and region.get("h"):
+            _rle_paint(mask, region)
+    band = stroke_band(points, radius, (height, width))
+    on_prediction = bool((band & mask).any())
+    payload: dict[str, Any] = {"stroke": points, "radius": round(float(radius), 2)}
+    if kind == "negative":
+        if not on_prediction:
+            raise Conflict("There is no predicted GBM under this stroke")
+        resolved = "paint-remove"
+    else:
+        reference = float(np.median(view.geometry.local_thickness_pixels)) if view.geometry.skeleton_y.size else 20.0
+        source_name = "probability"
+        if probability_path(config.analysis_root, run["runId"], attempt=attempt, require=False).is_file():
+            probability = read_probability(config.analysis_root, run["runId"], attempt=attempt)
+        else:
+            probability = _pseudo_probability(config, run)
+            source_name = "image"
+        region = region_under_band(probability, mask, band, reference)
+        if region is not None:
+            payload.update(region, probabilitySource=source_name)
+        elif not on_prediction:
+            raise Conflict("No GBM-like signal was found under this stroke")
+        resolved = "paint-keep"
+    return store.add_prediction_edit(
+        case, filename, channel, _source_key(path), z_index, resolved, points[0][0], points[0][1], payload, actor,
+    )
 
 
 def _pseudo_probability(config, run: dict) -> np.ndarray:
@@ -895,6 +1134,7 @@ def remove_edits(config, store, run: dict, *, edit_id: str | None = None, whole_
 __all__ = [
     "STACK_OPERATION",
     "create_edit",
+    "create_stroke_edit",
     "execute_stack_analysis",
     "filter_tokens",
     "filtered_samples",

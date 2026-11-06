@@ -31,6 +31,7 @@ export default function useImageThicknessAnalysis({
   const [options, setOptions] = useState({ groupBy: 'image', unit: 'nm', observed: false, focus: true })
   const [refreshToken, setRefreshToken] = useState(0)
   const [filterPoll, setFilterPoll] = useState(0)
+  const [measuredFor, setMeasuredFor] = useState('')
   const preferenceRef = useRef(null)
   const initialGapRef = useRef(initialGap)
   initialGapRef.current = initialGap
@@ -109,6 +110,7 @@ export default function useImageThicknessAnalysis({
     return run?.status === 'SUCCEEDED' ? `${z}:${run.runId}` : ''
   }).filter(Boolean).join(',')
 
+  const measureKey = `${coverageId}|${calibrationKey}|${filterIdentity}|${editsVersion}`
   useEffect(() => {
     if (!finishedSignature) return undefined
     const controller = new AbortController()
@@ -127,17 +129,23 @@ export default function useImageThicknessAnalysis({
       const needed = items.filter(item => distributionNeeded(
         byZ.get(item.key), distributionCacheKey(item.runId, item.calibration, item.filter), tokens?.[item.runId], states[item.runId],
       ))
-      if (!needed.length) return
-      await fetchDistributions(needed, {
-        signal,
-        ...(tokens ? { tokens } : {}),
-        onResult: (z, result) => setMeasured(current => {
-          const map = new Map(current.id === coverageId ? current.byZ : [])
-          map.set(z, result)
-          return { id: coverageId, byZ: map }
-        }),
-      })
-    })().catch(err => { if (err.name !== 'AbortError') setError(err.message) })
+      if (needed.length) {
+        await fetchDistributions(needed, {
+          signal,
+          ...(tokens ? { tokens } : {}),
+          onResult: (z, result) => setMeasured(current => {
+            const map = new Map(current.id === coverageId ? current.byZ : [])
+            map.set(z, result)
+            return { id: coverageId, byZ: map }
+          }),
+        })
+      }
+      if (!signal.aborted) setMeasuredFor(measureKey)
+    })().catch(err => {
+      if (err.name === 'AbortError') return
+      setError(err.message)
+      setMeasuredFor(measureKey)
+    })
     return () => controller.abort()
   }, [finishedSignature, calibrationKey, coverageId, filterIdentity, editsVersion, filterPoll])
 
@@ -242,6 +250,7 @@ export default function useImageThicknessAnalysis({
     batch, gap, setGap, gapOptions, slices, monitoring, busy, error, options,
     setOption: (name, value) => setOptions(current => ({ ...current, [name]: value })),
     progress, report, start, interrupt, runNearby, filterWaiting, activeCount: allActiveRunIds.length,
+    remeasuring: Boolean(finishedSignature) && measuredFor !== measureKey,
     coverageLoading: coverage.loading && coverage.id === coverageId,
     coverageError: coverage.id === coverageId ? coverage.error : '',
     refresh: () => setRefreshToken(value => value + 1),

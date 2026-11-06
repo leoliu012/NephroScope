@@ -1,6 +1,8 @@
 """Routes for cross-section filtering and human corrections of GBM predictions."""
 from __future__ import annotations
 
+import math
+
 from flask import g, jsonify, request, send_file
 
 from .analysis_artifacts import ensure_run_id
@@ -9,8 +11,10 @@ from .auth import has_permission
 from .errors import BadRequest, Conflict
 from .gbm_cross_section import DEFAULT_MAX_WINDOW, FilterSettings
 from .gbm_refinement import (
+    MAX_STROKE_POINTS,
     SEGMENTATION_OPERATION,
     create_edit,
+    create_stroke_edit,
     filter_tokens,
     label_file,
     parse_filter,
@@ -107,9 +111,14 @@ def register_gbm_refinement_routes(app, config, store):
         run = segmentation_run(run_id)
         body = _json_body()
         settings, options, calibration = filter_and_calibration(body, run)
-        x, y = _coordinate(body.get("x"), "x"), _coordinate(body.get("y"), "y")
         actor = getattr(g, "remote_user", "") or ""
-        edit = create_edit(config, store, run, body.get("kind"), x, y, actor, settings, options, calibration)
+        if body.get("stroke") is not None:
+            edit = create_stroke_edit(
+                config, store, run, body.get("kind"), _stroke(body.get("stroke")), _radius(body.get("radius")), actor, options,
+            )
+        else:
+            x, y = _coordinate(body.get("x"), "x"), _coordinate(body.get("y"), "y")
+            edit = create_edit(config, store, run, body.get("kind"), x, y, actor, settings, options, calibration)
         audit_event(
             action="GBM_PREDICTION_EDITED", case_id=run["case"], filename=run["filename"], result="success",
             details={"runId": run["runId"], "zIndex": run["zIndex"], "kind": edit["kind"], "editId": edit["id"]},
@@ -162,7 +171,25 @@ def _bounded_int(value, label, low, high, default):
     return parsed
 
 
+def _stroke(value) -> list:
+    if not isinstance(value, list) or not value or len(value) > MAX_STROKE_POINTS:
+        raise BadRequest(f"stroke must list 1 to {MAX_STROKE_POINTS} points")
+    points = []
+    for point in value:
+        if not isinstance(point, list) or len(point) != 2:
+            raise BadRequest("Each stroke point must be [x, y]")
+        points.append([_coordinate(point[0], "x"), _coordinate(point[1], "y")])
+    return points
+
+
+def _radius(value) -> float:
+    radius = _coordinate(value, "radius")
+    if not 0.5 <= radius <= 1000:
+        raise BadRequest("radius must be between 0.5 and 1000")
+    return radius
+
+
 def _coordinate(value, label) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise BadRequest(f"{label} must be a number")
     return float(value)

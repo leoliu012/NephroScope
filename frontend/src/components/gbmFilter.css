@@ -43,3 +43,7 @@
 .gf-nearby { width: 100%; justify-content: center; margin-top: 6px; min-height: 0; padding: 4px 6px; font-size: 11px; }
 .gf-case-panel .gf-row, .gf-case-panel .gf-number, .gf-case-panel .gf-slider { max-width: 340px; }
 .gf-case-panel .gf-limits { max-width: 360px; }
+.gf-brush { grid-template-columns: 34px minmax(0, 1fr) 40px; }
+.gf-brush-label { text-align: left !important; color: var(--text-muted) !important; }
+.gf-popup { position: fixed; top: 64px; left: 50%; transform: translateX(-50%); z-index: 70; display: flex; align-items: center; gap: 8px; padding: 8px 16px; border: 1px solid var(--accent); border-radius: 8px; background: var(--surface-1); color: var(--text); font-size: 13px; font-weight: 500; box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45); pointer-events: none; font-variant-numeric: tabular-nums; }
+.gf-popup svg { color: var(--accent); flex-shrink: 0; }

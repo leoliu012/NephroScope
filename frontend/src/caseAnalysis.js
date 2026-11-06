@@ -299,7 +299,7 @@ const TOKEN_POLL_MS = 10000
 
 export async function monitorSavedAnalysis(initial, {
   signal, onChange, request = caseAnalysisJson, pollMs = 3000, measure = fetchDistributions, distributions: known, filterFor = null,
-  tokenPollMs = TOKEN_POLL_MS,
+  tokenPollMs = TOKEN_POLL_MS, onPassFinished = null,
 } = {}) {
   let analysis = initial
   const distributions = new Map(known || [])
@@ -349,6 +349,7 @@ export async function monitorSavedAnalysis(initial, {
       })
     }
     if (dirty || needed.length === 0) publish()
+    if (!signal?.aborted) onPassFinished?.()
     const active = analysis.jobs.some(job => ACTIVE.has(job.run?.status))
     const retryable = analysis.jobs.some(job => distributions.get(job.id)?.retryable)
     const waiting = analysis.jobs.some(job => distributions.get(job.id)?.waiting)
