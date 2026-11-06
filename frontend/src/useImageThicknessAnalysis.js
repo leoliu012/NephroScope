@@ -18,6 +18,7 @@ const FILTER_POLL_MS = 4000
 // (here or in Case analysis) shows immediately.
 export default function useImageThicknessAnalysis({
   caseId, filename, meta, ready, channelIndex, calibration, initialGap = null, filter = null, filterSettings = null, editsVersion = 0,
+  active = true,
 }) {
   const zCount = Math.max(1, Number(meta?.zCount) || 1)
   const scope = ready ? imageThicknessScope(caseId, filename, meta) : null
@@ -112,9 +113,23 @@ export default function useImageThicknessAnalysis({
 
   const measureKey = `${coverageId}|${calibrationKey}|${filterIdentity}|${editsVersion}`
   useEffect(() => {
-    if (!finishedSignature) return undefined
+    if (!finishedSignature || !active) return undefined
     const controller = new AbortController()
     const { signal } = controller
+    // Applied together, or every slice's result would rebuild the whole report.
+    const arrived = new Map()
+    let flushTimer = null
+    const flush = () => {
+      flushTimer = null
+      if (!arrived.size) return
+      const batch = new Map(arrived)
+      arrived.clear()
+      setMeasured(current => {
+        const map = new Map(current.id === coverageId ? current.byZ : [])
+        batch.forEach((result, z) => map.set(z, result))
+        return { id: coverageId, byZ: map }
+      })
+    }
     const items = finishedSignature.split(',').map(item => {
       const [z, runId] = item.split(':')
       return { key: z, runId, calibration, ...(filter ? { filter } : {}) }
@@ -133,21 +148,25 @@ export default function useImageThicknessAnalysis({
         await fetchDistributions(needed, {
           signal,
           ...(tokens ? { tokens } : {}),
-          onResult: (z, result) => setMeasured(current => {
-            const map = new Map(current.id === coverageId ? current.byZ : [])
-            map.set(z, result)
-            return { id: coverageId, byZ: map }
-          }),
+          onResult: (z, result) => {
+            arrived.set(z, result)
+            if (flushTimer === null) flushTimer = setTimeout(flush, 120)
+          },
         })
       }
+      if (flushTimer !== null) clearTimeout(flushTimer)
+      flush()
       if (!signal.aborted) setMeasuredFor(measureKey)
     })().catch(err => {
       if (err.name === 'AbortError') return
       setError(err.message)
       setMeasuredFor(measureKey)
     })
-    return () => controller.abort()
-  }, [finishedSignature, calibrationKey, coverageId, filterIdentity, editsVersion, filterPoll])
+    return () => {
+      controller.abort()
+      if (flushTimer !== null) clearTimeout(flushTimer)
+    }
+  }, [finishedSignature, calibrationKey, coverageId, filterIdentity, editsVersion, filterPoll, active])
 
   // Slices measured while the Z analysis was unfinished are measured again once it is.
   const filterWaiting = [...byZ.values()].some(result => result.waiting)
@@ -171,10 +190,10 @@ export default function useImageThicknessAnalysis({
   }, [scope, key, caseId, filename, zCount, channelIndex, calibrationKey, slices, runs, byZ, coverageId, gap])
 
   const progress = batchProgress(batch?.jobs)
-  const report = useMemo(() => imageThicknessReport(batch, {
+  const report = useMemo(() => (active ? imageThicknessReport(batch, {
     ...options,
     filterLine: filterSettings ? reportFilterLine(filterSettings, (batch?.jobs || []).map(job => job.distribution).filter(Boolean)) : '',
-  }), [batch, options, filterSettings])
+  }) : null), [active, batch, options, filterSettings])
   const gapOptions = useMemo(() => viewerGapOptions(zCount).map(option => ({ ...option, ...gapRunCounts(option.slices, runs) })), [zCount, runs])
   const monitoring = activeRunIds.length > 0
 
@@ -250,7 +269,7 @@ export default function useImageThicknessAnalysis({
     batch, gap, setGap, gapOptions, slices, monitoring, busy, error, options,
     setOption: (name, value) => setOptions(current => ({ ...current, [name]: value })),
     progress, report, start, interrupt, runNearby, filterWaiting, activeCount: allActiveRunIds.length,
-    remeasuring: Boolean(finishedSignature) && measuredFor !== measureKey,
+    remeasuring: active && Boolean(finishedSignature) && measuredFor !== measureKey,
     coverageLoading: coverage.loading && coverage.id === coverageId,
     coverageError: coverage.id === coverageId ? coverage.error : '',
     refresh: () => setRefreshToken(value => value + 1),

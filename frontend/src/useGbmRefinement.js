@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  analysisIsActive, createPredictionEdit, excludedColorTable, fetchLabel, fetchRefinement, filterKey, isTemporaryFailure,
-  keptPieceTable, pieceInfoAt, refinedLayers, removePredictionEdits, retryStackAnalysis,
+  analysisIsActive, createPredictionEdit, fetchRefinement, filterKey, isTemporaryFailure, pieceInfoFor,
+  removePredictionEdits, retryStackAnalysis,
 } from './gbmRefinement.js'
 
 const POLL_MS = 2500
@@ -12,10 +12,9 @@ const SCRUB_DELAY_MS = 120
 // What the viewer draws and offers for the displayed Z slice. The response for
 // another slice or filter is ignored, so overlays never show the wrong plane.
 export default function useGbmRefinement({
-  caseId, filename, channelIndex, runId, enabled, calibration, filter, filterActive, onEdited, refreshKey = '',
+  caseId, filename, channelIndex, runId, enabled, calibration, filter, onEdited, refreshKey = '',
 }) {
   const [view, setView] = useState(null)
-  const [label, setLabel] = useState(null)
   const [error, setError] = useState('')
   const [clickState, setClickState] = useState({ busy: false, message: '', error: '' })
   const [version, setVersion] = useState(0)
@@ -64,26 +63,8 @@ export default function useGbmRefinement({
     return () => clearTimeout(timer)
   }, [enabled, runId, updating, settled])
 
-  const labelToken = current?.pieces ? current.labelToken : null
   const window = filter?.window
-  useEffect(() => {
-    if (!labelToken || !runId) return undefined
-    const controller = new AbortController()
-    fetchLabel(runId, labelToken, window, { signal: controller.signal })
-      .then(decoded => { if (!controller.signal.aborted) setLabel({ runId, token: labelToken, data: decoded }) })
-      .catch(err => { if (err.name !== 'AbortError') setError(err.message || 'Unable to load the prediction pieces') })
-    return () => controller.abort()
-  }, [labelToken, runId, window])
-
-  const activeLabel = label?.runId === runId && label?.token === labelToken ? label.data : null
-  const hasCorrections = (current?.edits?.length || 0) > 0 || (current?.editCount || 0) > 0
-  const refined = useMemo(() => {
-    if (!activeLabel || !current?.pieces || !(filterActive || hasCorrections)) return null
-    const { reason, reasonNames } = current.pieces
-    return refinedLayers(activeLabel, keptPieceTable(reason, reasonNames), excludedColorTable(reason, reasonNames))
-  }, [activeLabel, current, filterActive, hasCorrections])
-
-  const pieceAt = useCallback((x, y) => pieceInfoAt(activeLabel, current, x, y), [activeLabel, current])
+  const pieceFor = useCallback(identity => pieceInfoFor(identity, current), [current])
 
   const applyEdit = useCallback(async (target, message) => {
     if (!runId) return
@@ -141,7 +122,7 @@ export default function useGbmRefinement({
   }, [caseId, filename, channelIndex, window])
 
   return {
-    view: known, current, stack, updating, refined, error, clickState, pieceAt, click, paint, undo, restore, retry,
+    view: known, current, stack, updating, error, clickState, pieceFor, click, paint, undo, restore, retry,
     fetching: Boolean(enabled && runId && known && known.filterKey !== key),
     canUndo: Boolean(lastEdit), sliceEditCount: current?.edits?.length || 0, imageEditCount: current?.editCount || 0,
   }

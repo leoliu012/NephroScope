@@ -264,6 +264,32 @@ these, so the defaults should be checked against expert review before results ar
 relied on. To do that, compare a few images with the filter on and off, looking at
 what the coloured overlays exclude.
 
+### Drawing predictions
+
+Moving through Z has to stay smooth with predictions showing, so nothing about a slice is
+computed per pixel on the main thread:
+
+- The slider draws directly, without a React update, and every slice passed is shown:
+  anything loaded on the way to where the slider is now gets drawn, and at most two slices
+  are requested at once, so the newest never waits behind old requests. The rest of the
+  viewer updates when the slider settles.
+- A worker turns each prediction image into lists of runs and centerline points. GBM covers
+  a few percent of an image, so these are about thirty times smaller than a decoded image,
+  a whole stack fits on the GPU, and showing a slice is one draw call.
+- `/analysis-runs/refinement-frames` returns the decisions for every slice in one request.
+  A small table maps each piece to how it is shown, so changing decisions or colours needs
+  no new data.
+- The brush moves a small element by transform and grows its stroke on a small canvas, so a
+  move costs the same however long the stroke is. Panning and zooming write the transform
+  directly, and React state catches up when the gesture ends.
+- Measuring every slice for the Thickness tab only happens while the tab or the export panel
+  is open.
+
+On a 2048 × 2048, 44-slice, 2-channel stack with the CPU slowed 6 times, a 2-second drag went
+from 4–11 images and no predictions shown, at 18–48 frames per second with stalls of about
+100 ms, to all 44 of each at 58–60 frames per second with no stalls, once the slices are loaded.
+The first pass over slices not yet loaded shows about 30 of the 44.
+
 ## Persistence and Z status
 
 Queued, running, failed, and successful runs are stored in the analysis SQLite

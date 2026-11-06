@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react'
 import { v4 as uuidv4 } from 'uuid'
 import {
   X,
@@ -42,15 +42,14 @@ import { jsPDF } from 'jspdf'
 import { annotationListPages, canvasBlob, downloadBlob } from '../exportPages.js'
 import AnnotationLayer from './AnnotationLayer.jsx'
 import ChannelControls from './ChannelControls.jsx'
-import ModelMaskOverlay from './ModelMaskOverlay.jsx'
 import ModelRoiLayer from './ModelRoiLayer.jsx'
-import ModelSkeletonOverlay from './ModelSkeletonOverlay.jsx'
-import ModelClassOverlay from './ModelClassOverlay.jsx'
+import PredictionOverlay from './PredictionOverlay.jsx'
 import ModelEditLayer from './ModelEditLayer.jsx'
 import ImageThicknessPanel from './ImageThicknessPanel.jsx'
 import GbmFilterControls, { GbmCorrectionControls, GbmRecalculatingPopup } from './GbmFilterControls.jsx'
 import useImageThicknessAnalysis from '../useImageThicknessAnalysis.js'
 import useGbmRefinement from '../useGbmRefinement.js'
+import useGbmFrames from '../useGbmFrames.js'
 import {
   REASON_INFO, filterIsActive, filterKey, filterPayload, loadFilterSettings, loadZStepOverride, normalizeFilterSettings,
   recalculationMessage, saveFilterSettings, saveZStepOverride,
@@ -94,8 +93,6 @@ import {
   loadModelOverlaySettings,
   loadModelSkeletonSettings,
   measureGbmThickness,
-  modelMaskUrl,
-  modelSkeletonUrl,
   normalizeModelOverlaySettings,
   normalizeModelSkeletonSettings,
   normalizeRunStatus,
@@ -287,19 +284,6 @@ async function exportCanvasFromViewer(sourceCanvas, svg, {
   return output
 }
 
-async function waitForRenderedPredictionCanvas(container, selector, sourceCanvas) {
-  for (let frame = 0; frame < 10; frame += 1) {
-    const canvas = container?.querySelector(selector)
-    if (
-      canvas?.dataset.predictionReady === 'true'
-      && Number(canvas.width) === Number(sourceCanvas?.width)
-      && Number(canvas.height) === Number(sourceCanvas?.height)
-    ) return canvas
-    await nextFrame()
-  }
-  return null
-}
-
 function modelErrorText(value, fallback = 'Model run failed') {
   if (typeof value === 'string' && value.trim()) return value
   if (typeof value?.message === 'string' && value.message.trim()) return value.message
@@ -454,9 +438,11 @@ export default function ImageViewer({
   const [bottomBarsHeight, setBottomBarsHeight] = useState(0)
   const viewportRef = useRef(null)
   const dragRef = useRef(null)
-  const panRafRef = useRef(null)
-  const zScrubTimerRef = useRef(null)
   const zScrubTargetRef = useRef(0)
+  const canvasContainerRef = useRef(null)
+  const canvasScrubRef = useRef(null)
+  const predictionOverlayRef = useRef(null)
+  const innerContentRef = useRef(null)
   const modelRequestEpochRef = useRef(0)
   const modelStartAbortRef = useRef(null)
   const modelMeasurementAbortRef = useRef(null)
@@ -677,33 +663,21 @@ export default function ImageViewer({
     return () => window.clearInterval(id)
   }, [caseId, filename, imageKey, loadedImageKey, imgMeta, viewStateRevision])
 
-  useEffect(() => {
-    setChannelStats(null)
-  }, [zIndex])
-
   const commitZSlice = useCallback((value) => {
     const nextZIndex = clampZIndex(value, imgMeta)
-    if (zScrubTimerRef.current) {
-      window.clearTimeout(zScrubTimerRef.current)
-      zScrubTimerRef.current = null
-    }
     zScrubTargetRef.current = nextZIndex
+    canvasContainerRef.current?.classList.remove('is-scrubbing')
     setZDraftIndex(nextZIndex)
     setZIndex(nextZIndex)
   }, [imgMeta])
 
-  // Keep the thumb responsive, but do not turn one quick drag into dozens of
-  // expensive TIFF/ND2 reads. Releasing the control always commits its final
-  // slice immediately.
+  // Each slice passed during a drag goes straight to the canvas, without a React update.
+  // Annotations belong to the settled slice, so they step aside until it settles.
   const scrubZSlice = useCallback((value) => {
     const nextZIndex = clampZIndex(value, imgMeta)
     zScrubTargetRef.current = nextZIndex
-    setZDraftIndex(nextZIndex)
-    if (zScrubTimerRef.current) return
-    zScrubTimerRef.current = window.setTimeout(() => {
-      zScrubTimerRef.current = null
-      setZIndex(zScrubTargetRef.current)
-    }, 90)
+    canvasContainerRef.current?.classList.add('is-scrubbing')
+    canvasScrubRef.current?.scrubTo(nextZIndex)
   }, [imgMeta])
 
   const nudgeZSlice = useCallback((direction) => {
@@ -716,10 +690,6 @@ export default function ImageViewer({
     const committedZIndex = clampZIndex(zIndex, imgMeta)
     if (committedZIndex !== zIndex) setZIndex(committedZIndex)
   }, [imgMeta, zDraftIndex, zIndex])
-
-  useEffect(() => () => {
-    if (zScrubTimerRef.current) window.clearTimeout(zScrubTimerRef.current)
-  }, [])
 
   useEffect(() => {
     if (!imgMeta || !channelSettings || !channelStats || autoWindowAppliedRef.current) return
@@ -1097,47 +1067,66 @@ export default function ImageViewer({
     return () => window.clearTimeout(id)
   }, [sidebarCollapsed, imgMeta, fitToViewport])
 
+  // Panning and zooming move the image directly. React state catches up when the gesture
+  // ends, so a gesture does not re-render the whole viewer for every event.
+  const viewRef = useRef({ tx: 0, ty: 0, scale: 1 })
+  const viewCommitTimerRef = useRef(null)
+  useLayoutEffect(() => { viewRef.current = { tx, ty, scale } }, [tx, ty, scale])
+  const applyView = useCallback(() => {
+    const { tx: x, ty: y, scale: s } = viewRef.current
+    if (innerContentRef.current) innerContentRef.current.style.transform = `translate(${x}px, ${y}px) scale(${s})`
+  }, [])
+  const commitView = useCallback(() => {
+    if (viewCommitTimerRef.current) window.clearTimeout(viewCommitTimerRef.current)
+    viewCommitTimerRef.current = null
+    const { tx: x, ty: y, scale: s } = viewRef.current
+    setTx(x)
+    setTy(y)
+    setScale(s)
+  }, [])
+  useEffect(() => () => {
+    if (viewCommitTimerRef.current) window.clearTimeout(viewCommitTimerRef.current)
+  }, [])
+
   const handleWheel = useCallback(e => {
     e.preventDefault()
+    const view = viewRef.current
     if (e.shiftKey) {
-      setTx(x => x - e.deltaY)
-      return
+      view.tx -= e.deltaY
+    } else {
+      const next = Math.max(0.05, Math.min(40, view.scale * (e.deltaY < 0 ? 1.12 : 1 / 1.12)))
+      const factor = next / view.scale
+      const rect = viewportRef.current.getBoundingClientRect()
+      const mx = e.clientX - rect.left
+      const my = e.clientY - rect.top
+      view.scale = next
+      view.tx = mx - (mx - view.tx) * factor
+      view.ty = my - (my - view.ty) * factor
     }
-    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12
-    const rect = viewportRef.current.getBoundingClientRect()
-    const mx = e.clientX - rect.left
-    const my = e.clientY - rect.top
-    setScale(s => Math.max(0.05, Math.min(40, s * factor)))
-    setTx(x => mx - (mx - x) * factor)
-    setTy(y => my - (my - y) * factor)
-  }, [])
+    applyView()
+    if (viewCommitTimerRef.current) window.clearTimeout(viewCommitTimerRef.current)
+    viewCommitTimerRef.current = window.setTimeout(commitView, 140)
+  }, [applyView, commitView])
 
   const handleMouseDown = useCallback(e => {
     if (e.target?.closest?.('.annotation-floating-toolbar')) return
     if (activeTool !== 'select' && activeTool !== 'pan' && !spacePan) return
     if (e.button !== 0) return
-    dragRef.current = { startX: e.clientX - tx, startY: e.clientY - ty }
-  }, [activeTool, spacePan, tx, ty])
+    dragRef.current = { startX: e.clientX - viewRef.current.tx, startY: e.clientY - viewRef.current.ty }
+  }, [activeTool, spacePan])
 
   const handleMouseMove = useCallback(e => {
     if (!dragRef.current) return
-    const nextTx = e.clientX - dragRef.current.startX
-    const nextTy = e.clientY - dragRef.current.startY
-    if (panRafRef.current) window.cancelAnimationFrame(panRafRef.current)
-    panRafRef.current = window.requestAnimationFrame(() => {
-      setTx(nextTx)
-      setTy(nextTy)
-      panRafRef.current = null
-    })
-  }, [])
+    viewRef.current.tx = e.clientX - dragRef.current.startX
+    viewRef.current.ty = e.clientY - dragRef.current.startY
+    applyView()
+  }, [applyView])
 
   const handleMouseUp = useCallback(() => {
+    if (!dragRef.current) return
     dragRef.current = null
-    if (panRafRef.current) {
-      window.cancelAnimationFrame(panRafRef.current)
-      panRafRef.current = null
-    }
-  }, [])
+    commitView()
+  }, [commitView])
 
   const updateSelectedAnnotation = useCallback((patch) => {
     if (!canAnnotate) return
@@ -1251,6 +1240,8 @@ export default function ImageViewer({
     caseId, filename, meta: imgMeta, ready: Boolean(imageReady),
     channelIndex: modelInputChannel, calibration: currentCalibration, initialGap,
     filter: gbmFilterPayload, filterSettings: gbmFilter, editsVersion: gbmEditsVersion,
+    // Measuring every slice is for whoever is looking at the results.
+    active: sidebarTab === 'thickness' || exportPanelOpen,
   })
   const gbmRefinement = useGbmRefinement({
     caseId, filename,
@@ -1259,7 +1250,6 @@ export default function ImageViewer({
     enabled: Boolean(imageReady),
     calibration: currentCalibration,
     filter: gbmFilterPayload,
-    filterActive: filterIsActive(gbmFilter),
     onEdited: () => { setGbmEditsVersion(value => value + 1); setGbmRecalculating(true) },
     // More segmented Z means a new Z analysis, which this slice should pick up.
     refreshKey: `${thicknessAnalysis.activeCount}|${Object.values(modelRunsByZ).filter(run => run?.status === 'SUCCEEDED').length}`,
@@ -1273,7 +1263,48 @@ export default function ImageViewer({
     if (gbmRecalculating && !gbmRecalculationMessage) setGbmRecalculating(false)
   }, [gbmRecalculating, gbmRecalculationMessage])
   const gbmTool = activeTool === 'gbm-add' || activeTool === 'gbm-remove'
-  const gbmRefinedOverlay = modelOverlayAligned ? gbmRefinement.refined : null
+  const segmentedRunIds = useMemo(() => Object.values(modelRunsByZ)
+    .filter(run => run?.runId && run.status === 'SUCCEEDED' && run.imageKey === imageKey)
+    .map(run => run.runId)
+    .sort(), [imageKey, modelRunsByZ])
+  // The analysis's state is only known for a settled slice, and is unknown between them.
+  const stackStateRef = useRef('')
+  if (gbmRefinement.stack) stackStateRef.current = `${gbmRefinement.stack.state}|${gbmRefinement.stack.job?.runId || ''}`
+  const gbmFrames = useGbmFrames({
+    enabled: Boolean(imageReady),
+    runIds: segmentedRunIds,
+    calibration: currentCalibration,
+    filter: gbmFilterPayload,
+    refreshKey: `${gbmEditsVersion}|${stackStateRef.current}`,
+  })
+  const predictionAppearance = useMemo(() => ({
+    visible: modelOverlaySettings.visible || modelSkeletonSettings.visible,
+    showMask: modelOverlaySettings.visible,
+    showSkeleton: modelSkeletonSettings.visible,
+    showExcluded: gbmFilter.showExcluded && modelOverlaySettings.visible,
+    contour: modelOverlaySettings.displayMode === 'contour',
+    opacity: modelOverlaySettings.opacity,
+    maskColor: modelOverlaySettings.color,
+    skeletonColor: modelSkeletonSettings.color,
+    thickness: modelSkeletonSettings.thickness,
+  }), [gbmFilter.showExcluded, modelOverlaySettings, modelSkeletonSettings])
+  const usePredictionLabels = filterIsActive(gbmFilter) || gbmRefinement.imageEditCount > 0
+  const handleCanvasDisplayedZ = useCallback(z => { predictionOverlayRef.current?.show(z) }, [])
+  const handlePredictionReady = useCallback((runId, z) => {
+    setModelRunsByZ(current => {
+      const entry = current[String(z)]
+      if (!entry || entry.runId !== runId || (entry.maskStatus === 'ready' && entry.skeletonStatus === 'ready')) return current
+      return { ...current, [String(z)]: { ...entry, maskStatus: 'ready', maskError: '', skeletonStatus: 'ready', skeletonError: '' } }
+    })
+  }, [])
+  const handlePredictionError = useCallback((message, runId, z) => {
+    setActiveTool(current => current === 'model-roi' ? 'select' : current)
+    setModelRunsByZ(current => {
+      const entry = current[String(z)]
+      if (!entry || entry.runId !== runId) return current
+      return { ...current, [String(z)]: { ...entry, maskStatus: 'error', maskError: modelErrorText(message, 'Unable to load the model mask') } }
+    })
+  }, [])
   const gbmToolsAvailable = Boolean(currentMaskReady && currentSkeletonAvailable && canAnnotate)
   // Leaving this prediction ends a correction tool, so a click never lands elsewhere.
   useEffect(() => {
@@ -1286,7 +1317,7 @@ export default function ImageViewer({
     gbmHoverPointRef.current = x === null ? null : [x, y]
     if (x === null) { element.style.display = 'none'; return }
     const adding = activeTool === 'gbm-add'
-    const piece = gbmRefinement.pieceAt(x, y)
+    const piece = gbmRefinement.pieceFor(predictionOverlayRef.current?.pieceIdAt(x, y))
     let text
     if (piece) {
       const kept = piece.reason === 'kept'
@@ -1302,7 +1333,7 @@ export default function ImageViewer({
     }
     element.textContent = text
     element.style.display = 'block'
-  }, [activeTool, gbmRefinement.pieceAt])
+  }, [activeTool, gbmRefinement.pieceFor])
   useEffect(() => { if (!gbmTool && gbmHoverRef.current) gbmHoverRef.current.style.display = 'none' }, [gbmTool])
   // What the pointer rests on changes with each correction, without the pointer moving.
   useEffect(() => {
@@ -1437,16 +1468,11 @@ export default function ImageViewer({
       const canvasContainer = sourceCanvas?.closest('.viewer-canvas-container')
 
       if (includeSegmentationPredictions && modelOverlayAligned) {
-        if (modelOverlaySettings.visible && modelOverlaySettings.opacity > 0) {
-          const maskCanvas = await waitForRenderedPredictionCanvas(canvasContainer, '.model-mask-overlay', sourceCanvas)
-          if (!maskCanvas) throw new Error('The GBM overlay is not ready yet')
-          predictionLayers.push({ canvas: maskCanvas, opacity: modelOverlaySettings.opacity })
-        }
-
-        if (modelSkeletonSettings.visible && currentSkeletonAvailable) {
-          const skeletonCanvas = await waitForRenderedPredictionCanvas(canvasContainer, '.model-skeleton-overlay', sourceCanvas)
-          if (!skeletonCanvas) throw new Error('The GBM skeleton is not ready yet')
-          predictionLayers.push({ canvas: skeletonCanvas, opacity: 1 })
+        if (modelOverlaySettings.visible || modelSkeletonSettings.visible) {
+          // Only what is measured, so the export matches the numbers beside it.
+          const predictionCanvas = await predictionOverlayRef.current?.prepareExport()
+          if (!predictionCanvas) throw new Error('The GBM overlay is not ready yet')
+          predictionLayers.push({ canvas: predictionCanvas, opacity: 1 })
         }
       }
 
@@ -1531,6 +1557,7 @@ export default function ImageViewer({
     } catch (error) {
       setExportError(error.message || 'Unable to export image')
     } finally {
+      predictionOverlayRef.current?.finishExport()
       setExporting(false)
     }
   }, [
@@ -1708,61 +1735,6 @@ export default function ImageViewer({
       })
     }
   }, [currentModelRun, currentModelRunBusy, imageApiBase, zIndex])
-
-  const handleModelMaskReady = useCallback(() => {
-    const zKey = String(zIndex)
-    const runId = currentModelRun?.runId
-    setModelRunsByZ(current => {
-      const entry = current[zKey]
-      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
-      return { ...current, [zKey]: { ...entry, maskStatus: 'ready', maskError: '' } }
-    })
-  }, [currentModelRun?.runId, imageKey, zIndex])
-
-  const handleModelMaskError = useCallback((message) => {
-    const zKey = String(zIndex)
-    const runId = currentModelRun?.runId
-    setActiveTool(current => current === 'model-roi' ? 'select' : current)
-    setModelRunsByZ(current => {
-      const entry = current[zKey]
-      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
-      return {
-        ...current,
-        [zKey]: {
-          ...entry,
-          maskStatus: 'error',
-          maskError: modelErrorText(message, 'Unable to load the model mask'),
-        },
-      }
-    })
-  }, [currentModelRun?.runId, imageKey, zIndex])
-
-  const handleModelSkeletonReady = useCallback(() => {
-    const zKey = String(zIndex)
-    const runId = currentModelRun?.runId
-    setModelRunsByZ(current => {
-      const entry = current[zKey]
-      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
-      return { ...current, [zKey]: { ...entry, skeletonStatus: 'ready', skeletonError: '' } }
-    })
-  }, [currentModelRun?.runId, imageKey, zIndex])
-
-  const handleModelSkeletonError = useCallback((message) => {
-    const zKey = String(zIndex)
-    const runId = currentModelRun?.runId
-    setModelRunsByZ(current => {
-      const entry = current[zKey]
-      if (!runId || entry?.runId !== runId || entry.imageKey !== imageKey) return current
-      return {
-        ...current,
-        [zKey]: {
-          ...entry,
-          skeletonStatus: 'error',
-          skeletonError: modelErrorText(message, 'Unable to load the GBM skeleton'),
-        },
-      }
-    })
-  }, [currentModelRun?.runId, imageKey, zIndex])
 
   const activateModelRoi = useCallback(() => {
     if (!currentMaskReady) return
@@ -2312,9 +2284,10 @@ export default function ImageViewer({
               )}
             </div>
           )}
-          <div className="inner-content" style={{ position: 'absolute', transform, transformOrigin: '0 0' }}>
+          <div ref={innerContentRef} className="inner-content" style={{ position: 'absolute', transform, transformOrigin: '0 0' }}>
             <div
               style={{ position: 'relative', width: imgMeta?.width || 0, height: imgMeta?.height || 0 }}
+              ref={canvasContainerRef}
               className="viewer-canvas-container"
             >
               {loadError && (
@@ -2335,45 +2308,24 @@ export default function ImageViewer({
                   onChannelStats={setChannelStats}
                   cacheAllRequest={fullImageCacheRequest}
                   onCacheProgress={handleFullImageCacheProgress}
+                  onDisplayedZ={handleCanvasDisplayedZ}
+                  scrubRef={canvasScrubRef}
                 />
               )}
-              {modelOverlayAligned && currentModelRun?.runId && (
-                <ModelMaskOverlay
-                  key={`${imageKey}:${currentModelRun.runId}`}
-                  maskUrl={modelMaskUrl(currentModelRun.runId)}
-                  alphaData={gbmRefinedOverlay?.kept || null}
-                  width={imgMeta?.width}
-                  height={imgMeta?.height}
-                  color={modelOverlaySettings.color}
-                  opacity={modelOverlaySettings.opacity}
-                  visible={modelOverlaySettings.visible}
-                  displayMode={modelOverlaySettings.displayMode}
-                  onReady={handleModelMaskReady}
-                  onError={handleModelMaskError}
-                />
-              )}
-              {modelOverlayAligned
-                && currentModelRun?.runId
-                && currentModelRun?.result?.thicknessGeometryAvailable !== false && (
-                <ModelSkeletonOverlay
-                  key={`${imageKey}:${currentModelRun.runId}:skeleton`}
-                  skeletonUrl={modelSkeletonUrl(currentModelRun.runId)}
-                  alphaData={(gbmFilter.showExcluded ? gbmRefinedOverlay?.skeleton : gbmRefinedOverlay?.wholeSkeleton) || null}
-                  width={imgMeta?.width}
-                  height={imgMeta?.height}
-                  color={modelSkeletonSettings.color}
-                  thickness={modelSkeletonSettings.thickness}
-                  visible={modelSkeletonSettings.visible}
-                  onReady={handleModelSkeletonReady}
-                  onError={handleModelSkeletonError}
-                />
-              )}
-              {modelOverlayAligned && gbmRefinedOverlay && gbmFilter.showExcluded && (
-                <ModelClassOverlay
-                  layer={gbmRefinedOverlay.excluded}
-                  opacity={modelOverlaySettings.opacity}
-                  visible={modelOverlaySettings.visible}
-                  lineThickness={modelSkeletonSettings.thickness}
+              {imageReady && imgMeta && (
+                <PredictionOverlay
+                  ref={predictionOverlayRef}
+                  width={imgMeta.width}
+                  height={imgMeta.height}
+                  runsByZ={modelRunsByZ}
+                  frames={gbmFrames.frames}
+                  reasonNames={gbmFrames.reasonNames}
+                  useLabels={usePredictionLabels}
+                  window={gbmFilterPayload.window}
+                  zIndex={zIndex}
+                  appearance={predictionAppearance}
+                  onReady={handlePredictionReady}
+                  onError={handlePredictionError}
                 />
               )}
               {imgMeta && (
@@ -2418,6 +2370,7 @@ export default function ImageViewer({
                   edits={gbmRefinement.current?.edits}
                   busy={gbmRefinement.clickState.busy}
                   brushRadius={gbmFilter.brushRadius}
+                  zoom={scale}
                   onClick={handleGbmClick}
                   onStroke={handleGbmStroke}
                   onHover={updateGbmHover}
@@ -2438,13 +2391,12 @@ export default function ImageViewer({
               <ChevronLeft size={16} />
             </button>
             <div className="viewer-z-slider" title="Z slice">
-              <span>Z {zDraftIndex + 1}/{zCount}</span>
               <ZSliceSlider
                 zCount={zCount}
                 value={zDraftIndex}
                 annotations={annotations}
                 modelRuns={modelRunsByZ}
-                onInput={scrubZSlice}
+                onScrub={scrubZSlice}
                 onCommit={commitZSlice}
                 onJumpToSlice={commitZSlice}
               />

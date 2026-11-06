@@ -18,6 +18,7 @@ from .gbm_refinement import (
     filter_tokens,
     label_file,
     parse_filter,
+    refinement_frames,
     refinement_view,
     remove_edits,
     stack_state,
@@ -102,6 +103,26 @@ def register_gbm_refinement_routes(app, config, store):
         settings, options = parse_filter(body.get("filter") if body.get("filter") is not None else {})
         runs = store.get_runs(ensure_run_id(run_id) for run_id in run_ids)
         return jsonify(filter_tokens(config, store, runs, settings, options))
+
+    @app.route("/agh/api/analysis-runs/refinement-frames", methods=["POST"])
+    def gbm_refinement_frames():
+        """What to draw for every slice of a stack, for smooth scrubbing."""
+        denied = require("view")
+        if denied:
+            return denied
+        body = _json_body()
+        run_ids = body.get("runIds")
+        if not isinstance(run_ids, list) or not run_ids or len(run_ids) > MAX_TOKEN_RUNS:
+            raise BadRequest(f"runIds must list 1 to {MAX_TOKEN_RUNS} runs")
+        runs = store.get_runs(ensure_run_id(run_id) for run_id in run_ids)
+        if not runs:
+            return jsonify({"frames": {}, "reasonNames": {}})
+        settings, options = parse_filter(body.get("filter") if body.get("filter") is not None else {})
+        _, calibration = validate_thickness_request({
+            "calibration": body.get("calibration"),
+            "roi": {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]]},
+        }, next(iter(runs.values())))
+        return jsonify(refinement_frames(config, store, runs, settings, options, calibration))
 
     @app.route("/agh/api/analysis-runs/<run_id>/edits", methods=["POST"])
     def gbm_create_edit(run_id):

@@ -604,6 +604,35 @@ class RefinementApiTests(unittest.TestCase):
             self.assertTrue(_encode_label(plane.geometry, plane.mask, analysis.sample_piece, analysis.sample_artifact))
             _save_plane(Path(self.tmp.name) / f"plane_{plane.z_index}.npz", analysis)
 
+    def test_frames_give_the_same_decisions_as_each_slice_on_its_own(self):
+        self.distribution()
+        self.run_stack_job()
+        self.click("negative", RING[1] + RING[2], RING[0])
+        self.paint("negative", [[RING[1] - RING[2] - 15, RING[0]], [RING[1] - RING[2] + 15, RING[0]]])
+        response = self.client.post("/agh/api/analysis-runs/refinement-frames", json={
+            "runIds": list(self.runs.values()), "calibration": self.calibration, "filter": self.filter,
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["reasonNames"]["0"], "kept")
+        self.assertEqual(set(payload["frames"]), set(self.runs.values()))
+        for z, run_id in self.runs.items():
+            view = self.refinement(run_id)
+            frame = payload["frames"][run_id]
+            self.assertEqual(frame["reason"], view["pieces"]["reason"], f"Z{z}")
+            self.assertEqual(frame["labelToken"], view["labelToken"], f"Z{z}")
+            self.assertEqual(frame["zIndex"], z)
+
+    def test_frames_before_the_analysis_is_ready_start_it(self):
+        response = self.client.post("/agh/api/analysis-runs/refinement-frames", json={
+            "runIds": [self.middle], "calibration": self.calibration, "filter": self.filter,
+        }).get_json()
+        self.assertIsNone(response["frames"][self.middle])
+        self.assertTrue(self.run_stack_job()["planes"])
+        for bad in ({"runIds": [], "calibration": self.calibration}, {"runIds": [self.middle], "calibration": None}):
+            with self.subTest(body=bad):
+                self.assertEqual(self.client.post("/agh/api/analysis-runs/refinement-frames", json=bad).status_code, 400)
+
     def test_deleting_a_prediction_removes_its_corrections(self):
         self.distribution()
         self.run_stack_job()

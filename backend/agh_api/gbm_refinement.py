@@ -893,11 +893,60 @@ def refinement_view(config, store, run: dict, settings: FilterSettings, options:
     response["limitDeg"] = decided["limit_deg"]
     response["zStep"] = outcome["zStep"]
     response["medianReachPlanes"] = ((view.stack_run or {}).get("result") or {}).get("medianReachPlanes")
-    response["labelToken"] = _digest({
+    response["labelToken"] = _label_token(view)
+    return response
+
+
+def _label_token(view: PlaneView) -> str:
+    return _digest({
         "stack": (view.stack_run or {}).get("runId"),
         "structural": [edit["id"] for edit in view.edits if edit["kind"] in STRUCTURAL_KINDS],
     })[:20]
-    return response
+
+
+def refinement_frames(config, store, runs: dict[str, dict], settings: FilterSettings, options: dict, calibration: dict) -> dict:
+    """What to draw for every slice of a stack, so scrubbing needs no request per slice.
+
+    Decisions come from the saved analysis alone, without reading any plane's geometry,
+    unless a slice has corrections of its own.
+    """
+    memo: dict = {}
+    options = {**options, "memo": memo}
+    window = int(options.get("window") or DEFAULT_MAX_WINDOW)
+    edits_by_image: dict = {}
+    frames: dict[str, dict | None] = {}
+    for run_id, run in runs.items():
+        if run.get("status") != "SUCCEEDED" or run.get("operation") != SEGMENTATION_OPERATION:
+            frames[run_id] = None
+            continue
+        case, filename = run["case"], run["filename"]
+        channel, z_index = int(run["channelIndex"]), int(run["zIndex"])
+        image = (case, filename, channel)
+        if image not in edits_by_image:
+            path = image_path(config.active_data_root, case, filename)
+            edits_by_image[image] = store.list_prediction_edits(case, filename, channel, _source_key(path))
+        all_edits = edits_by_image[image]
+        edits = [edit for edit in all_edits if edit["zIndex"] == z_index]
+        state = stack_state(config, store, case, filename, channel, window=window, ensure=True, memo=memo)
+        stack_run = state.get("usable")
+        if edits:
+            view = plane_view(config, store, run, options)
+        else:
+            analysis = load_plane(config, stack_run, z_index) if stack_run else None
+            view = PlaneView(None, analysis, stack_run, state, [], all_edits, None, None, None, edits_revision(all_edits))
+        if view.analysis is None:
+            frames[run_id] = None
+            continue
+        members = ((stack_run or {}).get("request") or {}).get("members") or []
+        mip_planes = len((run.get("request") or {}).get("zWindow") or [MIP_PLANES])
+        z_step = resolve_z_step(config, run, options.get("zStepUm"))
+        decided = decide(view, settings, calibration, z_step, z_index, mip_planes, _plane_step(members))
+        frames[run_id] = {
+            "zIndex": z_index,
+            "reason": decided["reasons"].astype(int).tolist(),
+            "labelToken": _label_token(view),
+        }
+    return {"frames": frames, "reasonNames": {str(code): name for code, name in REASON_NAMES.items()}}
 
 
 def _public_state(state: dict) -> dict:
@@ -1165,6 +1214,7 @@ __all__ = [
     "find_region_at_click",
     "label_file",
     "parse_filter",
+    "refinement_frames",
     "refinement_view",
     "remove_edits",
     "stack_state",

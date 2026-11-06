@@ -8,9 +8,9 @@ globalThis.localStorage = {
 }
 
 const {
-  DEFAULT_FILTER_SETTINGS, REASON_INFO, decodeLabel, excludedColorTable, filterIsActive, filterIsWaiting, filterKey, filterLabel,
-  filterPayload, filterTotals, isTemporaryFailure, keptPieceTable, loadFilterSettings, loadZStepOverride, normalizeFilterSettings,
-  pieceInfoAt, recalculationMessage, refinedLayers, reportFilterLine, saveFilterSettings, saveZStepOverride, workerHasStopped,
+  DEFAULT_FILTER_SETTINGS, REASON_INFO, filterIsActive, filterIsWaiting, filterKey, filterLabel,
+  filterPayload, filterTotals, isTemporaryFailure, loadFilterSettings, loadZStepOverride, normalizeFilterSettings,
+  pieceInfoFor, recalculationMessage, reportFilterLine, saveFilterSettings, saveZStepOverride, workerHasStopped,
 } = await import('./gbmRefinement.js')
 const { distributionNeeded, fetchDistributions, monitorSavedAnalysis } = await import('./caseAnalysis.js')
 const { distributionCacheKey } = await import('./distributionCache.js')
@@ -49,45 +49,21 @@ assert.equal(filterIsActive({ ...DEFAULT_FILTER_SETTINGS, crossSection: false, t
 assert.match(filterLabel(DEFAULT_FILTER_SETTINGS), /Cross-sections only.*30–3400 nm/)
 assert.equal(filterLabel({ ...DEFAULT_FILTER_SETTINGS, crossSection: false, thicknessLimits: false }), 'All model predictions')
 
-// Label raster: 2 x 2, pieces 1 and 300, skeleton artifact stays hidden.
-const rgba = new Uint8ClampedArray([
-  1, 0, 255, 255, /* piece 1, measured centerline */
-  44, 1, 0, 255, /* piece 300 */
-  1, 0, 128, 255, /* piece 1, artifact centerline */
-  0, 0, 0, 255, /* background */
-])
-const label = decodeLabel(rgba, 2, 2)
-assert.deepEqual([...label.pieces], [1, 300, 1, 0])
-const reasons = new Array(300).fill(1)
-reasons[0] = 0
-const names = { 0: 'kept', 1: 'oblique' }
-const table = keptPieceTable(reasons, names)
-assert.equal(table[1], 1)
-assert.equal(table[300], 0)
-const colors = excludedColorTable(reasons, names)
-const alpha = refinedLayers(label, table, colors)
-assert.deepEqual([...alpha.kept.alpha], [255, 0, 255, 0])
-assert.deepEqual([...alpha.skeleton.alpha], [255, 0, 0, 0])
-assert.deepEqual([...alpha.wholeSkeleton.alpha], [255, 0, 255, 0], 'a kept centerline stays unbroken across tapers and junctions')
-// Excluded GBM is filled in the colour of its reason; kept GBM is not in that layer.
-const red = [0xef, 0x44, 0x44, 255]
-assert.deepEqual([...alpha.excluded.fill.slice(0, 4)], [0, 0, 0, 0])
-assert.deepEqual([...alpha.excluded.fill.slice(4, 8)], red)
-assert.deepEqual([...alpha.excluded.fill.slice(12, 16)], [0, 0, 0, 0])
-// A kept piece's artifact centerline is shown as such, since it is not measured.
-const gray = Number.parseInt(REASON_INFO.artifact.color.slice(1), 16)
-assert.deepEqual([...alpha.excluded.lines.slice(8, 12)], [(gray >> 16) & 255, (gray >> 8) & 255, gray & 255, 255])
-assert.deepEqual([...alpha.excluded.lines.slice(0, 4)], [0, 0, 0, 0], 'measured centerline stays in the skeleton layer')
 // Every reason has its own colour, or the legend would not identify it.
 const reasonColors = Object.values(REASON_INFO).map(info => info.color)
 assert.equal(new Set(reasonColors).size, reasonColors.length)
 
+// What is under the pointer, by piece number.
+const names = { 0: 'kept', 1: 'oblique' }
+const reasons = new Array(300).fill(1)
+reasons[0] = 0
 const view = { pieces: { reason: reasons, reasonNames: names, tiltDeg: new Array(300).fill(41), widthNm: new Array(300).fill(1500) } }
-assert.deepEqual(pieceInfoAt(label, view, 1.2, 0.5), { piece: 299, reason: 'oblique', tiltDeg: 41, widthNm: 1500 })
-assert.equal(pieceInfoAt(label, view, 1.5, 1.5), null)
-assert.equal(pieceInfoAt(label, view, -1, 0), null)
-assert.equal(pieceInfoAt(label, view, 5, 0), null)
-assert.equal(pieceInfoAt(null, view, 0, 0), null)
+assert.deepEqual(pieceInfoFor(300, view), { piece: 299, reason: 'oblique', tiltDeg: 41, widthNm: 1500 })
+assert.equal(pieceInfoFor(1, view).reason, 'kept')
+assert.equal(pieceInfoFor(0, view), null, 'background is no piece')
+assert.equal(pieceInfoFor(null, view), null)
+assert.equal(pieceInfoFor(5000, view), null)
+assert.equal(pieceInfoFor(1, null), null)
 
 // What the recalculating popup says, and that it says nothing when nothing is running.
 assert.equal(recalculationMessage({}), '')
