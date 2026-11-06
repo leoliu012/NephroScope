@@ -51,6 +51,7 @@ from .gbm_cross_section import (
     DEFAULT_MAX_WINDOW,
     DEFAULT_MIN_THICKNESS_NM,
     MIP_PLANES,
+    REASON_ARTIFACT,
     REASON_KEPT,
     REASON_MANUAL,
     REASON_NAMES,
@@ -72,6 +73,9 @@ PAINT_KINDS = ("paint-keep", "paint-remove")
 # Corrections that change the plane's mask or pieces, not only decisions about them.
 STRUCTURAL_KINDS = ("add", *PAINT_KINDS)
 MAX_STROKE_POINTS = 5000
+# Browsers keep filtered measurements under a token. Evidence from an analysis stays
+# valid when only the decision rules change, so the rules have their own version.
+DECISION_VERSION = "d2"
 SEGMENTATION_OPERATION = "gbm-segmentation"
 MAX_WINDOW_LIMIT = 200
 # A correction's influence falls off over this many typical thicknesses (Gaussian
@@ -205,7 +209,7 @@ def filter_token(state: dict, revision: str, cross_section: bool) -> str | None:
     """Identifies a filtered result while it stays valid; ``None`` means do not cache."""
     stack = state.get("usable")
     if stack is not None and not state["stale"]:
-        return f"{stack['runId']}:{revision}"
+        return f"{stack['runId']}:{revision}:{DECISION_VERSION}"
     if not cross_section and revision == "0":
         return "limits"
     return None
@@ -831,7 +835,10 @@ def filtered_samples(config, store, run: dict, settings: FilterSettings, options
     sample_reason = decided["reasons"][pieces]
     keep = (sample_reason == REASON_KEPT) & (within_limits | pinned)
     if settings.cross_section:
-        keep &= (view.analysis.sample_artifact == SAMPLE_OK) | decided["clicked"][pieces]
+        # Tapers, spurs and junctions belong to the GBM but are not measured.
+        unmeasured = (view.analysis.sample_artifact != SAMPLE_OK) & ~decided["clicked"][pieces]
+        keep &= ~unmeasured
+        sample_reason = np.where(unmeasured & (sample_reason == REASON_KEPT), REASON_ARTIFACT, sample_reason)
     unique, totals = np.unique(sample_reason, return_counts=True)
     info.update(
         applied=True,

@@ -50,9 +50,10 @@ re-measures the saved segmentations without running the model again.
 GBM thickness is only true where the sheet crosses the image plane steeply.
 **Cross-sections only** (on by default, in the viewer's Settings and Thickness
 tabs and in Case analysis) compares each slice's prediction with the other
-segmented slices of the image, measures how tilted each short length of GBM is,
-and leaves out oblique and en-face GBM, as well as predictions too short-lived or
-small through the stack to be a sheet. **Thickness limits** (default 30–3400 nm,
+segmented slices of the image, measures how tilted each short length of GBM is at
+that slice, and leaves out oblique and en-face GBM, as well as predictions too
+short-lived or small through the stack to be a sheet. Decisions run along the
+centerline, so a short noisy stretch stays with the continuous GBM around it. **Thickness limits** (default 30–3400 nm,
 after EF) work independently. Excluded GBM and its centerline are drawn in the colour
 of the reason it was excluded, matching the legend beside it, and thickness plots, ROI
 measurements and exports only use what is kept. A popup shows when a change of

@@ -131,31 +131,48 @@ The tilt is the slope of that displacement at this slice.
 - **Own Z window.** A piece is followed only until it has moved by its own thickness
   or is missing from two sampled slices in a row, up to the configured maximum
   (default ±30). The Z window setting only changes that maximum.
-- **Uncertain means kept.** The fit reports a standard error, allowing for how the Z
-  projection makes nearby slices repeat each other's noise. A piece counts as tilted
-  only when the low end of that range is over the limit, or when the measured tilt
-  is over it and the piece is also more than 20% wider than the best-oriented GBM,
-  since a tilted sheet is wider.
+- **Uncertainty is weighed.** The fit reports a standard error, allowing for how the Z
+  projection makes nearby slices repeat each other's noise. An uncertain slope counts
+  for less in the decision below.
 
 Everything is stored in pixels per plane, so a new pixel size or Z step needs no
 recomputation (`tan θ = stored × pixel / dz`).
 
 ### Deciding
 
-Decisions are made on *pieces*: lengths of centerline about two thicknesses long,
-starting at endpoints and junctions. A wall that turns oblique part-way along is
-excluded only where it does, and pieces are what a person clicks. Tilt is smoothed
-over neighbouring pieces. A piece is excluded as:
+GBM is continuous, so decisions are made along its centerline rather than piece by
+piece. Pieces are lengths of centerline about two thicknesses long, starting at
+endpoints and junctions.
+
+Each piece first gets a score, positive when the evidence says to exclude it:
+
+- **Tilt**: degrees past the limit, over 8° plus the uncertainty of its slope. Tilt is
+  first smoothed over neighbouring pieces, since orientation changes gradually along
+  a continuous sheet.
+- **Width**: more than 20% wider than the best-oriented GBM counts towards tilt, since
+  a tilted sheet is wider. Clearly uniform narrow GBM counts against it.
+- **Line-likeness**: a long connected line counts slightly against tilt, and a short
+  fragment slightly for it, since true cross-sections trace long continuous curves.
+
+Then runs of equally judged pieces along the centerline are compared. A run keeps its
+decision only if its evidence (length in thicknesses times score) outweighs the breaks
+it makes. Each break costs 1.5 for a gap in kept GBM and 1 for a kept stretch inside
+excluded GBM, weakest runs flipping first. So a short noisy stretch stays with the wall
+around it, while a long stretch that is clearly tilted is excluded as a whole, and a
+part of the prediction with no neighbours keeps what its own evidence says. Tapers,
+spurs and junctions have no opinion and take after what they join; their samples are
+not measured, but they do not break the GBM.
+
+Excluded GBM is labelled as:
 
 | Reason | Meaning |
 |---|---|
-| Oblique | Tilted beyond the limit (see above) |
+| Oblique | The evidence above, or part of a stretch that is |
 | En-face | Tilted beyond both the limit and 60° |
-| Wide patch | Over 2.5 times the width of the best-oriented GBM, with nothing showing it is vertical |
+| Wide patch | Over 2.5 times the width of the best-oriented GBM, and its slope could not be measured |
 | Brief in Z | Neither its medial point nor its followed centerline lasts longer than the projection plus 2 planes, and it is not cut off by the stack's ends. Not judged when slices are sampled too sparsely to tell |
 | Speck | Its 3D component has less area than about 4 thickness², and it does not persist through Z |
 | Compact | Its component is shorter than 1.5 times its width, and it does not persist through Z |
-| Skeleton artifact | Mostly taper, spur or junction samples (these samples are also dropped from kept pieces) |
 | Below minimum / Above maximum | Thickness limits, per sample |
 | Removed by you | A correction |
 
@@ -180,7 +197,8 @@ result, except at a fine Z step of 0.2 µm, where it excluded almost nothing.
 Corrections live in the `prediction_edits` table, keyed by image, channel and source
 version; saved masks are never touched, so removing them restores the prediction.
 
-A **brush stroke** is exact: the centerline samples owning painted mask pixels become
+Corrections are applied after continuity, so they always win. A **brush stroke** is
+exact: the centerline samples owning painted mask pixels become
 their own pieces, kept or removed (later corrections win), and nothing nearby changes.
 Where a keeping stroke crosses background, what it adds is cut from the smoothed
 probability map at half height between the signal under the brush and the local
@@ -218,23 +236,28 @@ distributions under a token of analysis run and corrections.
 
 Tested only on synthetic stacks: tube shells and spheres of known orientation and
 true thickness 2.5 µm, imaged like the pipeline (blur, 5-plane projection, thresholding
-with boundary noise and dropouts), with non-GBM specks and fibres added. "Kept" columns
-are shares of centerline with that true tilt.
+with boundary noise and dropouts), with non-GBM specks and fibres added. Tightly curved
+stacks use spheres of 6–16 µm radius. "Kept" columns are shares of centerline with that
+true tilt. Breaks are places a decision changes along the centerline, per 100 thicknesses
+of centerline, before and after deciding along it.
 
-| Stack | Mean, unfiltered → kept (µm) | Median kept | Kept, tilt < 10° | Kept, 30–45° |
+| Stack | Mean, unfiltered → kept (µm) | Kept, tilt < 10° | Kept, 30–45° | Breaks |
 |---|---|---|---|---|
-| dz 0.4 µm, 60 planes | 3.74 → 2.72 | 2.58 | 93% | 15% |
-| dz 0.2 µm | 2.79 → 2.71 | 2.60 | 92% | 35% |
-| dz 0.8 µm, 30 planes | 4.46 → 2.89 | 2.58 | 90% | 19% |
-| Every 4th slice segmented | 3.86 → 2.86 | 2.60 | 92% | 30% |
-| 15 planes only | 2.76 → 2.71 | 2.71 | 88% | 41% |
-| Noisy masks (±5 px jitter, dropouts) | 2.27 → 2.07 | 2.18 | 63% | 28% |
+| dz 0.4 µm, 60 planes | 3.74 → 2.69 | 93% | 18% | 20 → 4 |
+| dz 0.2 µm | 2.79 → 2.71 | 92% | 35% | 23 → 2 |
+| dz 0.8 µm, 30 planes | 4.46 → 2.61 | 88% | 9% | 24 → 4 |
+| Every 4th slice segmented | 3.86 → 2.75 | 92% | 23% | 23 → 4 |
+| Noisy masks (±5 px jitter, dropouts) | 2.27 → 2.13 | 67% | 34% | 61 → 1 |
+| Tightly curved | 3.89 → 3.51 | 87% | 59% | 41 → 4 |
+| Tightly curved, jittery masks | 3.97 → 3.46 | 88% | 37% | 46 → 3 |
+| Tightly curved, heavy jitter | 2.71 → 2.46 | 63% | 14% | 61 → 1 |
 
-Compared with the first version of this filter, which used unsigned drift and axial
-chords, near-vertical GBM kept rose from 86% to 93% on the first stack and from 23% to
-63% on noisy masks. In exchange more oblique GBM stays (kept GBM truly under 30° fell
-from 99% to 89%), and the mean rose from 2.67 to 2.72 µm. On noisy masks most of what
-is still lost is skeleton artifacts rather than tilt.
+The cost of continuity shows on tightly curved GBM: tilted arcs that vary smoothly along
+a line are more often kept, raising the mean from 3.34 to 3.51 µm on the clean curved
+stack. On the others the mean stayed about the same or improved. The long-line term
+makes accuracy on these stacks slightly worse, not better; it is kept at a low weight
+because on real tissue oblique GBM is expected to look patchier than these phantoms.
+On noisy masks most of what is still lost is skeleton artifacts rather than tilt.
 
 **It has not been validated on real images.** Real masks may behave differently from
 these, so the defaults should be checked against expert review before results are

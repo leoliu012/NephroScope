@@ -68,6 +68,7 @@ const colors = excludedColorTable(reasons, names)
 const alpha = refinedLayers(label, table, colors)
 assert.deepEqual([...alpha.kept.alpha], [255, 0, 255, 0])
 assert.deepEqual([...alpha.skeleton.alpha], [255, 0, 0, 0])
+assert.deepEqual([...alpha.wholeSkeleton.alpha], [255, 0, 255, 0], 'a kept centerline stays unbroken across tapers and junctions')
 // Excluded GBM is filled in the colour of its reason; kept GBM is not in that layer.
 const red = [0xef, 0x44, 0x44, 255]
 assert.deepEqual([...alpha.excluded.fill.slice(0, 4)], [0, 0, 0, 0])
