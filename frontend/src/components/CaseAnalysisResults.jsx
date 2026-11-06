@@ -6,15 +6,20 @@ import {
 } from '../caseAnalysis.js'
 import { authFetch } from '../auth.js'
 import { caseAnalysisSession } from '../caseAnalysisSession.js'
+import {
+  filterKey, filterPayload, filterTotals, loadFilterSettings, loadZStepOverride, normalizeFilterSettings, reportFilterLine, saveFilterSettings,
+} from '../gbmRefinement.js'
+import GbmFilterControls from './GbmFilterControls.jsx'
 import { compareAlphanumeric } from '../collectionOrganization.js'
 import { AnalysisStatusBadge, analysisStatusText } from './CaseAnalysisStatus.jsx'
 import ThicknessDistributionPlot from './ThicknessDistributionPlot.jsx'
 
-function useSavedAnalysis(id) {
+function useSavedAnalysis(id, filterSettings) {
   const [state, setState] = useState(() => caseAnalysisSession.analysisState.get(id) || null)
   const [error, setError] = useState('')
   const [version, setVersion] = useState(0)
   const nextRef = useRef(null)
+  const filterIdentity = filterKey(filterPayload(filterSettings))
 
   useEffect(() => {
     setState(caseAnalysisSession.analysisState.get(id) || null)
@@ -33,6 +38,7 @@ function useSavedAnalysis(id) {
         await monitorSavedAnalysis(initial, {
           signal,
           distributions: known?.distributions,
+          filterFor: image => filterPayload(filterSettings, image ? loadZStepOverride(image.caseId, image.filename) : null),
           onChange: next => {
             caseAnalysisSession.analysisState.set(id, next)
             setState(next)
@@ -43,7 +49,7 @@ function useSavedAnalysis(id) {
       }
     })()
     return () => controller.abort()
-  }, [id, version])
+  }, [id, version, filterIdentity])
 
   const restartWith = analysis => {
     nextRef.current = analysis
@@ -57,7 +63,13 @@ function useSavedAnalysis(id) {
 
 function jobLabel(job) {
   if (job.distributionError) return `Measurement unavailable: ${job.distributionError}`
-  if (job.distribution) return job.distribution.sampleCount ? `${job.distribution.sampleCount.toLocaleString()} points` : 'No GBM detected'
+  if (job.distribution) {
+    const filter = job.distribution.filter
+    if (!job.distribution.sampleCount) return filter?.totalSamples ? 'All GBM excluded by the filter' : 'No GBM detected'
+    const points = `${job.distribution.sampleCount.toLocaleString()} points`
+    if (job.filterWaiting) return `${points} · cross-section check pending`
+    return filter?.totalSamples ? `${points} of ${filter.totalSamples.toLocaleString()}` : points
+  }
   switch (job.status) {
     case 'SUCCEEDED': return 'Reading thickness…'
     case 'RUNNING': return job.progress?.message || 'Running model'
@@ -137,7 +149,13 @@ function ProgressTree({ batch, analysis, canCancel, onCancel, cancelling }) {
 }
 
 export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNewAnalysis, onChanged }) {
-  const { analysis, distributions, error, setError, restartWith } = useSavedAnalysis(id)
+  const [filterSettings, setFilterSettings] = useState(loadFilterSettings)
+  const { analysis, distributions, error, setError, restartWith } = useSavedAnalysis(id, filterSettings)
+  const updateFilterSettings = next => {
+    const normalized = normalizeFilterSettings(next)
+    setFilterSettings(normalized)
+    saveFilterSettings(normalized)
+  }
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState('')
   // View choices are kept per analysis for this tab, so returning from the
@@ -197,6 +215,8 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
   // Pooled per-case statistics for the case headers of image/slice comparisons.
   const caseGroups = useMemo(() => groupBy === 'case' ? [] : comparisonGroups(batch, { groupBy: 'case', unit, observed, excluded }), [batch, groupBy, unit, observed, excluded])
   const plotCases = [...new Set(groups.map(group => group.caseId))]
+  const measuredDistributions = useMemo(() => (batch?.jobs || []).filter(job => !excluded.includes(job.imageKey)).map(job => job.distribution).filter(Boolean), [batch, excluded])
+  const totals = useMemo(() => filterTotals(measuredDistributions), [measuredDistributions])
   const toggleCase = caseId => setCollapsedCases(current => ({ ...current, [caseId]: !current[caseId] }))
 
   if (!analysis) {
@@ -237,6 +257,7 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
       await exportCaseAnalysisDistributions({
         format, title: analysisTitle(analysis), analysis, gapLabel: analysisGapLabel(analysis), groups, caseGroups, progress,
         groupBy, unit, observed, focus, excludedCount: excluded.length,
+        filterLine: reportFilterLine(filterSettings, measuredDistributions),
       })
       authFetch('/agh/api/audit/export', {
         method: 'POST',
@@ -329,6 +350,9 @@ export default function CaseAnalysisResults({ id, analyses, onOpenAnalysis, onNe
         <label className="ca-field">Thickness<select className="ux-input" value={observed ? 'observed' : 'adjusted'} onChange={event => setObserved(event.target.value === 'observed')}><option value="adjusted">EF-adjusted (per-image EF)</option><option value="observed">Observed (before EF)</option></select></label>
         <label className="ca-field">Units<select className="ux-input" value={unit} onChange={event => setUnit(event.target.value)}><option value="nm">nm</option><option value="µm">µm</option></select></label>
         <label className="ca-field">Axis range<select className="ux-input" value={focus ? 'whiskers' : 'full'} onChange={event => setFocus(event.target.value === 'whiskers')}><option value="whiskers">Whiskers (1.5 × IQR)</option><option value="full">Full range</option></select></label>
+      </div>
+      <div className="gf-case-panel">
+        <GbmFilterControls settings={filterSettings} onChange={updateFilterSettings} totals={totals} />
       </div>
       <details className="ca-comparison-filter"><summary>Images in this comparison ({analysis.images.length - excluded.length}/{analysis.images.length})</summary>
         {[...analysis.images].sort((a, b) => compareAlphanumeric(a.caseId, b.caseId) || compareAlphanumeric(a.filename, b.filename)).map(image => <label key={image.key} className="ca-check"><input type="checkbox" checked={!excluded.includes(image.key)} onChange={event => setExcluded(current => event.target.checked ? current.filter(key => key !== image.key) : [...current, image.key])} />{image.caseId} · {image.filename}</label>)}

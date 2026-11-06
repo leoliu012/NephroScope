@@ -152,6 +152,7 @@ def get_metadata(filepath: Path):
         channel_count = _channel_count(series.shape, axes)
         channel_value_min, channel_value_max = _channel_value_range(series.dtype)
         pixel_size = _read_pixel_size_um(tf, series)
+        z_step = _read_z_step_um(tf, series)
     return {
         "sourceRelPath": path.name,
         "sourceFormat": "TIFF",
@@ -181,6 +182,8 @@ def get_metadata(filepath: Path):
         "pixelSizeYUm": pixel_size["y"],
         "pixelSizeSource": pixel_size["source"],
         "pixelSizeIsDefault": pixel_size["isDefault"],
+        "zStepUm": z_step["value"],
+        "zStepSource": z_step["source"],
     }
 
 
@@ -457,6 +460,7 @@ def _get_nd2_metadata(path: Path):
         z_count = int(sizes.get("Z") or 1)
         time_count = int(sizes.get("T") or 1)
         pixel_size = _read_nd2_pixel_size_um(ndfile)
+        z_step = _read_nd2_z_step_um(ndfile)
         channel_value_min, channel_value_max = _channel_value_range(dtype)
         axes = "".join(sizes.keys()) or "YX"
 
@@ -492,7 +496,17 @@ def _get_nd2_metadata(path: Path):
         "pixelSizeYUm": pixel_size["y"],
         "pixelSizeSource": pixel_size["source"],
         "pixelSizeIsDefault": pixel_size["isDefault"],
+        "zStepUm": z_step["value"],
+        "zStepSource": z_step["source"],
     }
+
+
+def _read_nd2_z_step_um(ndfile):
+    try:
+        value = _positive_number(getattr(ndfile.voxel_size(), "z", None))
+    except Exception:
+        value = None
+    return {"value": value, "source": "ND2 voxel size" if value else None}
 
 
 def _read_nd2_pixel_size_um(ndfile):
@@ -987,6 +1001,38 @@ def _read_sample_info(series):
         return None, int(value)
     except Exception:
         return None, None
+
+def _read_z_step_um(tf, series):
+    """Read the physical distance between Z planes, when the file records one."""
+    for reader in (_z_step_from_ome, _z_step_from_imagej_metadata):
+        try:
+            value = reader(tf, series)
+        except Exception:
+            value = None
+        if value:
+            return {"value": float(value[0]), "source": value[1]}
+    return {"value": None, "source": None}
+
+
+def _z_step_from_ome(tf, series):
+    ome = getattr(tf, "ome_metadata", None)
+    if not ome:
+        return None
+    pixels = ElementTree.fromstring(ome).find(".//{*}Pixels")
+    if pixels is None:
+        return None
+    value = _length_um(pixels.attrib.get("PhysicalSizeZ"), pixels.attrib.get("PhysicalSizeZUnit", "µm"))
+    return (value, "OME-XML PhysicalSizeZ") if value else None
+
+
+def _z_step_from_imagej_metadata(tf, series):
+    metadata = dict(getattr(tf, "imagej_metadata", None) or {})
+    spacing = metadata.get("spacing")
+    if spacing is None:
+        return None
+    value = _length_um(spacing, metadata.get("unit") or metadata.get("Unit") or "µm")
+    return (value, "ImageJ spacing") if value else None
+
 
 def _read_pixel_size_um(tf, series):
     """Read physical X/Y calibration in micrometers per pixel, with a safe fallback."""

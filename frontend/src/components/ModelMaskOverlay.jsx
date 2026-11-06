@@ -54,6 +54,9 @@ export default function ModelMaskOverlay({
   opacity,
   visible,
   displayMode = 'filled',
+  alphaData = null,
+  className = 'model-mask-overlay',
+  ariaLabel = 'GBM model mask overlay',
   onReady,
   onError,
 }) {
@@ -67,6 +70,12 @@ export default function ModelMaskOverlay({
   useEffect(() => { errorCallbackRef.current = onError }, [onError])
 
   useEffect(() => {
+    if (alphaData) {
+      // Already decoded, so the previous picture stays until this one is drawn.
+      maskAlphaRef.current = { ...alphaData, contourAlpha: null }
+      setMaskRevision(revision => revision + 1)
+      return undefined
+    }
     maskAlphaRef.current = null
     if (canvasRef.current) {
       canvasRef.current.dataset.predictionReady = 'false'
@@ -132,7 +141,7 @@ export default function ModelMaskOverlay({
     }
     void load()
     return () => controller.abort()
-  }, [height, maskUrl, width])
+  }, [alphaData, height, maskUrl, width])
 
   useLayoutEffect(() => {
     const mask = maskAlphaRef.current
@@ -167,8 +176,8 @@ export default function ModelMaskOverlay({
       ref={canvasRef}
       width={Math.max(1, Number(width) || 1)}
       height={Math.max(1, Number(height) || 1)}
-      className="model-mask-overlay"
-      aria-label="GBM model mask overlay"
+      className={className}
+      aria-label={ariaLabel}
       aria-hidden={!visible}
       style={{
         position: 'absolute',

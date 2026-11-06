@@ -14,7 +14,9 @@ import uuid
 from agh_api.analysis_store import AnalysisStore, LeaseLost
 from agh_api.audit import AuditLog
 from agh_api.config import Config
+from agh_api.analysis_artifacts import remove_run_artifacts
 from agh_api.errors import APIError
+from agh_api.gbm_refinement import STACK_OPERATION, execute_stack_analysis
 from agh_api.segmentation_service import OPERATION, execute_segmentation
 
 
@@ -64,9 +66,13 @@ def main(argv=None) -> int:
         progress = _progress_reporter(store, run_id, worker_id, lease_lost)
 
         try:
-            if job["operation"] != OPERATION:
+            if job["operation"] == OPERATION:
+                execute = execute_segmentation
+            elif job["operation"] == STACK_OPERATION:
+                execute = execute_stack_analysis
+            else:
                 raise ValueError(f"Unknown analysis operation: {job['operation']}")
-            result = execute_segmentation(
+            result = execute(
                 config,
                 job,
                 progress=progress,
@@ -74,12 +80,16 @@ def main(argv=None) -> int:
             )
             _require_ownership(store, run_id, worker_id, lease_lost)
             store.mark_succeeded(run_id, worker_id, result)
+            if job["operation"] == STACK_OPERATION:
+                _remove_superseded_analyses(config, store, job)
             _record_audit(config, job, result="success", details={"model": result.get("modelId")})
             log.info("Segmentation job %s succeeded", run_id)
         except LeaseLost:
             log.warning("Stopped publishing stale analysis attempt for %s after its lease was lost", run_id)
         except Exception as exc:
             public_message = _public_error(exc)
+            if job["operation"] == STACK_OPERATION and not isinstance(exc, APIError):
+                public_message = "see the server log for details"
             log.exception("Segmentation job %s failed", run_id)
             try:
                 store.mark_failed(run_id, worker_id, public_message)
@@ -155,6 +165,15 @@ def _public_error(exc):
     if isinstance(exc, FileNotFoundError) and message:
         return message[:500]
     return "Segmentation failed; see the server log for details"
+
+
+def _remove_superseded_analyses(config, store, job) -> None:
+    try:
+        for stale_id in store.remove_superseded_stack_runs(job):
+            remove_run_artifacts(config.analysis_root, stale_id)
+    except Exception:
+        # Only disk space is at stake, so this never fails the finished analysis.
+        log.exception("Unable to remove older stack analyses for %s", job["runId"])
 
 
 def _record_audit(config, job, *, result, details):

@@ -1,6 +1,8 @@
 // Thickness distributions for a finished run never change for a given
 // calibration, so they are kept in memory for this page and in IndexedDB
 // across reloads. Reopening an analysis then needs no measurement requests.
+// Filtered results also depend on the Z analysis and on corrections, so they are
+// stored under a server token that changes with either.
 import { stableModelJson } from './modelAnalysis.js'
 
 const DB_NAME = 'nephroscope-cache'
@@ -10,8 +12,9 @@ const memory = new Map()
 let dbPromise = null
 let writesSincePrune = 0
 
-export function distributionCacheKey(runId, calibration) {
-  return `${runId}|${stableModelJson(calibration || {})}`
+export function distributionCacheKey(runId, calibration, filter = null) {
+  const base = `${runId}|${stableModelJson(calibration || {})}`
+  return filter ? `${base}|${stableModelJson(filter)}` : base
 }
 
 function compact(distribution) {
@@ -22,6 +25,7 @@ function compact(distribution) {
     counts: distribution.counts,
     sampleCount: distribution.sampleCount,
     unit: distribution.unit,
+    ...(distribution.filter ? { filter: distribution.filter } : {}),
   }
 }
 

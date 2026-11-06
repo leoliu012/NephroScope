@@ -214,11 +214,11 @@ export function modelSkeletonUrl(runId) {
   return `/agh/api/analysis-runs/${encodeURIComponent(runId)}/skeleton`
 }
 
-export async function measureGbmThickness(runId, { roi, calibration }, options = {}) {
+export async function measureGbmThickness(runId, { roi, calibration, filter }, options = {}) {
   return fetchJson(`/agh/api/analysis-runs/${encodeURIComponent(runId)}/measurements/gbm-thickness`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ roi, calibration }),
+    body: JSON.stringify({ roi, calibration, ...(filter ? { filter } : {}) }),
     signal: options.signal,
   })
 }

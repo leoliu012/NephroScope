@@ -1,20 +1,24 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  batchProgress, cancelRuns, coverageKey, fetchCoverage, fetchDistributions, imageKey, jobFromRun, lookupRuns,
-  selectedZSlices, submitRuns,
+  batchProgress, cancelRuns, coverageKey, distributionNeeded, fetchCoverage, fetchDistributions, fetchDistributionTokens,
+  imageKey, jobFromRun, lookupRuns, selectedZSlices, submitRuns,
 } from './caseAnalysis.js'
 import { distributionCacheKey } from './distributionCache.js'
+import { filterKey, reportFilterLine } from './gbmRefinement.js'
 import {
-  gapRunCounts, imageThicknessReport, imageThicknessScope, loadGapPreference, saveGapPreference, viewerGapOptions,
+  gapRunCounts, imageThicknessReport, imageThicknessScope, loadGapPreference, nearbyZSlices, saveGapPreference, viewerGapOptions,
 } from './imageThickness.js'
 
 const ACTIVE = new Set(['QUEUED', 'RUNNING'])
 const POLL_MS = 3000
+const FILTER_POLL_MS = 4000
 
 // Thickness results for the open image come from the runs already saved on
 // the server for this channel, so any Z sampling that was analyzed before
 // (here or in Case analysis) shows immediately.
-export default function useImageThicknessAnalysis({ caseId, filename, meta, ready, channelIndex, calibration, initialGap = null }) {
+export default function useImageThicknessAnalysis({
+  caseId, filename, meta, ready, channelIndex, calibration, initialGap = null, filter = null, filterSettings = null, editsVersion = 0,
+}) {
   const zCount = Math.max(1, Number(meta?.zCount) || 1)
   const scope = ready ? imageThicknessScope(caseId, filename, meta) : null
   const coverageId = scope ? `${scope}#${channelIndex}` : ''
@@ -26,10 +30,12 @@ export default function useImageThicknessAnalysis({ caseId, filename, meta, read
   const [error, setError] = useState('')
   const [options, setOptions] = useState({ groupBy: 'image', unit: 'nm', observed: false, focus: true })
   const [refreshToken, setRefreshToken] = useState(0)
+  const [filterPoll, setFilterPoll] = useState(0)
   const preferenceRef = useRef(null)
   const initialGapRef = useRef(initialGap)
   initialGapRef.current = initialGap
   const calibrationKey = JSON.stringify(calibration)
+  const filterIdentity = filterKey(filter)
 
   useEffect(() => {
     if (!scope) return
@@ -72,7 +78,9 @@ export default function useImageThicknessAnalysis({ caseId, filename, meta, read
   const runs = coverage.id === coverageId ? coverage.runs : {}
   const slices = useMemo(() => selectedZSlices(zCount, gap), [zCount, gap])
   const activeRunIds = slices.map(z => runs[String(z)]).filter(run => run && ACTIVE.has(run.status)).map(run => run.runId)
-  const activeSignature = activeRunIds.join(',')
+  // Every active slice is followed, including nearby ones run for the Z analysis.
+  const allActiveRunIds = Object.values(runs).filter(run => run && ACTIVE.has(run.status)).map(run => run.runId)
+  const activeSignature = allActiveRunIds.join(',')
 
   useEffect(() => {
     if (!activeSignature) return undefined
@@ -104,21 +112,42 @@ export default function useImageThicknessAnalysis({ caseId, filename, meta, read
   useEffect(() => {
     if (!finishedSignature) return undefined
     const controller = new AbortController()
-    const needed = finishedSignature.split(',').map(item => {
+    const { signal } = controller
+    const items = finishedSignature.split(',').map(item => {
       const [z, runId] = item.split(':')
-      return { key: z, runId, calibration }
-    }).filter(item => byZ.get(item.key)?.cacheKey !== distributionCacheKey(item.runId, calibration) || byZ.get(item.key)?.retryable)
-    if (!needed.length) return undefined
-    fetchDistributions(needed, {
-      signal: controller.signal,
-      onResult: (z, result) => setMeasured(current => {
-        const map = new Map(current.id === coverageId ? current.byZ : [])
-        map.set(z, result)
-        return { id: coverageId, byZ: map }
-      }),
-    }).catch(err => { if (err.name !== 'AbortError') setError(err.message) })
+      return { key: z, runId, calibration, ...(filter ? { filter } : {}) }
+    })
+    ;(async () => {
+      const { tokens, states } = filter
+        ? await fetchDistributionTokens(items.map(item => item.runId), filter, { signal }).catch(err => {
+          if (err.name === 'AbortError') throw err
+          return { tokens: null, states: {} }
+        })
+        : { tokens: null, states: {} }
+      const needed = items.filter(item => distributionNeeded(
+        byZ.get(item.key), distributionCacheKey(item.runId, item.calibration, item.filter), tokens?.[item.runId], states[item.runId],
+      ))
+      if (!needed.length) return
+      await fetchDistributions(needed, {
+        signal,
+        ...(tokens ? { tokens } : {}),
+        onResult: (z, result) => setMeasured(current => {
+          const map = new Map(current.id === coverageId ? current.byZ : [])
+          map.set(z, result)
+          return { id: coverageId, byZ: map }
+        }),
+      })
+    })().catch(err => { if (err.name !== 'AbortError') setError(err.message) })
     return () => controller.abort()
-  }, [finishedSignature, calibrationKey, coverageId])
+  }, [finishedSignature, calibrationKey, coverageId, filterIdentity, editsVersion, filterPoll])
+
+  // Slices measured while the Z analysis was unfinished are measured again once it is.
+  const filterWaiting = [...byZ.values()].some(result => result.waiting)
+  useEffect(() => {
+    if (!filterWaiting) return undefined
+    const timer = setTimeout(() => setFilterPoll(value => value + 1), FILTER_POLL_MS)
+    return () => clearTimeout(timer)
+  }, [filterWaiting, filterPoll])
 
   const batch = useMemo(() => {
     if (!scope) return null
@@ -134,7 +163,10 @@ export default function useImageThicknessAnalysis({ caseId, filename, meta, read
   }, [scope, key, caseId, filename, zCount, channelIndex, calibrationKey, slices, runs, byZ, coverageId, gap])
 
   const progress = batchProgress(batch?.jobs)
-  const report = useMemo(() => imageThicknessReport(batch, options), [batch, options])
+  const report = useMemo(() => imageThicknessReport(batch, {
+    ...options,
+    filterLine: filterSettings ? reportFilterLine(filterSettings, (batch?.jobs || []).map(job => job.distribution).filter(Boolean)) : '',
+  }), [batch, options, filterSettings])
   const gapOptions = useMemo(() => viewerGapOptions(zCount).map(option => ({ ...option, ...gapRunCounts(option.slices, runs) })), [zCount, runs])
   const monitoring = activeRunIds.length > 0
 
@@ -154,6 +186,28 @@ export default function useImageThicknessAnalysis({ caseId, filename, meta, read
       })
       const failed = results.filter(result => result.status === 'SUBMIT_ERROR')
       if (failed.length) setError(`${failed.length} Z slice${failed.length === 1 ? '' : 's'} could not be queued: ${failed[0].error?.message || 'unknown error'}`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusy('')
+    }
+  }
+
+  // Tilt needs neighbours: segment a spread of nearby slices around this one.
+  const runNearby = async zIndex => {
+    if (!scope || busy) return
+    const missing = nearbyZSlices(zCount, zIndex).filter(z => !['SUCCEEDED', 'QUEUED', 'RUNNING'].includes(runs[String(z)]?.status))
+    if (!missing.length) return
+    setBusy('nearby')
+    setError('')
+    try {
+      const results = await submitRuns(missing.map(z => ({ caseId, filename, zIndex: z, channelIndex })))
+      setCoverage(current => {
+        if (current.id !== coverageId) return current
+        const next = { ...current.runs }
+        results.forEach(result => { if (result.runId) next[String(result.zIndex)] = result })
+        return { ...current, runs: next }
+      })
     } catch (err) {
       setError(err.message)
     } finally {
@@ -187,7 +241,7 @@ export default function useImageThicknessAnalysis({ caseId, filename, meta, read
   return {
     batch, gap, setGap, gapOptions, slices, monitoring, busy, error, options,
     setOption: (name, value) => setOptions(current => ({ ...current, [name]: value })),
-    progress, report, start, interrupt,
+    progress, report, start, interrupt, runNearby, filterWaiting, activeCount: allActiveRunIds.length,
     coverageLoading: coverage.loading && coverage.id === coverageId,
     coverageError: coverage.id === coverageId ? coverage.error : '',
     refresh: () => setRefreshToken(value => value + 1),

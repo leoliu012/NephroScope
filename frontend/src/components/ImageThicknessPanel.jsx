@@ -1,5 +1,6 @@
 import { CheckCircle2, CircleStop, Loader2, Play } from 'lucide-react'
 import { gapLabel, gapShortLabel, sliceSummary } from '../caseAnalysis.js'
+import GbmFilterControls, { GbmCorrectionControls } from './GbmFilterControls.jsx'
 import ThicknessDistributionPlot from './ThicknessDistributionPlot.jsx'
 import './caseAnalysis.css'
 import './imageThickness.css'
@@ -17,7 +18,9 @@ function sliceStatus(job) {
   }
 }
 
-export default function ImageThicknessPanel({ analysis, ready, zCount, channelIndex, channelCount, onChannelChange, calibration }) {
+export default function ImageThicknessPanel({
+  analysis, ready, zCount, channelIndex, channelCount, onChannelChange, calibration, filterControls, correctionControls,
+}) {
   const { batch, gap, setGap, gapOptions, slices, progress, monitoring, busy, report, options, setOption } = analysis
   const runnable = (batch?.jobs || []).filter(job => !['SUCCEEDED', 'QUEUED', 'RUNNING'].includes(job.status)).length
   const needsRun = runnable > 0
@@ -59,6 +62,10 @@ export default function ImageThicknessPanel({ analysis, ready, zCount, channelIn
     </label>
     <p className="ta-calibration">{calibration.pixelSizeXUm} µm/px · {calibration.expansionEnabled ? `EF ${calibration.expansionFactor}` : 'unexpanded'}</p>
 
+    {filterControls && <GbmFilterControls {...filterControls}>
+      {correctionControls && <GbmCorrectionControls {...correctionControls} />}
+    </GbmFilterControls>}
+
     <div className="ta-actions">
       {monitoring
         ? <button className="ux-button ux-button-secondary" onClick={analysis.interrupt} disabled={busy === 'interrupt' || progress.queued === 0}>
@@ -86,6 +93,7 @@ export default function ImageThicknessPanel({ analysis, ready, zCount, channelIn
         <span className="ca-z-pill">{gapShortLabel(gap)} · {progress.complete}/{progress.total} Z</span>
       </div>
       {progress.complete < progress.total && <p className="ca-warning">Partial results: {progress.complete}/{progress.total} Z runs included.</p>}
+      {analysis.filterWaiting && <p className="ca-warning">Cross-section analysis is still running, so these values are not filtered for tilt yet.</p>}
       <div className="ta-plot-controls">
         <label className="ca-field">Compare<select className="ux-input" value={options.groupBy} onChange={e => setOption('groupBy', e.target.value)}><option value="image">Pool Z slices</option><option value="slice">Each Z slice</option></select></label>
         <label className="ca-field">Units<select className="ux-input" value={options.unit} onChange={e => setOption('unit', e.target.value)}><option value="nm">nm</option><option value="µm">µm</option></select></label>
