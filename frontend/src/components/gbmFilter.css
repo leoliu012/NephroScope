@@ -1,0 +1,45 @@
+.gf-panel { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-1); font-size: 12px; color: var(--text-muted); }
+.gf-switch { display: flex; align-items: center; gap: 7px; font-weight: 600; color: var(--text); cursor: pointer; }
+.gf-switch input { accent-color: var(--accent); }
+.gf-group { display: flex; flex-direction: column; gap: 6px; padding-left: 21px; }
+.gf-row { display: grid; grid-template-columns: 62px minmax(0, 1fr); align-items: center; gap: 8px; }
+.gf-row .ux-input { min-height: 0; padding: 3px 6px; font-size: 12px; width: 100%; }
+.gf-value { color: var(--text); font-variant-numeric: tabular-nums; }
+.gf-slider { display: grid; grid-template-columns: minmax(0, 1fr) 36px; align-items: center; gap: 8px; }
+.gf-slider input { width: 100%; accent-color: var(--accent); }
+.gf-slider span { text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+.gf-number { display: grid; grid-template-columns: 62px minmax(0, 1fr); align-items: center; gap: 8px; }
+.gf-number-input { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.gf-number-input .ux-input { min-height: 0; padding: 3px 6px; font-size: 12px; width: 100%; min-width: 0; font-variant-numeric: tabular-nums; }
+.gf-number-input input { appearance: textfield; -moz-appearance: textfield; }
+.gf-number-input input::-webkit-outer-spin-button, .gf-number-input input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.gf-number-input em { font-style: normal; color: var(--text-subtle); font-size: 11px; }
+.gf-limits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.gf-limits .gf-number { grid-template-columns: auto minmax(0, 1fr); gap: 4px; }
+.gf-note { font-size: 11px; line-height: 1.45; color: var(--text-subtle); }
+.gf-warning { color: var(--warning, #d97706); }
+.gf-status { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; font-size: 11px; line-height: 1.45; }
+.gf-status > span { flex: 1; min-width: 120px; }
+.gf-status-busy { color: var(--accent); }
+.gf-status-error { color: #f87171; }
+.gf-status-muted { color: var(--text-subtle); }
+.gf-summary { border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.gf-summary p { color: var(--text-muted); }
+.gf-summary strong { color: var(--text); font-size: 15px; font-variant-numeric: tabular-nums; }
+.gf-summary p span { display: block; font-size: 11px; color: var(--text-subtle); font-variant-numeric: tabular-nums; }
+.gf-reasons { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 2px 12px; font-size: 11px; }
+.gf-reasons li { display: grid; grid-template-columns: 8px minmax(0, 1fr) auto; align-items: center; gap: 6px; }
+.gf-reasons i { width: 8px; height: 8px; border-radius: 2px; }
+.gf-reasons span { color: var(--text-subtle); font-variant-numeric: tabular-nums; }
+.gf-corrections { border-top: 1px solid var(--border); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.gf-label { font-size: 11px; font-weight: 600; color: var(--text-muted); }
+.gf-tool-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.gf-tool-row .ux-button { flex: 1 1 auto; justify-content: center; min-height: 0; padding: 4px 6px; font-size: 11px; white-space: nowrap; }
+.gf-tool-active { border-color: var(--accent) !important; background: var(--accent-soft) !important; color: var(--text) !important; }
+.gf-hover { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); z-index: 40; max-width: calc(100% - 24px); padding: 4px 10px; border-radius: 999px; background: rgba(15, 23, 42, 0.86); color: #f8fafc; font-size: 12px; pointer-events: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+.gf-case-panel { margin-top: 12px; }
+.gf-case-panel summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--text-muted); padding: 2px 0; }
+.gf-case-panel[open] summary { margin-bottom: 8px; }
+.gf-nearby { width: 100%; justify-content: center; margin-top: 6px; min-height: 0; padding: 4px 6px; font-size: 11px; }
+.gf-case-panel .gf-row, .gf-case-panel .gf-number, .gf-case-panel .gf-slider { max-width: 340px; }
+.gf-case-panel .gf-limits { max-width: 360px; }

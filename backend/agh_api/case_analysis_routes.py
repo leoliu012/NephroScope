@@ -149,13 +149,17 @@ def register_case_analysis_routes(app, config, store):
         requested = [(ensure_run_id(item.get("runId") if isinstance(item, dict) else None), item) for item in items]
         runs = store.get_runs(run_id for run_id, _ in requested)
         results = []
+        memo: dict = {}  # one stack lookup per image, however many slices it has
         for run_id, item in requested:
             run = runs.get(run_id)
             if run is None:
                 results.append({"runId": run_id, "status": 404, "error": "Analysis run not found"})
                 continue
             try:
-                distribution = measure_run_distribution(config, run, {"calibration": item.get("calibration")})
+                distribution = measure_run_distribution(
+                    config, run, {"calibration": item.get("calibration"), "filter": item.get("filter")},
+                    store=store, memo=memo,
+                )
                 results.append({"runId": run_id, "distribution": distribution})
             except APIError as exc:
                 results.append({"runId": run_id, "status": exc.status_code, "error": exc.message})

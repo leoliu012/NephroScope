@@ -2,6 +2,7 @@ import { authFetch } from './auth.js'
 import { v4 as uuidv4 } from 'uuid'
 import { compareAlphanumeric, getImageMagnificationGroup, organizeImageFilenames } from './collectionOrganization.js'
 import { distributionCacheKey, getCachedDistributions, putCachedDistributions } from './distributionCache.js'
+import { filterIsWaiting } from './gbmRefinement.js'
 
 export const imageKey = (caseId, filename) => JSON.stringify([caseId, filename])
 export const jobKey = (caseId, filename, zIndex) => `${imageKey(caseId, filename)}:${zIndex}`
@@ -160,21 +161,65 @@ export function gapCoverage(entry, zCount, gap) {
   return { total: slices.length, ready, active, missing: slices.length - ready - active }
 }
 
+// Whether a filtered result can still be trusted, cheaply: the token changes
+// with the Z analysis and with corrections. Also starts a Z analysis that is due.
+export async function fetchDistributionTokens(runIds, filter, { signal, request = caseAnalysisJson } = {}) {
+  const tokens = {}, states = {}
+  for (const chunk of chunked(runIds, 2000)) {
+    const payload = await postJson(request, '/agh/api/analysis-runs/refinement-tokens', { runIds: chunk, filter }, signal)
+    Object.assign(tokens, payload.tokens)
+    Object.assign(states, payload.states)
+  }
+  return { tokens, states }
+}
+
+// Does this measurement have to be requested (again)?
+export function distributionNeeded(measured, cacheKey, token = null, state = null) {
+  if (!measured || measured.cacheKey !== cacheKey || measured.retryable) return true
+  // Ready now but measured against something else, or finished waiting by failing.
+  if (token && token !== measured.token) return true
+  return Boolean(measured.waiting && state === 'failed')
+}
+
+function measuredResult(item, distribution) {
+  return {
+    runId: item.runId, cacheKey: item.cacheKey, distribution,
+    token: distribution.filter?.token ?? null,
+    waiting: filterIsWaiting(distribution.filter),
+  }
+}
+
 // Measurements for finished runs; cached results return without a request.
-export async function fetchDistributions(items, { signal, request = caseAnalysisJson, onResult } = {}) {
-  const keyed = items.map(item => ({ ...item, cacheKey: distributionCacheKey(item.runId, item.calibration) }))
-  const cached = await getCachedDistributions(keyed.map(item => item.cacheKey))
+export async function fetchDistributions(items, { signal, request = caseAnalysisJson, onResult, tokens = null } = {}) {
+  let known = tokens
+  const filtered = items.filter(item => item.filter)
+  if (filtered.length && !known) {
+    try {
+      known = (await fetchDistributionTokens(filtered.map(item => item.runId), filtered[0].filter, { signal, request })).tokens
+    } catch (error) {
+      if (error.name === 'AbortError' || [401, 403].includes(error.status)) throw error
+      known = {} // measure without the cache rather than fail
+    }
+  }
+  const keyed = items.map(item => {
+    const cacheKey = distributionCacheKey(item.runId, item.calibration, item.filter)
+    const token = item.filter ? known?.[item.runId] : null
+    return { ...item, cacheKey, storeKey: item.filter ? (token ? `${cacheKey}|${token}` : null) : cacheKey }
+  })
+  const cached = await getCachedDistributions(keyed.map(item => item.storeKey).filter(Boolean))
   const pending = []
   keyed.forEach(item => {
-    const distribution = cached.get(item.cacheKey)
-    if (distribution) onResult?.(item.key, { runId: item.runId, cacheKey: item.cacheKey, distribution })
+    const distribution = item.storeKey ? cached.get(item.storeKey) : null
+    if (distribution) onResult?.(item.key, measuredResult(item, distribution))
     else pending.push(item)
   })
   await mapLimit(chunked(pending, 40), 2, async chunk => {
     let payload
     try {
       payload = await postJson(request, '/agh/api/analysis-runs/distributions', {
-        items: chunk.map(item => ({ runId: item.runId, calibration: item.calibration })),
+        items: chunk.map(item => ({
+          runId: item.runId, calibration: item.calibration, ...(item.filter ? { filter: item.filter } : {}),
+        })),
       }, signal)
     } catch (error) {
       if (error.name === 'AbortError' || [401, 403].includes(error.status)) throw error
@@ -185,8 +230,10 @@ export async function fetchDistributions(items, { signal, request = caseAnalysis
     payload.results.forEach((result, index) => {
       const item = chunk[index]
       if (result.distribution) {
-        fresh.push({ key: item.cacheKey, distribution: result.distribution })
-        onResult?.(item.key, { runId: item.runId, cacheKey: item.cacheKey, distribution: result.distribution })
+        const token = result.distribution.filter?.token
+        if (!item.filter) fresh.push({ key: item.cacheKey, distribution: result.distribution })
+        else if (token) fresh.push({ key: `${item.cacheKey}|${token}`, distribution: result.distribution })
+        onResult?.(item.key, measuredResult(item, result.distribution))
       } else {
         onResult?.(item.key, { runId: item.runId, cacheKey: item.cacheKey, error: result.error || 'Measurement unavailable', status: result.status })
       }
@@ -247,31 +294,53 @@ export function analysisGapLabel(analysis) {
   return gapLabel([...gaps][0] ?? analysis.gap)
 }
 
+// Tokens are polled less often than run progress: a stack can have many runs.
+const TOKEN_POLL_MS = 10000
+
 export async function monitorSavedAnalysis(initial, {
-  signal, onChange, request = caseAnalysisJson, pollMs = 3000, measure = fetchDistributions, distributions: known,
+  signal, onChange, request = caseAnalysisJson, pollMs = 3000, measure = fetchDistributions, distributions: known, filterFor = null,
+  tokenPollMs = TOKEN_POLL_MS,
 } = {}) {
   let analysis = initial
   const distributions = new Map(known || [])
   let dirty = false
   let retryPasses = 0
+  let lastTokens = 0
+  let tokenState = { tokens: null, states: {} }
   const publish = () => {
     if (!signal?.aborted) onChange?.({ analysis, distributions: new Map(distributions) })
     dirty = false
   }
   while (!signal?.aborted) {
     const images = new Map(analysis.images.map(image => [image.key, image]))
-    const needed = analysis.jobs.filter(job => {
-      if (job.run?.status !== 'SUCCEEDED') return false
+    const finished = analysis.jobs.filter(job => job.run?.status === 'SUCCEEDED')
+    const filterOf = job => (filterFor ? filterFor(images.get(job.imageKey)) : null)
+    const keyOf = job => distributionCacheKey(job.run.runId, images.get(job.imageKey)?.calibration, filterOf(job))
+    if (filterFor && finished.length && Date.now() - lastTokens >= tokenPollMs) {
+      lastTokens = Date.now()
+      try {
+        tokenState = await fetchDistributionTokens(finished.map(job => job.run.runId), filterOf(finished[0]), { signal, request })
+      } catch (error) {
+        if (error.name === 'AbortError' || [401, 403].includes(error.status)) throw error
+      }
+    }
+    const needed = finished.filter(job => {
       const measured = distributions.get(job.id)
-      const cacheKey = distributionCacheKey(job.run.runId, images.get(job.imageKey)?.calibration)
-      return !measured || measured.cacheKey !== cacheKey || measured.retryable
+      const cacheKey = keyOf(job)
+      // A value measured under other settings must not be shown as this one.
+      if (measured && measured.cacheKey !== cacheKey) {
+        distributions.delete(job.id)
+        dirty = true
+      }
+      return distributionNeeded(distributions.get(job.id), cacheKey, tokenState.tokens?.[job.run.runId], tokenState.states?.[job.run.runId])
     })
     if (needed.length) {
       let lastPublish = Date.now()
       await measure(needed.map(job => ({
         key: job.id, runId: job.run.runId, calibration: images.get(job.imageKey)?.calibration,
+        ...(filterFor ? { filter: filterOf(job) } : {}),
       })), {
-        signal, request,
+        signal, request, ...(tokenState.tokens ? { tokens: tokenState.tokens } : {}),
         onResult: (key, result) => {
           distributions.set(key, result)
           dirty = true
@@ -282,8 +351,9 @@ export async function monitorSavedAnalysis(initial, {
     if (dirty || needed.length === 0) publish()
     const active = analysis.jobs.some(job => ACTIVE.has(job.run?.status))
     const retryable = analysis.jobs.some(job => distributions.get(job.id)?.retryable)
-    if (!active && (!retryable || retryPasses >= 2)) break
-    if (!active) retryPasses++
+    const waiting = analysis.jobs.some(job => distributions.get(job.id)?.waiting)
+    if (!active && !waiting && (!retryable || retryPasses >= 2)) break
+    if (!active && !waiting) retryPasses++
     await abortableDelay(pollMs, signal)
     if (active) {
       analysis = await savedAnalyses.get(analysis.id, { signal, request })
@@ -313,6 +383,7 @@ export function jobFromRun(job, run, measured) {
     error: run?.status === 'FAILED' ? run?.error?.message || 'Segmentation failed' : '',
     distribution: distribution?.distribution || null,
     distributionError: distribution?.error || '',
+    filterWaiting: Boolean(distribution?.waiting),
   }
 }
 

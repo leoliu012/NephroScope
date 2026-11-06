@@ -45,6 +45,35 @@ slices are canceled) and continued later.
 Results always use the viewer's current calibration; changing pixel size or EF
 re-measures the saved segmentations without running the model again.
 
+### Cross-sections only, and correcting predictions
+
+GBM thickness is only true where the sheet crosses the image plane steeply.
+**Cross-sections only** (on by default, in the viewer's Settings and Thickness
+tabs and in Case analysis) compares each slice's prediction with the other
+segmented slices of the image, measures how tilted each short length of GBM is,
+and leaves out oblique and en-face GBM, as well as predictions too short-lived or
+small through the stack to be a sheet. **Thickness limits** (default 30–3400 nm,
+after EF) work independently. Excluded GBM is outlined in red, and thickness plots,
+ROI measurements, overlays and exports only use what is kept.
+
+To correct a prediction, use **Add GBM** or **Remove GBM** on the tool rail and
+click:
+
+- Clicking excluded GBM keeps it, and raises the tilt limit nearby (also on nearby
+  Z slices), so similar GBM around it returns.
+- Clicking faint GBM the model missed lowers the probability threshold around that
+  point and adds what it finds.
+- Clicking wrong GBM removes that piece. If its tilt was close to the limit, the
+  limit also tightens nearby.
+
+The saved model prediction never changes. **Undo**, **Restore Z** and **Restore
+image** remove corrections and give back exactly what the algorithm decided.
+
+The filter needs more than one segmented Z slice to measure tilt. With only one,
+it falls back to shape rules that catch much less, and the viewer offers to run the
+model on nearby slices. See `docs/model-inference.md` for the method, how it was
+tested, and its limits: **so far it has only been validated on synthetic stacks.**
+
 ### 4. Compare thickness across cases and images
 
 Open **Case analysis** to select cases and images, sample their Z slices, and
@@ -255,6 +284,11 @@ GET  /agh/api/cases/:case/files/:filename/annotations
 PUT  /agh/api/cases/:case/files/:filename/annotations   (requires X-AGH-CSRF)
 POST /agh/api/analysis-runs/batch | lookup | cancel | distributions
 POST /agh/api/analysis-coverage            (saved runs per Z slice and channel)
+GET|POST /agh/api/cases/:case/files/:filename/gbm-refinement   (Z analysis status; POST starts or retries it)
+POST /agh/api/analysis-runs/:id/refinement                     (per-piece decisions for one slice)
+GET  /agh/api/analysis-runs/:id/refinement/label.png           (which piece each pixel belongs to)
+POST /agh/api/analysis-runs/refinement-tokens                  (is a cached filtered result still valid?)
+POST|DELETE /agh/api/analysis-runs/:id/edits                   (correct a prediction, or undo and restore)
 GET  /agh/api/case-analyses                (your saved analyses)
 POST /agh/api/case-analyses                (create, or merge an identical one)
 GET  /agh/api/case-analyses/:id

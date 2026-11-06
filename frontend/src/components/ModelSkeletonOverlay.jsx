@@ -67,6 +67,7 @@ export default function ModelSkeletonOverlay({
   color,
   thickness,
   visible,
+  alphaData = null,
   onReady,
   onError,
 }) {
@@ -80,6 +81,11 @@ export default function ModelSkeletonOverlay({
   useEffect(() => { errorCallbackRef.current = onError }, [onError])
 
   useEffect(() => {
+    if (alphaData) {
+      skeletonAlphaRef.current = alphaData
+      setSkeletonRevision(revision => revision + 1)
+      return undefined
+    }
     skeletonAlphaRef.current = null
     if (canvasRef.current) {
       canvasRef.current.dataset.predictionReady = 'false'
@@ -127,7 +133,7 @@ export default function ModelSkeletonOverlay({
     }
     void load()
     return () => controller.abort()
-  }, [height, skeletonUrl, width])
+  }, [alphaData, height, skeletonUrl, width])
 
   useLayoutEffect(() => {
     const skeleton = skeletonAlphaRef.current

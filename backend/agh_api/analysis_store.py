@@ -132,6 +132,32 @@ class AnalysisStore:
                 ON case_analysis_jobs(cache_key)
                 """
             )
+            # People's corrections of a prediction; the saved run never changes,
+            # so deleting these rows restores the model's prediction.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS prediction_edits (
+                    edit_id TEXT PRIMARY KEY,
+                    case_id TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    channel_index INTEGER NOT NULL,
+                    source_key TEXT NOT NULL,
+                    z_index INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    x REAL NOT NULL,
+                    y REAL NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_by TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_prediction_edits_image
+                ON prediction_edits(case_id, filename, channel_index, source_key, created_at)
+                """
+            )
 
     def create_or_reuse_run(
         self,
@@ -242,6 +268,7 @@ class AnalysisStore:
         *,
         operation: str,
         source_identity: dict | None = None,
+        channel_index: int | None = None,
     ) -> list[dict]:
         """Return the relevant active/saved run for every source Z slice.
 
@@ -266,6 +293,8 @@ class AnalysisStore:
             run = _row_to_dict(row)
             if run["status"] == "CANCELED":
                 # A cancelled queue entry never produced anything to show.
+                continue
+            if channel_index is not None and run["channelIndex"] != channel_index:
                 continue
             if source_identity and not _same_source_identity(
                 (run.get("request") or {}).get("source") or {}, source_identity
@@ -425,6 +454,120 @@ class AnalysisStore:
             conn.commit()
         return canceled, kept
 
+    def latest_stack_run(self, case_id: str, filename: str, channel_index: int, window: int, *, operation: str) -> dict | None:
+        """The newest finished stack analysis of this image, channel and window."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM analysis_runs
+                WHERE case_id = ? AND filename = ? AND channel_index = ?
+                  AND operation = ? AND status = 'SUCCEEDED'
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 20
+                """,
+                (case_id, filename, int(channel_index), operation),
+            ).fetchall()
+        for row in rows:
+            run = _row_to_dict(row)
+            if int((run.get("request") or {}).get("window") or 0) == int(window):
+                return run
+        return None
+
+    def remove_superseded_stack_runs(self, run: dict) -> list[str]:
+        """Forget older analyses of the same image, channel and window as this one.
+
+        Each change to the segmented slices makes a new analysis, and the old ones
+        are never read again, so keeping them would only use up disk.
+        """
+        window = int((run.get("request") or {}).get("window") or 0)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM analysis_runs
+                WHERE case_id = ? AND filename = ? AND channel_index = ? AND operation = ?
+                  AND run_id != ? AND created_at <= ? AND status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+                """,
+                (run["case"], run["filename"], int(run["channelIndex"]), run["operation"], run["runId"], run["createdAt"]),
+            ).fetchall()
+            stale = [
+                record["runId"] for record in map(_row_to_dict, rows)
+                if int((record.get("request") or {}).get("window") or 0) == window
+            ]
+            for chunk in _chunks(stale):
+                conn.execute(f"DELETE FROM analysis_runs WHERE run_id IN ({_placeholders(chunk)})", tuple(chunk))
+            conn.commit()
+        return stale
+
+    def add_prediction_edit(
+        self, case_id: str, filename: str, channel_index: int, source_key: str, z_index: int,
+        kind: str, x: float, y: float, payload: dict, created_by: str,
+    ) -> dict:
+        edit_id = str(uuid.uuid4())
+        now = utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO prediction_edits (
+                    edit_id, case_id, filename, channel_index, source_key, z_index,
+                    kind, x, y, payload_json, created_by, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (edit_id, case_id, filename, int(channel_index), source_key, int(z_index), kind,
+                 float(x), float(y), _json_dump(payload), created_by or "", now),
+            )
+        return {
+            "id": edit_id, "case": case_id, "filename": filename, "channelIndex": int(channel_index),
+            "zIndex": int(z_index), "kind": kind, "x": float(x), "y": float(y), "payload": payload,
+            "createdBy": created_by or "", "createdAt": now,
+        }
+
+    def list_prediction_edits(self, case_id: str, filename: str, channel_index: int, source_key: str) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM prediction_edits
+                WHERE case_id = ? AND filename = ? AND channel_index = ? AND source_key = ?
+                ORDER BY created_at ASC, rowid ASC
+                """,
+                (case_id, filename, int(channel_index), source_key),
+            ).fetchall()
+        return [
+            {
+                "id": row["edit_id"], "case": row["case_id"], "filename": row["filename"],
+                "channelIndex": int(row["channel_index"]), "zIndex": int(row["z_index"]),
+                "kind": row["kind"], "x": float(row["x"]), "y": float(row["y"]),
+                "payload": _json_load(row["payload_json"], {}),
+                "createdBy": row["created_by"], "createdAt": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def delete_prediction_edits(
+        self, case_id: str, filename: str, channel_index: int, source_key: str,
+        *, edit_id: str | None = None, z_index: int | None = None,
+    ) -> int:
+        where = ["case_id = ?", "filename = ?", "channel_index = ?", "source_key = ?"]
+        params: list[object] = [case_id, filename, int(channel_index), source_key]
+        if edit_id is not None:
+            where.append("edit_id = ?")
+            params.append(edit_id)
+        if z_index is not None:
+            where.append("z_index = ?")
+            params.append(int(z_index))
+        with self._connect() as conn:
+            return conn.execute(
+                f"DELETE FROM prediction_edits WHERE {' AND '.join(where)}", tuple(params),
+            ).rowcount
+
+    def delete_prediction_edits_for_slice(self, case_id: str, filename: str, z_index: int) -> int:
+        """Corrections of a slice whose saved prediction no longer exists."""
+        with self._connect() as conn:
+            return conn.execute(
+                "DELETE FROM prediction_edits WHERE case_id = ? AND filename = ? AND z_index = ?",
+                (case_id, filename, int(z_index)),
+            ).rowcount
+
     def save_case_analysis(self, owner: str, signature: str, definition: dict, jobs: list[dict]) -> tuple[str, bool]:
         """Create a saved analysis, or merge into the owner's identical one.
 
@@ -580,6 +723,9 @@ class AnalysisStore:
                    )
                 ORDER BY
                     CASE WHEN status = 'RUNNING' THEN 0 ELSE 1 END,
+                    -- Stack analyses take seconds and someone is usually waiting
+                    -- on them, so they go ahead of queued model inference.
+                    CASE WHEN operation = 'gbm-segmentation' THEN 1 ELSE 0 END,
                     created_at ASC,
                     rowid ASC
                 LIMIT 1

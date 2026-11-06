@@ -9,6 +9,7 @@ from .annotation_service import AnnotationService
 from .analysis_routes import register_analysis_routes
 from .analysis_store import AnalysisStore
 from .case_analysis_routes import register_case_analysis_routes
+from .gbm_refinement_routes import register_gbm_refinement_routes
 from .audit import audit_event, install_audit
 from .auth import ROLES, UserError, has_permission, install_auth
 from .collaboration_service import CollaborationService, collaboration_actor
@@ -513,6 +514,7 @@ def create_app(config: Optional[Config] = None):
 
     register_analysis_routes(app, cfg, analysis_store)
     register_case_analysis_routes(app, cfg, analysis_store)
+    register_gbm_refinement_routes(app, cfg, analysis_store)
     register_ef_routes(app, cfg, raw_channel_cache)
 
     return app

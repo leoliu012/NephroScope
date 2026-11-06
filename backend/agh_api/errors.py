@@ -25,6 +25,11 @@ class Conflict(APIError):
     message = "Conflict"
 
 
+class ServiceUnavailable(APIError):
+    status_code = 503
+    message = "Service unavailable"
+
+
 class UnsupportedTiff(APIError):
     status_code = 422
     message = "Unsupported TIFF layout"

@@ -135,6 +135,8 @@ def register_analysis_routes(app, config, store):
             operation=OPERATION,
             z_index=z_index,
         )
+        if run_ids:
+            store.delete_prediction_edits_for_slice(case, filename, z_index)
         cleanup_failures = 0
         for run_id in run_ids:
             try:
@@ -250,7 +252,7 @@ def register_analysis_routes(app, config, store):
         run_id = ensure_run_id(run_id)
         run = store.get_run(run_id)
         try:
-            result = measure_run_thickness(config, run, request.get_json(silent=True))
+            result = measure_run_thickness(config, run, request.get_json(silent=True), store=store)
         except Exception as exc:
             audit_event(
                 action="MEASURE_GBM_THICKNESS",
@@ -283,7 +285,7 @@ def register_analysis_routes(app, config, store):
         if denied:
             return denied
         run = store.get_run(ensure_run_id(run_id))
-        result = measure_run_distribution(config, run, request.get_json(silent=True))
+        result = measure_run_distribution(config, run, request.get_json(silent=True), store=store)
         audit_event(
             action="MEASURE_GBM_DISTRIBUTION", case_id=run["case"], filename=run["filename"],
             result="success", details={"runId": run_id, "sampleCount": result["sampleCount"]},

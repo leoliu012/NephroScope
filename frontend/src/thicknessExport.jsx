@@ -194,6 +194,7 @@ export async function renderThicknessReport(report) {
       `Selected: ${sliceLabel(report.slices)} · Measured: ${sliceLabel(report.measuredSlices)}`,
       `${report.progress.complete}/${report.progress.total} Z runs measured · ${report.progress.empty} empty masks · ${report.progress.failed} need attention${report.progress.complete < report.progress.total ? ' · PARTIAL RESULTS' : ''}`,
       `Pixel size: ${cal.pixelSizeXUm} × ${cal.pixelSizeYUm} µm/px · ${report.observed ? 'Observed thickness (before EF)' : cal.expansionEnabled ? `EF-adjusted thickness, factor ${cal.expansionFactor}` : 'Unexpanded thickness'} · values in ${report.unit}`,
+      ...(report.filterLine ? [report.filterLine] : []),
     ],
     groups: report.groups,
     unit: report.unit,
@@ -220,7 +221,7 @@ function fileSlug(value) {
 
 // Case analysis distributions as a paginated PDF or one PNG.
 export async function exportCaseAnalysisDistributions({
-  format, title, analysis, gapLabel, groups, caseGroups = [], progress, groupBy, unit, observed, focus, excludedCount = 0,
+  format, title, analysis, gapLabel, groups, caseGroups = [], progress, groupBy, unit, observed, focus, excludedCount = 0, filterLine = '',
 }) {
   const included = analysis.images.length - excludedCount
   const cases = [...new Set(analysis.images.map(image => image.caseId))]
@@ -231,6 +232,7 @@ export async function exportCaseAnalysisDistributions({
       `Compared by: ${GROUP_BY_LABEL[groupBy] || groupBy} · ${observed ? 'Observed thickness (before EF)' : 'EF-adjusted thickness'} · values in ${unit}`,
       `${progress.complete}/${progress.total} Z runs measured${progress.empty ? ` · ${progress.empty} empty masks` : ''}${progress.complete < progress.total ? ' · PARTIAL RESULTS' : ''}`,
       `${calibrationSummary(analysis.images)} · Started ${new Date(analysis.createdAt).toLocaleString()} · Exported ${new Date().toLocaleString()}`,
+      ...(filterLine ? [filterLine] : []),
     ],
     groups, caseGroups, unit, observed, focus,
     groupsPerPage: format === 'png' ? groups.length : 8,

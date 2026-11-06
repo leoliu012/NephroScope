@@ -13,6 +13,16 @@ export function makeImageThicknessBatch({ caseId, filename, zCount, gap, channel
   }], gap, id)
 }
 
+// A spread of slices around one Z, enough to measure tilt without running them all.
+export function nearbyZSlices(zCount, zIndex, radius = 10, step = 2) {
+  const slices = []
+  for (let offset = -radius; offset <= radius; offset += step) {
+    const z = zIndex + offset
+    if (z >= 0 && z < zCount) slices.push(z)
+  }
+  return slices
+}
+
 // Distinct Z samplings for this stack; short stacks collapse to one choice.
 export function viewerGapOptions(zCount) {
   const seen = new Set()
@@ -73,7 +83,7 @@ export function imageThicknessReport(batch, options = {}) {
     measuredSlices: batch.jobs.filter(job => job.distribution).map(job => job.zIndex + 1),
     progress: batchProgress(batch.jobs), groups,
     unit: options.unit || 'nm', observed: Boolean(options.observed),
-    focus: options.focus !== false, groupBy,
+    focus: options.focus !== false, groupBy, filterLine: options.filterLine || '',
   }
 }
 

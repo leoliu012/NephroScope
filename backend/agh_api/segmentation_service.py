@@ -17,10 +17,12 @@ from .analysis_artifacts import (
     thickness_geometry_path,
     write_manifest_atomic,
     write_mask_atomic,
+    write_probability_atomic,
     write_skeleton_atomic,
     write_thickness_geometry_atomic,
 )
 from .errors import BadRequest, Conflict
+from .gbm_refinement import filtered_samples, parse_filter
 from .path_guard import image_path
 from .data_source import image_source_id
 from .tiff_service import choose_z_window, get_metadata, read_z_mip
@@ -181,6 +183,8 @@ def execute_segmentation(
     if not isinstance(output, dict) or "mask" not in output:
         raise RuntimeError("MorphoGBM v10 returned an invalid result")
     mask = _normalize_mask(output["mask"], expected_shape)
+    # Kept so a person's correction can re-threshold the prediction locally.
+    probability = output.get("probability")
 
     _report(progress, "geometry", 0.93, "Preparing GBM thickness geometry")
     try:
@@ -218,6 +222,7 @@ def execute_segmentation(
         "artifactAttempt": artifact_attempt,
         "thicknessGeometryAvailable": thickness_arrays is not None,
         "thicknessGeometryError": thickness_error,
+        "probabilityAvailable": probability is not None,
         "metadata": model_metadata,
     }
     manifest = {
@@ -233,6 +238,13 @@ def execute_segmentation(
         mask,
         attempt=artifact_attempt,
     )
+    if probability is not None:
+        write_probability_atomic(
+            config.analysis_root,
+            job["runId"],
+            probability,
+            attempt=artifact_attempt,
+        )
     if thickness_arrays is not None:
         write_thickness_geometry_atomic(
             config.analysis_root,
@@ -258,11 +270,13 @@ def execute_segmentation(
     return result
 
 
-def measure_run_thickness(config, run: dict, payload) -> dict:
+def measure_run_thickness(config, run: dict, payload, store=None) -> dict:
     if run.get("status") != "SUCCEEDED":
         raise Conflict("Segmentation run is not finished")
     if (run.get("result") or {}).get("thicknessGeometryAvailable") is False:
         raise Conflict("Segmentation contains no measurable GBM thickness geometry")
+    payload = dict(payload) if isinstance(payload, dict) else payload
+    raw_filter = payload.pop("filter", None) if isinstance(payload, dict) else None
     roi, calibration = validate_thickness_request(payload, run)
     try:
         from .gbm_thickness import (
@@ -272,13 +286,20 @@ def measure_run_thickness(config, run: dict, payload) -> dict:
     except ImportError as exc:
         raise RuntimeError("GBM thickness measurement support is not installed") from exc
 
-    geometry = load_thickness_geometry(
-        thickness_geometry_path(
-            config.analysis_root,
-            run["runId"],
-            attempt=(run.get("result") or {}).get("artifactAttempt"),
+    parsed = parse_filter(raw_filter)
+    filter_info = None
+    sample_mask = None
+    if parsed is not None and store is not None:
+        outcome = filtered_samples(config, store, run, parsed[0], parsed[1], calibration)
+        geometry, sample_mask, filter_info = outcome["geometry"], outcome["keep"], outcome["info"]
+    else:
+        geometry = load_thickness_geometry(
+            thickness_geometry_path(
+                config.analysis_root,
+                run["runId"],
+                attempt=(run.get("result") or {}).get("artifactAttempt"),
+            )
         )
-    )
     try:
         result = measure_gbm_thickness_from_geometry(
             geometry,
@@ -290,6 +311,7 @@ def measure_run_thickness(config, run: dict, payload) -> dict:
                 if calibration["expansionEnabled"]
                 else 1.0
             ),
+            sample_mask=sample_mask,
         )
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
@@ -311,13 +333,14 @@ def measure_run_thickness(config, run: dict, payload) -> dict:
         "meanThickness": mean_thickness,
         "unit": normalized.get("unit") or "µm",
         "sampleCount": sample_count,
+        "filter": filter_info,
     }
 
 
-def measure_run_distribution(config, run: dict, payload) -> dict:
+def measure_run_distribution(config, run: dict, payload, store=None, memo: dict | None = None) -> dict:
     if run.get("status") != "SUCCEEDED":
         raise Conflict("Segmentation run is not finished")
-    if not isinstance(payload, dict) or set(payload) != {"calibration"}:
+    if not isinstance(payload, dict) or not set(payload) or set(payload) - {"calibration", "filter"} or "calibration" not in payload:
         raise BadRequest("A calibration object is required")
     source = (run.get("request") or {}).get("source") or {}
     path = image_path(config.active_data_root, run["case"], run["filename"])
@@ -340,17 +363,25 @@ def measure_run_distribution(config, run: dict, payload) -> dict:
         raise Conflict("This segmentation has no saved thickness geometry")
     from .gbm_thickness import load_thickness_geometry, gbm_thickness_distribution_from_geometry
 
-    geometry = load_thickness_geometry(thickness_geometry_path(
-        config.analysis_root, run["runId"],
-        attempt=(run.get("result") or {}).get("artifactAttempt"),
-    ))
+    parsed = parse_filter(payload.get("filter"))
+    filter_info = None
+    sample_mask = None
+    if parsed is not None and store is not None:
+        outcome = filtered_samples(config, store, run, parsed[0], {**parsed[1], "memo": memo}, calibration)
+        geometry, sample_mask, filter_info = outcome["geometry"], outcome["keep"], outcome["info"]
+    else:
+        geometry = load_thickness_geometry(thickness_geometry_path(
+            config.analysis_root, run["runId"],
+            attempt=(run.get("result") or {}).get("artifactAttempt"),
+        ))
     distribution = gbm_thickness_distribution_from_geometry(
         geometry,
         pixel_size_x_um=calibration["pixelSizeXUm"],
         pixel_size_y_um=calibration["pixelSizeYUm"],
         expansion_factor=calibration["expansionFactor"] if calibration["expansionEnabled"] else 1.0,
+        sample_mask=sample_mask,
     )
-    return {"analysisRunId": run["runId"], "calibration": calibration, **distribution}
+    return {"analysisRunId": run["runId"], "calibration": calibration, "filter": filter_info, **distribution}
 
 
 def validate_thickness_request(payload, run: dict) -> tuple[dict, dict]:

@@ -19,6 +19,7 @@ MASK_FILENAME = "mask.png"
 SKELETON_FILENAME = "skeleton.png"
 MANIFEST_FILENAME = "manifest.json"
 THICKNESS_GEOMETRY_FILENAME = "thickness_geometry.npz"
+PROBABILITY_FILENAME = "probability.png"
 
 
 def ensure_run_id(run_id: str) -> str:
@@ -117,6 +118,45 @@ def thickness_geometry_path(
     if require and not path.is_file():
         raise NotFound("GBM thickness geometry not found")
     return path
+
+
+def probability_path(
+    analysis_root: Path,
+    run_id: str,
+    *,
+    attempt: int | None = None,
+    require: bool = True,
+) -> Path:
+    path = resolve_under_root(
+        attempt_directory(analysis_root, run_id, attempt), PROBABILITY_FILENAME
+    )
+    if require and not path.is_file():
+        raise NotFound("Model probability map not found")
+    return path
+
+
+def write_probability_atomic(
+    analysis_root: Path,
+    run_id: str,
+    probability,
+    *,
+    attempt: int | None = None,
+) -> Path:
+    """Publish the model's probability map as an 8-bit PNG (1/255 resolution)."""
+    array = np.asarray(probability, dtype=np.float32)
+    if array.ndim != 2 or not np.isfinite(array).all():
+        raise ValueError("Model probability must be one finite 2-D array")
+    encoded = np.clip(np.round(array * 255.0), 0, 255).astype(np.uint8)
+    payload = BytesIO()
+    Image.fromarray(encoded, mode="L").save(payload, format="PNG", optimize=False)
+    destination = probability_path(analysis_root, run_id, attempt=attempt, require=False)
+    _atomic_write_bytes(destination, payload.getvalue())
+    return destination
+
+
+def read_probability(analysis_root: Path, run_id: str, *, attempt: int | None = None):
+    with Image.open(probability_path(analysis_root, run_id, attempt=attempt)) as image:
+        return np.asarray(image.convert("L"), dtype=np.float32) / 255.0
 
 
 def write_mask_atomic(
@@ -231,6 +271,11 @@ def remove_run_artifacts(analysis_root: Path, run_id: str) -> bool:
         return False
     shutil.rmtree(directory)
     return True
+
+
+def write_bytes_atomic(destination: Path, payload: bytes) -> Path:
+    _atomic_write_bytes(destination, payload)
+    return destination
 
 
 def _atomic_write_bytes(destination: Path, payload: bytes) -> None:

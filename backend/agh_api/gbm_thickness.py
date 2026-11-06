@@ -430,6 +430,7 @@ def gbm_thickness_distribution_from_geometry(
     pixel_size_x_um: float,
     pixel_size_y_um: float | None = None,
     expansion_factor: float = 1.0,
+    sample_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """All full-mask centerline diameters, losslessly encoded as value/count pairs.
 
@@ -443,12 +444,16 @@ def gbm_thickness_distribution_from_geometry(
         geometry.nearest_background_dy_pixels.astype(np.float64) * size_y,
         geometry.nearest_background_dx_pixels.astype(np.float64) * size_x,
     ) / expansion
+    components = geometry.skeleton_component
+    if sample_mask is not None:
+        diameters = diameters[sample_mask]
+        components = components[sample_mask]
     values, counts = np.unique(diameters, return_counts=True)
     return {
         "valuesUm": values.tolist(),
         "counts": counts.tolist(),
         "sampleCount": int(diameters.size),
-        "borderSampleCount": int(np.isin(geometry.skeleton_component, geometry.border_components).sum()),
+        "borderSampleCount": int(np.isin(components, geometry.border_components).sum()),
         "coverage": "full-mask-centerline",
         "unit": "µm",
     }
@@ -461,6 +466,7 @@ def measure_gbm_thickness_from_geometry(
     pixel_size_x_um: float,
     pixel_size_y_um: float | None = None,
     expansion_factor: float = 1.0,
+    sample_mask: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Measure one ROI from a saved geometry artifact using NumPy only."""
     if not isinstance(geometry, ThicknessGeometry):
@@ -482,6 +488,14 @@ def measure_gbm_thickness_from_geometry(
             "No segmented GBM centerline lies inside this ROI. "
             "Draw a larger ROI that crosses predicted GBM."
     )
+    roi_sample_total = int(inside.sum())
+    if sample_mask is not None:
+        inside = inside & sample_mask
+        if not inside.any():
+            raise ValueError(
+                "All GBM centerline in this ROI is excluded by the cross-section "
+                "and thickness filters. Turn a filter off or mark the GBM as real."
+            )
 
     local_pixels = geometry.local_thickness_pixels[inside]
     dy_pixels = geometry.nearest_background_dy_pixels[inside].astype(np.float64)
@@ -508,6 +522,7 @@ def measure_gbm_thickness_from_geometry(
         "efAdjustedMeanThicknessUm": float(np.mean(corrected_um)),
         "unit": "µm",
         "sampleCount": sample_count,
+        "roiSampleTotal": roi_sample_total,
         "measurement_method": (
             "2 * full-mask nearest-background EDT vector, skeleton-pixel mean "
             "at centerline samples inside ROI"
