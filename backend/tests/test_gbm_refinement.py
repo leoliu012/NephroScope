@@ -47,8 +47,198 @@ def z_mip(volume: np.ndarray, z: int, planes: int = 5) -> tuple[np.ndarray, list
     return volume[window].any(axis=0), window
 
 
+def speckle(size: int, seed: int = 0) -> np.ndarray:
+    """Fine structure with no particular direction, as tissue shows between GBM walls."""
+    from scipy.ndimage import gaussian_filter
+
+    field = gaussian_filter(np.random.default_rng(seed).normal(size=(size, size)), 3.0)
+    return (field - field.min()) / np.ptp(field)
+
+
+def moved(image: np.ndarray, registration: np.ndarray) -> np.ndarray:
+    """``image`` as it appears in a plane with this registration."""
+    from scipy.ndimage import affine_transform
+
+    inverse = np.linalg.inv(registration[:, :2])
+    return affine_transform(image, inverse, offset=-inverse @ registration[:, 2], order=1, mode="reflect")
+
+
+def field_registration(z: int, size: int, slide=(0.0, 0.0), scale: float = 0.0) -> np.ndarray:
+    """A steady slide and change of magnification about mid-field, ``z`` planes on."""
+    gain = 1.0 + scale * z
+    middle = size / 2.0
+    return np.array([
+        [gain, 0.0, middle + slide[0] * z - gain * middle],
+        [0.0, gain, middle + slide[1] * z - gain * middle],
+    ])
+
+
 @unittest.skipUnless(HAS_RUNTIME, "scipy and scikit-image are required")
-class RefinementApiTests(unittest.TestCase):
+class FieldMotionTests(unittest.TestCase):
+    SIZE = 800
+    PLANES = 25
+
+    def raw_stack(self, **motion) -> np.ndarray:
+        base = speckle(self.SIZE)
+        return np.stack([
+            (moved(base, field_registration(z, self.SIZE, **motion)) * 4000).astype(np.uint16) for z in range(self.PLANES)
+        ])
+
+    def test_coordinates_survive_the_round_trip(self):
+        from agh_api.gbm_cross_section import to_plane, to_shared
+
+        registration = field_registration(30, 500, slide=(1.0, -2.0), scale=0.002)
+        y, x = np.array([0.0, 120.0]), np.array([499.0, 30.0])
+        back_y, back_x = to_shared(registration, *to_plane(registration, y, x))
+        np.testing.assert_allclose(back_y, y)
+        np.testing.assert_allclose(back_x, x)
+
+    def test_a_still_field_reads_as_no_motion_at_all(self):
+        from agh_api.gbm_cross_section import estimate_field_motion
+
+        stack = self.raw_stack()
+        motion = estimate_field_motion(lambda z: stack[z], 0, self.PLANES - 1)
+        self.assertEqual(motion.px_per_plane().max(), 0.0)
+        np.testing.assert_array_equal(motion.at(7.0), np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+
+    def test_a_slide_is_measured(self):
+        from agh_api.gbm_cross_section import estimate_field_motion
+
+        stack = self.raw_stack(slide=(-0.5, 2.5))
+        motion = estimate_field_motion(lambda z: stack[z], 0, self.PLANES - 1)
+        expected = field_registration(self.PLANES - 1, self.SIZE, slide=(-0.5, 2.5))
+        np.testing.assert_allclose(motion.at(self.PLANES - 1.0)[:, 2], expected[:, 2], atol=1.5)
+        self.assertAlmostEqual(float(np.median(motion.px_per_plane())), float(np.hypot(0.5, 2.5)), delta=0.25)
+
+    def test_a_change_of_magnification_is_measured(self):
+        from agh_api.gbm_cross_section import estimate_field_motion, to_plane
+
+        stack = self.raw_stack(scale=0.0025)
+        motion = estimate_field_motion(lambda z: stack[z], 0, self.PLANES - 1)
+        expected = field_registration(self.PLANES - 1, self.SIZE, scale=0.0025)
+        self.assertAlmostEqual(motion.at(self.PLANES - 1.0)[0, 0], expected[0, 0], delta=0.004)
+        # Mid-field stays put, and a corner lands within a couple of pixels of where it should.
+        y, x = to_plane(motion.at(self.PLANES - 1.0), 0.0, 0.0)
+        wanted_y, wanted_x = to_plane(expected, 0.0, 0.0)
+        self.assertAlmostEqual(float(y), float(wanted_y), delta=2.5)
+        self.assertAlmostEqual(float(x), float(wanted_x), delta=2.5)
+
+    def test_one_oblique_sheet_is_not_taken_for_the_whole_field_moving(self):
+        from agh_api.gbm_cross_section import estimate_field_motion
+
+        stack = self.raw_stack().astype(np.float64)
+        yy, xx = np.mgrid[:self.SIZE, :self.SIZE]
+        for z in range(self.PLANES):
+            # A bright sheet crossing part of the field, moving 3 px per plane by itself.
+            sheet = np.exp(-((xx - 120 - 3.0 * z) / 12.0) ** 2) * (yy < 300)
+            stack[z] += 30000.0 * sheet
+        motion = estimate_field_motion(lambda z: stack[z], 0, self.PLANES - 1)
+        self.assertLess(float(np.median(motion.px_per_plane())), 0.3)
+
+    def test_where_the_tissue_ends_the_movement_carries_on(self):
+        from agh_api.gbm_cross_section import estimate_field_motion
+
+        stack = self.raw_stack(slide=(0.0, 2.0))
+        noise = np.random.default_rng(1)
+        for z in range(self.PLANES - 6, self.PLANES):
+            stack[z] = noise.integers(0, 50, size=(self.SIZE, self.SIZE), dtype=np.uint16)
+        motion = estimate_field_motion(lambda z: stack[z], 0, self.PLANES - 1)
+        self.assertLess(float(motion.px_per_plane().max()), 3.0)
+        self.assertAlmostEqual(float(motion.at(self.PLANES - 1.0)[1, 2]), 2.0 * (self.PLANES - 1), delta=4.0)
+
+    def test_a_blank_stack_cannot_be_measured(self):
+        from agh_api.gbm_cross_section import estimate_field_motion
+
+        self.assertIsNone(estimate_field_motion(lambda z: np.zeros((200, 200), np.uint16), 0, 8))
+        self.assertIsNone(estimate_field_motion(lambda z: np.zeros((200, 200), np.uint16), 3, 3))
+
+    def scene(self, **motion):
+        """A wall vertical through the stack, a wall tilted 40 degrees, and a field that moves."""
+        from agh_api.gbm_cross_section import StackPlane, to_shared
+        from agh_api.gbm_thickness import prepare_thickness_geometry
+
+        size, count = 700, 31
+        yy, xx = np.mgrid[:size, :size].astype(np.float64)
+        shift = Z_STEP_UM / PIXEL_UM * np.tan(np.radians(40.0))
+        half_width = 12.0 / np.cos(np.radians(40.0))
+        planes, registrations = [], []
+        for z in range(count):
+            registration = field_registration(z, size, **motion)
+            y, x = to_shared(registration, yy, xx)
+            mask = (np.abs(x - 180) < 12) | (np.abs(x - 480 - shift * (z - count // 2)) < half_width)
+            planes.append((z, mask, prepare_thickness_geometry(mask)))
+            registrations.append(registration)
+        return [StackPlane(z, float(z), mask, geometry) for z, mask, geometry in planes], registrations, count // 2
+
+    def tilts(self, planes, registrations, middle, registered):
+        from agh_api.gbm_cross_section import StackPlane, analyze_stack, classify_pieces, FilterSettings, to_shared
+
+        stack = [
+            StackPlane(plane.z_index, plane.center, plane.mask, plane.geometry, registrations[index] if registered else None)
+            for index, plane in enumerate(planes)
+        ]
+        analysis = analyze_stack(stack)[middle]
+        decided = classify_pieces(analysis, FilterSettings(thickness_limits=False), pixel_size_um=PIXEL_UM, z_step_um=Z_STEP_UM)
+        _, x = to_shared(registrations[middle], analysis.piece_center_y, analysis.piece_center_x)
+        vertical = x < 330
+        kept = decided["reasons"] == 0
+        return (
+            float(np.nanmedian(decided["tilt_deg"][vertical])), float(kept[vertical].mean()),
+            float(np.nanmedian(decided["tilt_deg"][~vertical])), float(kept[~vertical].mean()),
+        )
+
+    def test_a_slide_does_not_read_as_tilt_once_planes_are_in_register(self):
+        planes, registrations, middle = self.scene(slide=(0.0, 3.0))
+        tilt, kept, _, _ = self.tilts(planes, registrations, middle, registered=False)
+        self.assertGreater(tilt, 25.0)  # The fault being fixed: a vertical wall reads as tilted.
+        tilt, kept, oblique_tilt, oblique_kept = self.tilts(planes, registrations, middle, registered=True)
+        self.assertLess(tilt, 3.0)
+        self.assertGreater(kept, 0.95)
+        self.assertAlmostEqual(oblique_tilt, 40.0, delta=3.0)
+        self.assertLess(oblique_kept, 0.05)
+
+    def test_a_change_of_magnification_does_not_read_as_tilt_once_planes_are_in_register(self):
+        planes, registrations, middle = self.scene(scale=0.003)
+        tilt, _, _, _ = self.tilts(planes, registrations, middle, registered=False)
+        self.assertGreater(tilt, 5.0)  # This wall is close to mid-field, where the effect is smallest.
+        tilt, kept, oblique_tilt, oblique_kept = self.tilts(planes, registrations, middle, registered=True)
+        self.assertLess(tilt, 3.0)
+        self.assertGreater(kept, 0.95)
+        self.assertAlmostEqual(oblique_tilt, 40.0, delta=4.0)
+        self.assertLess(oblique_kept, 0.05)
+
+    def test_being_in_register_with_no_motion_changes_nothing(self):
+        planes, registrations, middle = self.scene()
+        self.assertEqual(
+            self.tilts(planes, registrations, middle, registered=False),
+            self.tilts(planes, registrations, middle, registered=True),
+        )
+
+    def test_a_correction_on_another_plane_follows_the_sample(self):
+        from types import SimpleNamespace
+
+        from agh_api.gbm_cross_section import FieldMotion
+        from agh_api.gbm_refinement import _local_limits
+
+        # The sample moves 30 px per plane, so what was at x=100 in plane 0 is at x=160 in plane 2.
+        motion = FieldMotion(
+            np.array([0.0, 4.0]),
+            np.array([[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[1.0, 0.0, 0.0], [0.0, 1.0, 120.0]]]),
+            (500, 500),
+        )
+        analysis = SimpleNamespace(
+            piece_samples=np.array([10, 10]), piece_center_x=np.array([160.0, 40.0]), piece_center_y=np.array([200.0, 200.0]),
+        )
+        edit = {"kind": "include", "x": 100.0, "y": 200.0, "zIndex": 0, "payload": {"tiltDeg": 50.0}}
+        moved_limit, _ = _local_limits(analysis, 20.0, [edit], 2, PIXEL_UM, None, 10.0, motion)
+        still_limit, _ = _local_limits(analysis, 20.0, [edit], 2, PIXEL_UM, None, 10.0, None)
+        self.assertGreater(moved_limit[0], moved_limit[1])  # It reaches the same place in the sample.
+        self.assertEqual(still_limit[0], still_limit[1])    # Ignoring motion, both are 60 px away.
+
+
+class StackFixture(unittest.TestCase):
+    """A saved prediction for every other plane of ``scene_volume``, on a raw stack."""
+
     calibration = {"pixelSizeXUm": PIXEL_UM, "pixelSizeYUm": PIXEL_UM, "expansionEnabled": False, "expansionFactor": 1}
     filter = {"crossSection": True, "thicknessLimits": True, "minNm": 30, "maxNm": 3400, "zStepUm": Z_STEP_UM}
 
@@ -64,7 +254,7 @@ class RefinementApiTests(unittest.TestCase):
         data = base / "data"
         (data / "case1").mkdir(parents=True)
         self.path = data / "case1" / "stack.tif"
-        tifffile.imwrite(self.path, np.zeros((1, PLANES, SIZE, SIZE), dtype=np.uint16), metadata={"axes": "CZYX"})
+        tifffile.imwrite(self.path, self.raw_volume()[None], metadata={"axes": "CZYX"})
         checkpoint = base / "model.pt"
         checkpoint.write_bytes(b"synthetic test checkpoint")
         self.config = Config(
@@ -79,7 +269,7 @@ class RefinementApiTests(unittest.TestCase):
         self.client = self.app.test_client()
         self.store = self.app.extensions["agh_analysis"]["store"]
 
-        volume = scene_volume()
+        volume = self.mask_volume()
         self.runs = {}
         # A faint GBM-like line the model left below its threshold.
         yy, xx = np.mgrid[:SIZE, :SIZE]
@@ -102,6 +292,12 @@ class RefinementApiTests(unittest.TestCase):
             })
             self.runs[z] = run["runId"]
         self.middle = self.runs[12]
+
+    def raw_volume(self) -> np.ndarray:
+        return np.zeros((PLANES, SIZE, SIZE), dtype=np.uint16)
+
+    def mask_volume(self) -> np.ndarray:
+        return scene_volume()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -143,6 +339,59 @@ class RefinementApiTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, status, response.get_json())
         return response.get_json()
+
+
+@unittest.skipUnless(HAS_RUNTIME, "scipy and scikit-image are required")
+class MovingStackApiTests(StackFixture):
+    """The vertical tube of ``scene_volume``, with the whole field sliding through the stack."""
+
+    SLIDE = (0.0, 2.5)
+
+    def raw_volume(self) -> np.ndarray:
+        base = speckle(SIZE)
+        return np.stack([(moved(base, field_registration(z, SIZE, slide=self.SLIDE)) * 4000).astype(np.uint16) for z in range(PLANES)])
+
+    def mask_volume(self) -> np.ndarray:
+        yy, xx = np.mgrid[:SIZE, :SIZE]
+        return np.stack([
+            np.abs(np.hypot(yy - RING[0] - 70 - self.SLIDE[0] * z, xx - RING[1] - 70 - self.SLIDE[1] * z) - RING[2]) < THICKNESS_PX / 2
+            for z in range(PLANES)
+        ])
+
+    def test_a_sliding_stack_is_measured_from_its_raw_planes_and_reports_it(self):
+        self.distribution()
+        result = self.run_stack_job()
+        self.assertTrue(result["fieldMotion"]["measured"])
+        self.assertTrue(result["fieldMotion"]["corrected"])
+        self.assertAlmostEqual(result["fieldMotion"]["medianPxPerPlane"], 2.5, delta=0.5)
+        view = self.refinement()
+        self.assertTrue(view["stack"]["fieldMotion"]["corrected"])
+        self.assertNotIn("registration", view["stack"]["fieldMotion"])
+        tilt = np.asarray([np.nan if value is None else value for value in view["pieces"]["tiltDeg"]], dtype=float)
+        self.assertLess(np.nanmedian(tilt), 10.0)
+        self.assertGreater(view["summary"]["keptSamples"], 0.8 * view["summary"]["totalSamples"])
+
+    def test_a_stack_that_cannot_be_read_is_still_analysed_and_says_so(self):
+        from unittest import mock
+
+        self.distribution()
+        with mock.patch("agh_api.tiff_service.read_channel_plane", side_effect=OSError("gone")):
+            result = self.run_stack_job()
+        self.assertFalse(result["fieldMotion"]["measured"])
+        self.assertFalse(result["fieldMotion"]["corrected"])
+        self.assertEqual(self.refinement()["stack"]["fieldMotion"]["measured"], False)
+
+
+@unittest.skipUnless(HAS_RUNTIME, "scipy and scikit-image are required")
+class RefinementApiTests(StackFixture):
+    def test_a_stack_with_nothing_to_register_is_analysed_and_says_so(self):
+        self.distribution()
+        result = self.run_stack_job()
+        self.assertFalse(result["fieldMotion"]["measured"])
+        self.assertFalse(result["fieldMotion"]["corrected"])
+        stack = self.refinement()["stack"]
+        self.assertEqual(stack["fieldMotion"]["measured"], False)
+        self.assertNotIn("registration", stack["fieldMotion"])
 
     def test_measurements_are_pending_until_the_stack_analysis_finishes(self):
         raw = self.distribution(filter=None)

@@ -58,10 +58,14 @@ from .gbm_cross_section import (
     SAMPLE_OK,
     FilterSettings,
     PlaneAnalysis,
+    FieldMotion,
     StackPlane,
     analyze_stack,
     build_pieces,
     classify_pieces,
+    estimate_field_motion,
+    to_plane,
+    to_shared,
 )
 from .gbm_thickness import ThicknessGeometry, load_thickness_geometry, thickness_geometry_to_arrays
 from .path_guard import image_path
@@ -324,14 +328,16 @@ def execute_stack_analysis(config, job: dict, *, progress=None, before_publish=N
             fraction = float(np.clip(fraction, 0.0, 1.0))
             progress({"stage": "stack", "fraction": fraction, "percent": round(fraction * 100.0, 1), "message": message})
 
+    motion, measured = _measure_field_motion(config, job, members, lambda fraction, message: report(0.08 * fraction, message))
     planes = []
     for index, member in enumerate(members):
         geometry = load_thickness_geometry(thickness_geometry_path(
             config.analysis_root, member["runId"], attempt=member.get("attempt"),
         ))
         mask = read_mask(config.analysis_root, member["runId"], attempt=member.get("attempt"))
-        planes.append(StackPlane(int(member["zIndex"]), float(member["center"]), mask, geometry))
-        report(0.1 * (index + 1) / len(members), "Reading saved Z predictions")
+        registration = motion.at(float(member["center"])) if motion is not None else None
+        planes.append(StackPlane(int(member["zIndex"]), float(member["center"]), mask, geometry, registration))
+        report(0.08 + 0.02 * (index + 1) / len(members), "Reading saved Z predictions")
 
     started = time.monotonic()
     results = analyze_stack(
@@ -361,7 +367,56 @@ def execute_stack_analysis(config, job: dict, *, progress=None, before_publish=N
         "planes": len(planes),
         "window": int(request.get("window") or DEFAULT_MAX_WINDOW),
         "medianReachPlanes": float(np.median(reach_all)) if reach_all.size else 0.0,
+        "fieldMotion": _motion_summary(motion, measured),
     }
+
+
+def _measure_field_motion(config, job: dict, members: list[dict], progress) -> tuple[FieldMotion | None, bool]:
+    """How the field moved through this stack, and whether that could be measured.
+
+    Tilt can still be measured without it, and is only wrong on stacks where the field
+    moves, so a stack that cannot be read is not a reason to fail. The result says so instead.
+    """
+    if len(members) < 2:
+        return None, True
+    from .tiff_service import read_channel_plane
+
+    centers = [float(member["center"]) for member in members]
+    try:
+        path = image_path(config.active_data_root, job["case"], job["filename"])
+        channel = int(job["request"]["channelIndex"])
+        motion = estimate_field_motion(
+            lambda z: read_channel_plane(path, channel, z), math.floor(min(centers)), math.ceil(max(centers)), progress=progress,
+        )
+    except Exception:
+        log.warning("Could not measure field motion for stack analysis %s", job.get("runId"), exc_info=True)
+        return None, False
+    return motion, motion is not None
+
+
+def _motion_summary(motion: FieldMotion | None, measured: bool) -> dict:
+    """What a saved analysis keeps about field motion: enough to report it and to use it."""
+    rates = motion.px_per_plane() if motion is not None else np.empty(0)
+    return {
+        "measured": bool(measured),
+        "corrected": bool(rates.size and rates.max() > 0.0),
+        "medianPxPerPlane": round(float(np.median(rates)), 3) if rates.size else 0.0,
+        "maxPxPerPlane": round(float(rates.max()), 3) if rates.size else 0.0,
+        "z": [] if motion is None else [float(value) for value in motion.z],
+        "registration": [] if motion is None else [[round(float(value), 6) for value in row] for row in motion.registration.reshape(motion.z.size, -1)],
+        "shape": [] if motion is None else [int(size) for size in motion.shape],
+    }
+
+
+def _saved_motion(stack_run: dict | None) -> FieldMotion | None:
+    saved = ((stack_run or {}).get("result") or {}).get("fieldMotion") or {}
+    if not saved.get("corrected"):
+        return None
+    return FieldMotion(
+        np.asarray(saved["z"], dtype=np.float64),
+        np.asarray(saved["registration"], dtype=np.float64).reshape(-1, 2, 3),
+        tuple(saved["shape"]),
+    )
 
 
 def resolve_z_step(config, run: dict, override: float | None) -> dict:
@@ -405,10 +460,13 @@ def _nearest_sample(geometry: ThicknessGeometry, x: float, y: float) -> tuple[in
 
 def _local_limits(
     analysis: PlaneAnalysis, base_limit: float | None, edits: list[dict], z_index: int, pixel_size_um: float, z_step_um: float | None, reference_px: float,
+    motion: FieldMotion | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray]:
     """Per-piece tilt limit and vouched-for reasons from nearby corrections.
 
-    With no Z step there is no angle to adjust, so only the reasons carry over.
+    With no Z step there is no angle to adjust, so only the reasons carry over. A
+    correction made on another plane reaches the same place in the sample, which
+    field motion may have moved in this plane.
     """
     count = analysis.piece_samples.size
     field_ = None if base_limit is None else np.full(count, float(base_limit))
@@ -425,7 +483,10 @@ def _local_limits(
             continue
         payload = edit.get("payload") or {}
         tilt = payload.get("tiltDeg")
-        distance2 = (x - edit["x"]) ** 2 + (y - edit["y"]) ** 2 + ((z_index - edit["zIndex"]) * axial) ** 2
+        edit_x, edit_y = float(edit["x"]), float(edit["y"])
+        if motion is not None:
+            edit_y, edit_x = to_plane(motion.at(float(z_index)), *to_shared(motion.at(float(edit["zIndex"])), edit_y, edit_x))
+        distance2 = (x - edit_x) ** 2 + (y - edit_y) ** 2 + ((z_index - edit["zIndex"]) * axial) ** 2
         weight = np.nan_to_num(np.exp(-distance2 / (2.0 * radius * radius)))
         weight[weight < CORRECTION_MIN_WEIGHT] = 0.0
         if tilt is not None and field_ is not None:
@@ -752,7 +813,9 @@ def decide(view: PlaneView, settings: FilterSettings, calibration: dict, z_step:
         mip_planes=mip_planes, plane_step=plane_step,
     )
     first = classify_pieces(analysis, settings, pixel_size_um=pixel, z_step_um=z_step["um"], expansion_factor=expansion)
-    field_, trusted = _local_limits(analysis, first["limit_deg"], view.all_edits, z_index, pixel, z_step["um"], first["reference_px"])
+    field_, trusted = _local_limits(
+        analysis, first["limit_deg"], view.all_edits, z_index, pixel, z_step["um"], first["reference_px"], _saved_motion(view.stack_run),
+    )
     result = classify_pieces(
         analysis, settings, pixel_size_um=pixel, z_step_um=z_step["um"], expansion_factor=expansion,
         tilt_limit_field=field_, trusted_reasons=trusted,
@@ -949,6 +1012,12 @@ def refinement_frames(config, store, runs: dict[str, dict], settings: FilterSett
     return {"frames": frames, "reasonNames": {str(code): name for code, name in REASON_NAMES.items()}}
 
 
+def _public_motion(saved: dict | None) -> dict | None:
+    if saved is None:
+        return None
+    return {name: saved.get(name) for name in ("measured", "corrected", "medianPxPerPlane", "maxPxPerPlane")}
+
+
 def _public_state(state: dict) -> dict:
     usable = state.get("usable") or {}
     result = usable.get("result") or {}
@@ -961,6 +1030,7 @@ def _public_state(state: dict) -> dict:
         "job": state.get("job"),
         "analysedPlanes": result.get("planes"),
         "medianReachPlanes": result.get("medianReachPlanes"),
+        "fieldMotion": _public_motion(result.get("fieldMotion")),
     }
 
 

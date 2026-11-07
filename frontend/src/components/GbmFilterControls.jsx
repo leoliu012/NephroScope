@@ -97,6 +97,8 @@ export default function GbmFilterControls({
       </div>
       {!settings.windowAuto && <NumberField label="Up to ±" unit="Z" min={1} max={200} value={settings.window} onCommit={value => patch({ window: value ?? DEFAULT_FILTER_SETTINGS.window })} />}
       {Number.isFinite(stack?.medianReachPlanes) && stack.medianReachPlanes > 0 && <p className="gf-note">Each point measures its own range; here the median reached ±{Math.round(stack.medianReachPlanes)} Z.</p>}
+      {stack?.fieldMotion?.corrected && <p className="gf-note">The whole field moved between Z, up to {Number(stack.fieldMotion.maxPxPerPlane.toPrecision(2))} px per Z. This was removed before measuring tilt.</p>}
+      {stack?.fieldMotion?.measured === false && <p className="gf-note gf-warning">Whole-field movement could not be measured for this stack, so tilt may read too high if the stage slid or focus changed the magnification.</p>}
       {onZStepOverride && view?.pieces && <div className="gf-row">
         <span>Z step</span>
         <span className="gf-value">{zStepText(view?.zStep)}</span>
