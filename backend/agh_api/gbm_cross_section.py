@@ -22,6 +22,15 @@ displacement along its own normal is recorded per plane:
   than its own thickness, so every piece measures its own usable Z window.
 * The fit reports its standard error, so uncertain slopes carry less weight.
 
+The whole field can also move between planes for reasons that have nothing to do with
+the sheet. The stage or sample can slide during acquisition, and focusing can change the
+magnification, which moves everything radially from the optical axis. Either would read
+as tilt, because a piece's displacement along its normal gains that movement projected on
+the normal. So it is measured first, from the raw planes (``estimate_field_motion``), and
+planes are compared in register. The 5-plane projection each mask was predicted from is
+still smeared by this movement; correcting that would mean predicting again from
+registered planes.
+
 Everything is stored in pixels per plane, so changing the pixel size or Z step
 later needs no recomputation (``tan θ = stored * pixel_size / z_step``).
 
@@ -46,7 +55,7 @@ import numpy as np
 
 from .gbm_thickness import ThicknessGeometry
 
-ALGORITHM_VERSION = "gbm-cross-section-v2"
+ALGORITHM_VERSION = "gbm-cross-section-v3"
 MIP_PLANES = 5
 DEFAULT_MAX_WINDOW = 30
 EN_FACE_TILT_DEG = 60.0
@@ -67,6 +76,23 @@ SLOPE_MIN_WINDOW_PLANES = 4.0
 CHORD_TOLERANCE_FRACTION = 0.15
 CHORD_MAX_MISSES = 1
 
+# Field motion is measured between raw planes this far apart, in tiles of the field. Its
+# shape is the same at any Z step, so this is in planes rather than micrometres.
+MOTION_BASELINE_PLANES = 2
+MOTION_DOWNSAMPLE = 2
+MOTION_UPSAMPLE = 8
+MOTION_TILES_PER_SIDE = 4
+MOTION_FIT_ITERATIONS = 6
+MOTION_MIN_TILES = 8
+# How far tiles may scatter around the fit, over one baseline: below the first, scatter is
+# only the registration's own resolution, and past the second there is no shared movement.
+MOTION_MIN_SPREAD_PX = 0.25
+MOTION_MAX_SPREAD_PX = 2.0
+MOTION_SMOOTH_STEPS = 5
+# Below this anywhere in the field, motion is not told apart from registration noise (about
+# 2 degrees at a 0.1 µm pixel and 0.3 µm Z step), so a stack that does not move stays as it is.
+MOTION_MIN_PX_PER_PLANE = 0.1
+
 SAMPLE_OK = 0
 SAMPLE_TAPER = 1
 SAMPLE_SPUR = 2
@@ -75,12 +101,17 @@ SAMPLE_JUNCTION = 3
 
 @dataclass
 class StackPlane:
-    """One saved prediction: its plane, Z projection centre, mask and geometry."""
+    """One saved prediction: its plane, Z projection centre, mask and geometry.
+
+    ``registration`` is a 2 x 3 matrix taking ``(y, x, 1)`` in a frame shared by the
+    whole stack to ``(y, x)`` in this plane. ``None`` means the two are the same.
+    """
 
     z_index: int
     center: float
     mask: np.ndarray
     geometry: ThicknessGeometry
+    registration: np.ndarray | None = None
 
 
 @dataclass
@@ -185,6 +216,193 @@ class PlaneAnalysis:
         )
 
 
+IDENTITY_REGISTRATION = np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+
+
+def to_plane(registration: np.ndarray, y, x) -> tuple[np.ndarray, np.ndarray]:
+    """Shared-frame coordinates in the plane with this registration."""
+    m = registration
+    return m[0, 0] * y + m[0, 1] * x + m[0, 2], m[1, 0] * y + m[1, 1] * x + m[1, 2]
+
+
+def to_shared(registration: np.ndarray, y, x) -> tuple[np.ndarray, np.ndarray]:
+    """Coordinates in the plane with this registration, in the shared frame."""
+    m = registration
+    dy, dx = y - m[0, 2], x - m[1, 2]
+    determinant = m[0, 0] * m[1, 1] - m[0, 1] * m[1, 0]
+    return (m[1, 1] * dy - m[0, 1] * dx) / determinant, (m[0, 0] * dx - m[1, 0] * dy) / determinant
+
+
+@dataclass
+class FieldMotion:
+    """How the whole field moved through a stack.
+
+    ``registration[i]`` takes the shared frame, which is the first plane sampled, to
+    plane ``z[i]``. ``shape`` is the size of the field it was measured on.
+    """
+
+    z: np.ndarray
+    registration: np.ndarray
+    shape: tuple[int, int]
+
+    def at(self, center: float) -> np.ndarray:
+        """Registration of a plane at this Z, which need not have been sampled."""
+        steps = self.registration.reshape(self.z.size, -1)
+        values = [np.interp(center, self.z, steps[:, column]) for column in range(steps.shape[1])]
+        return np.asarray(values, dtype=np.float64).reshape(2, 3)
+
+    def px_per_plane(self) -> np.ndarray:
+        """Largest movement anywhere in the field between each pair of sampled planes."""
+        if self.z.size < 2:
+            return np.empty(0)
+        height, width = self.shape
+        corners_y = np.asarray([0.0, 0.0, height, height])
+        corners_x = np.asarray([0.0, width, 0.0, width])
+        rates = []
+        for index in range(self.z.size - 1):
+            # The corners, as they appear in the earlier plane, moved to the later one.
+            y0, x0 = to_shared(self.registration[index], corners_y, corners_x)
+            y1, x1 = to_plane(self.registration[index + 1], y0, x0)
+            rates.append(np.hypot(y1 - corners_y, x1 - corners_x).max() / (self.z[index + 1] - self.z[index]))
+        return np.asarray(rates)
+
+
+def _motion_plane(plane: np.ndarray) -> np.ndarray | None:
+    """A plane ready to register, or ``None`` if there is nothing in it to register."""
+    low_resolution = np.asarray(plane, dtype=np.float32)[::MOTION_DOWNSAMPLE, ::MOTION_DOWNSAMPLE]
+    low, high = np.percentile(low_resolution, (1.0, 99.7))
+    if not high > low:
+        return None
+    return np.clip((low_resolution - low) / (high - low), 0.0, 1.0)
+
+
+def _tile_shifts(reference: np.ndarray, moving: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Tile centres, and where each tile of ``reference`` appears in ``moving``, in full-resolution pixels.
+
+    Phase correlation weighs fine structure, which sits still unless the field moves, over
+    large bright bodies, which change shape through Z and pull a plain correlation with them.
+    """
+    from skimage.registration import phase_cross_correlation
+
+    height, width = reference.shape
+    tiles = MOTION_TILES_PER_SIDE
+    centers, shifts = [], []
+    window = None
+    for row in range(tiles):
+        for column in range(tiles):
+            area = (
+                slice(row * height // tiles, (row + 1) * height // tiles),
+                slice(column * width // tiles, (column + 1) * width // tiles),
+            )
+            first, second = reference[area], moving[area]
+            if first.std() < 1e-3 or second.std() < 1e-3:
+                continue
+            if window is None or window.shape != first.shape:
+                window = np.outer(np.hanning(first.shape[0]), np.hanning(first.shape[1])).astype(np.float32)
+            shift, _, _ = phase_cross_correlation(
+                (first - first.mean()) * window, (second - second.mean()) * window,
+                upsample_factor=MOTION_UPSAMPLE, normalization="phase",
+            )
+            # phase_cross_correlation says how to move ``moving`` back onto ``reference``.
+            shifts.append(-np.asarray(shift, dtype=np.float64) * MOTION_DOWNSAMPLE)
+            centers.append(((area[0].start + area[0].stop) * 0.5 * MOTION_DOWNSAMPLE, (area[1].start + area[1].stop) * 0.5 * MOTION_DOWNSAMPLE))
+    return np.asarray(centers, dtype=np.float64).reshape(-1, 2), np.asarray(shifts, dtype=np.float64).reshape(-1, 2)
+
+
+def _fit_field_motion(centers: np.ndarray, shifts: np.ndarray, middle: tuple[float, float]) -> np.ndarray | None:
+    """Fit ``shift = (ty, tx) + scale * r + rotation * r_perp``, robustly, with r from mid-field.
+
+    Returned as ``(ty, tx, scale, rotation)``, or ``None`` when the tiles do not agree on any
+    such movement, as happens where the tissue ends. A rigid slide and a change of
+    magnification are all this allows, because a freer fit would start to absorb real
+    tissue geometry. A tile that disagrees, as one showing a large oblique sheet does,
+    loses its weight entirely.
+    """
+    count = centers.shape[0]
+    if count < MOTION_MIN_TILES:
+        return None
+    ry, rx = centers[:, 0] - middle[0], centers[:, 1] - middle[1]
+    reach = max(float(np.abs(ry).max()), float(np.abs(rx).max()), 1.0)
+    design = np.zeros((2 * count, 4))
+    design[:count, 0] = 1.0
+    design[count:, 1] = 1.0
+    # In units of the field's size, so the four parameters are of similar size to the solver.
+    design[:count, 2], design[count:, 2] = ry / reach, rx / reach
+    design[:count, 3], design[count:, 3] = -rx / reach, ry / reach
+    target = np.concatenate([shifts[:, 0], shifts[:, 1]])
+    solution = np.array([np.median(shifts[:, 0]), np.median(shifts[:, 1]), 0.0, 0.0])
+    spread = 0.0
+    for _ in range(MOTION_FIT_ITERATIONS):
+        residual = target - design @ solution
+        spread = max(1.4826 * float(np.median(np.abs(residual))), MOTION_MIN_SPREAD_PX)
+        scaled = residual / (4.685 * spread)
+        weights = np.where(np.abs(scaled) < 1.0, (1.0 - scaled ** 2) ** 2, 0.0)
+        if np.count_nonzero(weights) < 2 * MOTION_MIN_TILES:
+            return None
+        root = np.sqrt(weights)
+        solution = np.linalg.lstsq(design * root[:, None], target * root, rcond=None)[0]
+    if spread > MOTION_MAX_SPREAD_PX:
+        return None
+    return solution / np.array([1.0, 1.0, reach, reach])
+
+
+def estimate_field_motion(read_plane, z_low: int, z_high: int, *, progress=None) -> FieldMotion | None:
+    """Measure how the whole field moves between ``z_low`` and ``z_high``.
+
+    ``read_plane(z)`` returns one raw plane. Single planes are used rather than Z
+    projections, because neighbouring projections share planes and those shared planes
+    pull the registration towards no movement at all. Returns ``None`` if the stack has
+    too little in it to measure.
+    """
+    z_low, z_high = int(z_low), int(z_high)
+    if z_high <= z_low:
+        return None
+    positions = list(range(z_low, z_high, MOTION_BASELINE_PLANES)) + [z_high]
+    rates = np.full((len(positions) - 1, 4), np.nan)
+    previous = None
+    shape = None
+    for index, z in enumerate(positions):
+        plane = read_plane(z)
+        shape = tuple(int(size) for size in np.shape(plane)[:2])
+        current = _motion_plane(plane)
+        if previous is not None and current is not None:
+            centers, shifts = _tile_shifts(previous, current)
+            fitted = _fit_field_motion(centers, shifts, (shape[0] * 0.5, shape[1] * 0.5))
+            if fitted is not None:
+                rates[index - 1] = fitted / float(z - positions[index - 1])
+        previous = current
+        if progress:
+            progress((index + 1) / len(positions), "Measuring field motion")
+    measured = np.isfinite(rates[:, 0])
+    if not measured.any():
+        return None
+    # A step with no agreement between its tiles carries on from the steps around it.
+    steps = np.arange(rates.shape[0])
+    for column in range(rates.shape[1]):
+        rates[:, column] = np.interp(steps, steps[measured], rates[measured, column])
+    # Movement is steady over a few planes, so a lone reading follows its neighbours.
+    smooth = np.zeros_like(rates)
+    reach = MOTION_SMOOTH_STEPS // 2
+    for step in steps:
+        smooth[step] = np.median(rates[max(0, step - reach):step + reach + 1], axis=0)
+    corner = math.hypot(shape[0] * 0.5, shape[1] * 0.5)
+    largest = np.hypot(smooth[:, 0], smooth[:, 1]) + np.hypot(smooth[:, 2], smooth[:, 3]) * corner
+    smooth[largest < MOTION_MIN_PX_PER_PLANE] = 0.0
+
+    middle_y, middle_x = shape[0] * 0.5, shape[1] * 0.5
+    registration = np.empty((len(positions), 2, 3))
+    registration[0] = IDENTITY_REGISTRATION
+    for step in range(rates.shape[0]):
+        ty, tx, scale, rotation = smooth[step] * float(positions[step + 1] - positions[step])
+        # p' = p + t + [scale, -rotation; rotation, scale] applied to p from mid-field.
+        linear = np.array([[1.0 + scale, -rotation], [rotation, 1.0 + scale]])
+        moved = np.array([middle_y + ty, middle_x + tx]) - linear @ np.array([middle_y, middle_x])
+        before = registration[step]
+        registration[step + 1, :, :2] = linear @ before[:, :2]
+        registration[step + 1, :, 2] = linear @ before[:, 2] + moved
+    return FieldMotion(np.asarray(positions, dtype=np.float64), registration, shape)
+
+
 def signed_distance(mask: np.ndarray, factor: int) -> np.ndarray:
     """Signed distance in full-resolution pixels: negative inside, positive outside."""
     from scipy.ndimage import distance_transform_edt
@@ -217,8 +435,12 @@ def _axial_chord(
     usable: np.ndarray,
     factor: int,
     typical_width: float,
+    registrations: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Length of the mask along Z through each medial point, per direction."""
+    """Length of the mask along Z through each medial point, per direction.
+
+    ``y`` and ``x`` are in the stack's shared frame, and ``registrations`` puts them in each plane.
+    """
     count = y.size
     # Bounded by the typical thickness: a wide patch must not gain a tolerance
     # large enough to reach a neighbouring wall.
@@ -230,7 +452,8 @@ def _axial_chord(
         alive = np.ones(count, dtype=bool)
         misses = np.zeros(count, dtype=np.int32)
         for index in planes:
-            inside = _probe(distance_fields[index], y, x, factor) <= tolerance
+            plane_y, plane_x = to_plane(registrations[index], y, x)
+            inside = _probe(distance_fields[index], plane_y, plane_x, factor) <= tolerance
             misses = np.where(inside, 0, misses + 1)
             ended = alive & (misses > CHORD_MAX_MISSES)
             open_ended[ended] = False
@@ -592,20 +815,49 @@ def _component_aspect(geometry: ThicknessGeometry, median_width: float) -> np.nd
     return (size / np.maximum(mean_width, 1.0))[component]
 
 
+def _registration_of(plane: StackPlane) -> np.ndarray:
+    return IDENTITY_REGISTRATION if plane.registration is None else np.asarray(plane.registration, dtype=np.float64)
+
+
 def _connected_3d(planes: Sequence[StackPlane]) -> tuple[list[np.ndarray], np.ndarray, np.ndarray]:
     """3D components of the stack, with their centerline sample count and Z span."""
     from scipy.ndimage import label as component_label
 
+    from scipy.ndimage import affine_transform
+
     factor = 4
-    volume = np.stack([np.asarray(plane.mask, dtype=bool)[::factor, ::factor] for plane in planes])
+    lowered = [np.asarray(plane.mask, dtype=bool)[::factor, ::factor] for plane in planes]
+    height, width = lowered[0].shape
+    registrations = np.asarray([_registration_of(plane) for plane in planes])
+    # In register, on a canvas large enough for every plane, at the masks' low resolution.
+    corners_y = np.asarray([0.0, 0.0, height * factor, height * factor])
+    corners_x = np.asarray([0.0, width * factor, 0.0, width * factor])
+    reached = [to_shared(registration, corners_y, corners_x) for registration in registrations]
+    origin_y = min(float(y.min()) for y, _ in reached)
+    origin_x = min(float(x.min()) for _, x in reached)
+    canvas = (
+        int(math.ceil((max(float(y.max()) for y, _ in reached) - origin_y) / factor)) + 1,
+        int(math.ceil((max(float(x.max()) for _, x in reached) - origin_x) / factor)) + 1,
+    )
+    volume = np.zeros((len(planes), *canvas), dtype=bool)
+    for index, mask in enumerate(lowered):
+        matrix = registrations[index]
+        if np.array_equal(matrix, IDENTITY_REGISTRATION) and origin_y == 0.0 and origin_x == 0.0:
+            volume[index, :height, :width] = mask
+            continue
+        # Canvas pixel -> shared frame -> plane -> low-resolution plane pixel.
+        linear = matrix[:, :2]
+        offset = (linear @ np.array([origin_y, origin_x]) + matrix[:, 2]) / factor
+        volume[index] = affine_transform(mask, linear, offset=offset, output_shape=canvas, order=0, mode="constant", cval=False, output=bool)
     labels, count = component_label(volume, structure=np.ones((3, 3, 3), dtype=np.uint8))
     samples = np.zeros(count + 1, dtype=np.int64)
     low = np.full(count + 1, np.inf)
     high = np.full(count + 1, -np.inf)
     per_plane = []
     for index, plane in enumerate(planes):
-        y = np.clip(plane.geometry.skeleton_y // factor, 0, volume.shape[1] - 1)
-        x = np.clip(plane.geometry.skeleton_x // factor, 0, volume.shape[2] - 1)
+        shared_y, shared_x = to_shared(registrations[index], plane.geometry.skeleton_y.astype(np.float64), plane.geometry.skeleton_x.astype(np.float64))
+        y = np.clip(((shared_y - origin_y) / factor).astype(np.int64), 0, canvas[0] - 1)
+        x = np.clip(((shared_x - origin_x) / factor).astype(np.int64), 0, canvas[1] - 1)
         ids = labels[index, y, x].astype(np.int64)
         per_plane.append(ids)
         if ids.size:
@@ -628,6 +880,7 @@ def analyze_stack(
     if not planes:
         return {}
     centers = np.asarray([plane.center for plane in planes], dtype=np.float64)
+    registrations = np.asarray([_registration_of(plane) for plane in planes])
     widths = [plane.geometry.local_thickness_pixels for plane in planes if plane.geometry.skeleton_y.size]
     median_width = float(np.median(np.concatenate(widths))) if widths else 0.0
     factor = working_factor(median_width) if median_width else 1
@@ -642,7 +895,11 @@ def analyze_stack(
         piece, artifact, edges = build_pieces(plane.geometry)
         built.append((piece, artifact, edges))
         clean = artifact == SAMPLE_OK
-        where = np.column_stack([plane.geometry.skeleton_x[clean], plane.geometry.skeleton_y[clean]]).astype(np.float64)
+        # Centerlines are compared across planes in the stack's shared frame.
+        shared_y, shared_x = to_shared(
+            registrations[index], plane.geometry.skeleton_y[clean].astype(np.float64), plane.geometry.skeleton_x[clean].astype(np.float64),
+        )
+        where = np.column_stack([shared_x, shared_y])
         positions.append(where)
         trees.append(cKDTree(where) if where.size else None)
         if progress:
@@ -668,11 +925,14 @@ def analyze_stack(
         reach = np.zeros(piece_count)
         track_planes = np.ones(piece_count)
         if usable.size and count:
-            up, down, open_up, open_down = _axial_chord(y, x, width, fields, relative, usable, factor, median_width)
+            shared_y, shared_x = to_shared(registrations[index], y.astype(np.float64), x.astype(np.float64))
+            up, down, open_up, open_down = _axial_chord(
+                shared_y, shared_x, width, fields, relative, usable, factor, median_width, registrations,
+            )
             chord_planes, censored = _chord_planes(up, down, open_up, open_down)
             tan_chord = width / np.maximum(chord_planes, 1.0)
             track_width = np.where(np.isfinite(piece_width), piece_width, median_width)
-            displacement = _track_pieces(x, y, piece, piece_count, track_width, trees, positions, relative, usable)
+            displacement = _track_pieces(shared_x, shared_y, piece, piece_count, track_width, trees, positions, relative, usable)
             half_window = np.clip(
                 np.maximum(SLOPE_WINDOW_FRACTION * track_width, max(SLOPE_MIN_WINDOW_PLANES, 2.0 * spacing) + 1.0),
                 1.0, float(max_window) + 1.0,
@@ -1044,8 +1304,12 @@ def classify_pieces(
 
 __all__ = [name for name in globals() if name.isupper()] + [
     "PlaneAnalysis",
+    "FieldMotion",
     "StackPlane",
     "analyze_stack",
     "build_pieces",
+    "estimate_field_motion",
     "signed_distance",
+    "to_plane",
+    "to_shared",
 ]

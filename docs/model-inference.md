@@ -116,6 +116,39 @@ A sheet of thickness `t` tilted by `θ` from vertical looks wider in one plane
 how far it drifts across the projection (`4 dz tan θ`). Lying flat, it becomes a
 wide en-face patch. All of that biases thickness upwards.
 
+### Whole-field movement between slices
+
+The whole field can move between slices for reasons that have nothing to do with the
+GBM, and that movement would read as tilt:
+
+- **The stage or sample slides** during acquisition. On real stacks this reached about
+  2.7 px per plane, which at 0.107 µm pixels and a 0.3 µm Z step is about 44°.
+- **Focusing changes the magnification**, so everything moves radially from the middle of
+  the field. The three April 2026 AGH7 stacks measured here change by 0.13–0.22% per
+  plane, up to about 3.5 px per plane at the image corners, while the other stacks
+  measured stay at or below 0.03%.
+
+So the stack analysis measures this first, from raw single planes of the same channel, two
+planes apart. Single planes are used because neighbouring Z projections share planes,
+which pulls registration towards no movement. The field is cut into 4 × 4 tiles, each is
+registered by phase correlation, and a translation, scale and rotation are fitted across
+tiles, with tiles that disagree losing their weight. A freer fit is not used, since it would
+start to absorb real tissue geometry. Steps where tiles do not agree, as where the tissue
+ends, carry on from the steps around them. Movement below 0.1 px per plane everywhere in
+the field is treated as none. Slices are then compared in register, and corrections made
+on one slice reach the same place in the sample on the others.
+
+If the raw planes cannot be read, the analysis still finishes without this step, and the
+filter panel warns that tilt may read too high. The panel also says when movement was
+removed and how large it was.
+
+The 5-plane projection that each mask is predicted from is **not** corrected. On a moving
+stack it is smeared by about `4 × movement` pixels, so masks there are predicted on a
+blurred image and can look wider along the direction of movement. Fixing that means
+registering planes before projecting and predicting again, which has not been tested.
+Tilt is corrected, thickness is not. Magnification change also means a pixel is not quite
+the same size through a stack; that is not corrected either.
+
 ### Measuring tilt
 
 What matters is the tilt **at this slice**. A loop that is vertical here and curves
@@ -234,7 +267,7 @@ distributions under a token of analysis run and corrections.
 
 ### Validation
 
-Tested only on synthetic stacks: tube shells and spheres of known orientation and
+Decisions were tuned on synthetic stacks: tube shells and spheres of known orientation and
 true thickness 2.5 µm, imaged like the pipeline (blur, 5-plane projection, thresholding
 with boundary noise and dropouts), with non-GBM specks and fibres added. Tightly curved
 stacks use spheres of 6–16 µm radius. "Kept" columns are shares of centerline with that
@@ -259,10 +292,37 @@ makes accuracy on these stacks slightly worse, not better; it is kept at a low w
 because on real tissue oblique GBM is expected to look patchier than these phantoms.
 On noisy masks most of what is still lost is skeleton artifacts rather than tilt.
 
-**It has not been validated on real images.** Real masks may behave differently from
-these, so the defaults should be checked against expert review before results are
-relied on. To do that, compare a few images with the filter on and off, looking at
-what the coloured overlays exclude.
+**Whole-field movement on real stacks.** Five real stacks, with v10 masks on every second
+slice, before and after removing the movement. Movement is the largest anywhere in the field.
+
+| Stack | Movement, px per plane | Median tilt | Kept | Excluded as oblique |
+|---|---|---|---|---|
+| AGH9 60x_2 (stage slides) | 2.7 | 27° → 19° | 73% → 83% | 23% → 13% |
+| AGH10 60x_2-2 (stage slides) | 1.4 | 23° → 18° | 70% → 79% | 23% → 15% |
+| AGH7-1-1 60x-1 (magnification) | 4.1 | 20° → 7° | 83% → 98% | 15% → 1% |
+| AGH1 botL (control) | 0.2 | 19° → 19° | 65% → 64% | 30% → 31% |
+| AGH9-2-2 ROI2 (control) | 0.4 | 19° → 19° | 70% → 68% | 27% → 29% |
+
+These masks used one view per tile for speed. With the deployed eight views, the AGH10 and
+AGH9-2-2 stacks came out within 2 points of these. Independently of the raw images, the
+movement implied by the GBM tracks alone falls after correction on AGH7 (scale +0.155% to
+−0.021% per plane) and AGH10 (slide 0.94 to 0.28 px per plane). On AGH9 60x_2 it goes from
+1.35 to 0.57 px per plane but changes sign, so that stack may be slightly overcorrected.
+
+**Why tilt still comes from tracked centerlines.** An image-based normal-flow estimate was
+compared with the tracked tilt on 1,322 pieces of the four stacks without magnification
+change. Both repeat about equally from independent neighbouring slices (rank correlation
+0.79 tracked, 0.82 image-based). The image-based estimate agrees better with a tilt measured
+from the same images (0.59 against 0.30), but that shares its input. Width, which geometry
+says should rise with tilt, relates more to tracked tilt (0.27 against 0.16). So neither is
+shown to be better, and there is no ground truth here.
+
+**Decisions have not been validated on real images.** Tracked tilt has a median near 18° on
+real stacks with almost no movement, against about 11° from the image-based estimate, and
+the filter excludes about 30% of GBM there. Whether that is real or a bias from mask jitter
+is not known, so the defaults should be checked against expert review before results are
+relied on. To do that, compare a few images with the filter on and off, looking at what the
+coloured overlays exclude.
 
 ### Drawing predictions
 
