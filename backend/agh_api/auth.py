@@ -378,6 +378,11 @@ def has_permission(permission: str) -> bool:
     return permission in role_permissions(getattr(g, "remote_role", DEFAULT_ROLE))
 
 
+def reads_all_analyses() -> bool:
+    """Whether this request may read every account's saved analyses: only the access-key account."""
+    return bool(getattr(g, "reads_all_analyses", False))
+
+
 # --- Session store -----------------------------------------------------------
 
 class SessionStore:
@@ -804,6 +809,15 @@ def install_auth(app, cfg):
         _set_session_cookie(response, token, cfg)
         audit_event(actor=canonical, action="LOGIN", result="success")
         return response
+
+    access_key_name = UserStore.normalize_username(cfg.access_key_user) if access_key else ""
+
+    @app.before_request
+    def mark_access_key_account():
+        # Runs only for requests that passed enforce_authentication. The access-key account,
+        # by link, header or password, may read everyone's saved analyses; it still cannot
+        # change anyone else's.
+        g.reads_all_analyses = bool(access_key_name) and cfg.auth_required and getattr(g, "remote_user", "") == access_key_name
 
     @app.route("/agh/api/key-login", methods=["GET"])
     def key_login():

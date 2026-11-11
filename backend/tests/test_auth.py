@@ -321,6 +321,40 @@ class AccessKeyTests(unittest.TestCase):
         self.assertEqual(client.get(f"/agh/api/key-login?key={ACCESS_KEY}").status_code, 404)
         self.assertEqual(client.get("/agh/api/cases", headers={"X-AGH-Access-Key": ACCESS_KEY}).status_code, 401)
 
+    def saved_analysis(self, client, owner):
+        store = client.application.extensions["agh_analysis"]["store"]
+        analysis_id, _ = store.save_case_analysis(owner, f"signature-{owner}", {"images": [], "gap": 0}, [])
+        return analysis_id
+
+    def test_the_key_account_reads_every_accounts_analyses_but_changes_none(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        theirs = self.saved_analysis(client, "leo")
+        key = {"X-AGH-Access-Key": ACCESS_KEY}
+        listed = client.get("/agh/api/case-analyses", headers=key).get_json()["analyses"]
+        self.assertEqual([(item["id"], item["owner"]) for item in listed], [(theirs, "leo")])
+        self.assertEqual(client.get(f"/agh/api/case-analyses/{theirs}", headers=key).status_code, 200)
+        self.assertEqual(client.delete(f"/agh/api/case-analyses/{theirs}", headers=key).status_code, 404)
+        self.assertEqual(client.post(f"/agh/api/case-analyses/{theirs}/interrupt", headers=key).status_code, 404)
+        # The same holds after signing in by link.
+        client.get(f"/agh/api/key-login?key={ACCESS_KEY}")
+        self.assertEqual(len(client.get("/agh/api/case-analyses").get_json()["analyses"]), 1)
+
+    def test_other_accounts_still_see_only_their_own(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        theirs = self.saved_analysis(client, "agent")
+        self.saved_analysis(client, "leo")
+        login = client.post("/agh/api/login", json={"username": "leo", "password": "correct horse battery"})
+        self.assertEqual(login.status_code, 200)
+        listed = client.get("/agh/api/case-analyses").get_json()["analyses"]
+        self.assertEqual([item["owner"] for item in listed], ["leo"])
+        self.assertEqual(client.get(f"/agh/api/case-analyses/{theirs}").status_code, 404)
+
+    def test_without_the_key_the_account_sees_only_its_own(self):
+        client = self.make()
+        self.saved_analysis(client, "leo")
+        client.post("/agh/api/login", json={"username": "agent", "password": "correct horse battery"})
+        self.assertEqual(client.get("/agh/api/case-analyses").get_json()["analyses"], [])
+
     def test_everyone_else_still_needs_to_log_in(self):
         client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
         self.assertEqual(client.get("/agh/api/cases").status_code, 401)
