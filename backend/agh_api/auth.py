@@ -638,6 +638,8 @@ def _basic_credentials():
 
 def install_auth(app, cfg):
     """Attach account/session enforcement and the auth endpoints to ``app``."""
+    if not cfg.auth_required:
+        log.warning("Login is OFF: anyone who can reach this server can read and change all data.")
     users = UserStore(cfg.users_file)
     sessions = SessionStore(cfg.session_root, cfg.session_ttl_seconds, cfg.session_idle_seconds)
     limiter = LoginRateLimiter(
