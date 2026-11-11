@@ -222,9 +222,11 @@ def _env_bool(name, default):
 
 
 def _env_auth_required():
-    # TEMPORARY: login is off by default while another agent works on the app.
-    # AGH_AUTH_REQUIRED=1 turns it back on; reverting this commit restores the default.
-    return _env_bool("AGH_AUTH_REQUIRED", False)
+    required = _env_bool("AGH_AUTH_REQUIRED", True)
+    if required:
+        return True
+    acknowledgement = os.environ.get("AGH_ALLOW_INSECURE_AUTH_BYPASS", "")
+    return acknowledgement != "I_UNDERSTAND_THIS_EXPOSES_DATA"
 
 
 def _env_mb(name, default):
