@@ -247,6 +247,86 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(Config.from_env().auth_required)
 
 
+# --- Integration: access key for agents ---------------------------------------
+
+ACCESS_KEY = "kkkkkkkkkkkkkkkkkkkk-0123456789abcdefghij"
+
+
+class AccessKeyTests(unittest.TestCase):
+    """An agent that cannot type a password signs in with a secret link or header."""
+
+    def make(self, **overrides):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cfg = make_config(Path(self.tmp.name), **overrides)
+        store = UserStore(self.cfg.users_file)
+        store.add("agent", "correct horse battery")
+        store.set_role("agent", "viewer")
+        store.add("leo", "correct horse battery")
+        app = create_app(self.cfg)
+        app.testing = True
+        return app.test_client()
+
+    def test_it_is_off_unless_configured(self):
+        client = self.make()
+        self.assertEqual(client.get(f"/agh/api/key-login?key={ACCESS_KEY}").status_code, 404)
+        self.assertEqual(client.get("/agh/api/cases", headers={"X-AGH-Access-Key": ACCESS_KEY}).status_code, 401)
+
+    def test_a_short_key_or_no_account_leaves_it_off(self):
+        client = self.make(access_key="short", access_key_user="agent")
+        self.assertEqual(client.get("/agh/api/key-login?key=short").status_code, 404)
+        client = self.make(access_key=ACCESS_KEY, access_key_user="")
+        self.assertEqual(client.get(f"/agh/api/key-login?key={ACCESS_KEY}").status_code, 404)
+
+    def test_the_link_signs_the_browser_in_as_the_account(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        response = client.get(f"/agh/api/key-login?key={ACCESS_KEY}")
+        self.assertEqual(response.status_code, 303)
+        self.assertTrue(response.headers["Location"].endswith("/agh/"))
+        self.assertEqual(response.headers["Referrer-Policy"], "no-referrer")
+        session = client.get("/agh/api/session").get_json()
+        self.assertTrue(session["authenticated"])
+        self.assertEqual((session["user"], session["role"]), ("agent", "viewer"))
+        self.assertEqual(client.get("/agh/api/cases").status_code, 200)
+
+    def test_a_wrong_key_signs_nothing_in(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        self.assertEqual(client.get("/agh/api/key-login?key=" + "x" * len(ACCESS_KEY)).status_code, 404)
+        self.assertEqual(client.get("/agh/api/key-login").status_code, 404)
+        self.assertFalse(client.get("/agh/api/session").get_json()["authenticated"])
+        self.assertEqual(client.get("/agh/api/cases").status_code, 401)
+
+    def test_it_only_goes_on_to_somewhere_in_the_app(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        inside = client.get(f"/agh/api/key-login?key={ACCESS_KEY}&next=/agh/%23/case-analysis")
+        self.assertTrue(inside.headers["Location"].endswith("/agh/#/case-analysis"))
+        for target in ("https://evil.example/", "//evil.example/agh/", "/elsewhere"):
+            response = client.get(f"/agh/api/key-login?key={ACCESS_KEY}&next={target}")
+            self.assertTrue(response.headers["Location"].endswith("/agh/"), target)
+
+    def test_the_header_works_for_api_requests_with_the_account_role(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        self.assertEqual(client.get("/agh/api/cases", headers={"X-AGH-Access-Key": ACCESS_KEY}).status_code, 200)
+        self.assertEqual(client.get("/agh/api/cases", headers={"X-AGH-Access-Key": "nope"}).status_code, 401)
+        # The account is a viewer, so the key cannot change anything.
+        response = client.put(
+            "/agh/api/cases/case1/files/image.tif/annotations",
+            json={"revision": 0, "annotations": []}, headers={"X-AGH-Access-Key": ACCESS_KEY},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_disabling_the_account_stops_the_key(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        UserStore(self.cfg.users_file).set_disabled("agent", True)
+        self.assertEqual(client.get(f"/agh/api/key-login?key={ACCESS_KEY}").status_code, 404)
+        self.assertEqual(client.get("/agh/api/cases", headers={"X-AGH-Access-Key": ACCESS_KEY}).status_code, 401)
+
+    def test_everyone_else_still_needs_to_log_in(self):
+        client = self.make(access_key=ACCESS_KEY, access_key_user="agent")
+        self.assertEqual(client.get("/agh/api/cases").status_code, 401)
+        self.assertFalse(client.get("/agh/api/session").get_json()["authenticated"])
+
+
 # --- Integration: API auth flow ----------------------------------------------
 
 class AuthApiTests(unittest.TestCase):

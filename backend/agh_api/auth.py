@@ -36,7 +36,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-from flask import g, jsonify, request
+from flask import g, jsonify, redirect, request
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from .audit import audit_event
@@ -82,7 +82,15 @@ PUBLIC_PATHS = frozenset({
     "/agh/api/session",
     "/agh/api/login",
     "/agh/api/logout",
+    "/agh/api/key-login",
 })
+
+# An access key lets an agent that cannot type a password in: opening
+# /agh/api/key-login?key=... signs that browser in, and the header below works
+# on any API request. It acts as one existing account, so that account's role
+# (make it a viewer) limits what it can do. Off unless AGH_ACCESS_KEY is set.
+ACCESS_KEY_HEADER = "X-AGH-Access-Key"
+ACCESS_KEY_MIN_LENGTH = 32
 
 # A stable, valid PBKDF2 hash of an unguessable value. When a login names a
 # user that does not exist we still run a verification against this so the
@@ -636,6 +644,13 @@ def _basic_credentials():
 
 # --- Wiring ------------------------------------------------------------------
 
+def _safe_next(target: str) -> str:
+    """Where to go after signing in by access key: only somewhere in this app."""
+    if isinstance(target, str) and target.startswith("/agh/") and not target.startswith("//") and "\\" not in target:
+        return target
+    return "/agh/"
+
+
 def install_auth(app, cfg):
     """Attach account/session enforcement and the auth endpoints to ``app``."""
     users = UserStore(cfg.users_file)
@@ -663,6 +678,30 @@ def install_auth(app, cfg):
             return record["username"], record
         return None, None
 
+    access_key = cfg.access_key if len(cfg.access_key) >= ACCESS_KEY_MIN_LENGTH and cfg.access_key_user else ""
+    if cfg.access_key and not access_key:
+        log.warning(
+            "AGH_ACCESS_KEY is ignored: it needs at least %d characters and AGH_ACCESS_KEY_USER naming an account.",
+            ACCESS_KEY_MIN_LENGTH,
+        )
+    elif access_key:
+        log.warning("Access key sign-in is ON, as account %r. Unset AGH_ACCESS_KEY to turn it off.", cfg.access_key_user)
+
+    def access_key_account(presented) -> Optional[str]:
+        """The account a presented access key signs in as, if it is the key and that account is usable."""
+        if not access_key or not isinstance(presented, str) or not presented:
+            return None
+        if not hmac.compare_digest(presented.encode("utf-8"), access_key.encode("utf-8")):
+            return None
+        name = UserStore.normalize_username(cfg.access_key_user)
+        try:
+            record = next((user for user in users.list_users() if user["username"] == name), None)
+        except UserError:
+            return None
+        if record is None or record["disabled"]:
+            return None
+        return name
+
     @app.before_request
     def enforce_authentication():
         g.remote_user = ""
@@ -684,6 +723,14 @@ def install_auth(app, cfg):
 
         if request.path in PUBLIC_PATHS:
             return None
+
+        if not username:
+            # An agent's API request carrying the access key.
+            account = access_key_account(request.headers.get(ACCESS_KEY_HEADER, ""))
+            if account:
+                g.remote_user = account
+                g.remote_role = users.role(account)
+                return None
 
         if username:
             # CSRF check for state-changing requests from the browser.
@@ -756,6 +803,32 @@ def install_auth(app, cfg):
         }))
         _set_session_cookie(response, token, cfg)
         audit_event(actor=canonical, action="LOGIN", result="success")
+        return response
+
+    @app.route("/agh/api/key-login", methods=["GET"])
+    def key_login():
+        """Sign this browser in with the access key, then go into the app."""
+        if not access_key:
+            return _no_store(jsonify({"error": "Not found"})), 404
+        # Per address only, so someone else's wrong guesses cannot lock the agent out.
+        keys = [f"ip:{_client_ip()}"]
+        remaining = limiter.retry_after(keys)
+        if remaining:
+            response = _no_store(jsonify({"error": "Too many failed attempts. Try again later.", "retryAfter": remaining}))
+            response.headers["Retry-After"] = str(remaining)
+            return response, 429
+        account = access_key_account(request.args.get("key", ""))
+        if not account:
+            limiter.record_failure(keys)
+            audit_event(action="LOGIN", result="failure", details={"method": "access-key"})
+            return _no_store(jsonify({"error": "Not found"})), 404
+        limiter.record_success(keys)
+        token, _ = sessions.create(account, users.role(account))
+        response = _no_store(redirect(_safe_next(request.args.get("next", "")), code=303))
+        # The key is in this URL; keep it out of the Referer of whatever loads next.
+        response.headers["Referrer-Policy"] = "no-referrer"
+        _set_session_cookie(response, token, cfg)
+        audit_event(actor=account, action="LOGIN", result="success", details={"method": "access-key"})
         return response
 
     @app.route("/agh/api/logout", methods=["POST"])

@@ -19,6 +19,8 @@ class Config:
     session_idle_seconds: int = 8 * 60 * 60
     cookie_secure: str = "auto"          # "auto" | "true" | "false"
     allow_basic_auth: bool = False       # opt-in Basic auth for automation
+    access_key: str = ""                 # secret for agents: sign-in link or header; empty = off
+    access_key_user: str = ""            # existing account the access key signs in as
     login_max_attempts: int = 8
     login_window_seconds: int = 15 * 60
     login_lockout_seconds: int = 15 * 60
@@ -78,6 +80,8 @@ class Config:
             session_idle_seconds=_env_int("AGH_SESSION_IDLE_SECONDS", 8 * 60 * 60),
             cookie_secure=os.environ.get("AGH_COOKIE_SECURE", "auto"),
             allow_basic_auth=_env_bool("AGH_ALLOW_BASIC_AUTH", False),
+            access_key=os.environ.get("AGH_ACCESS_KEY", "").strip(),
+            access_key_user=os.environ.get("AGH_ACCESS_KEY_USER", "").strip(),
             login_max_attempts=_env_int("AGH_LOGIN_MAX_ATTEMPTS", 8),
             login_window_seconds=_env_int("AGH_LOGIN_WINDOW_SECONDS", 15 * 60),
             login_lockout_seconds=_env_int("AGH_LOGIN_LOCKOUT_SECONDS", 15 * 60),
@@ -120,6 +124,8 @@ class Config:
             session_idle_seconds=_env_int("AGH_SESSION_IDLE_SECONDS", 8 * 60 * 60),
             cookie_secure=os.environ.get("AGH_COOKIE_SECURE", "auto"),
             allow_basic_auth=_env_bool("AGH_ALLOW_BASIC_AUTH", False),
+            access_key=os.environ.get("AGH_ACCESS_KEY", "").strip(),
+            access_key_user=os.environ.get("AGH_ACCESS_KEY_USER", "").strip(),
             login_max_attempts=_env_int("AGH_LOGIN_MAX_ATTEMPTS", 8),
             login_window_seconds=_env_int("AGH_LOGIN_WINDOW_SECONDS", 15 * 60),
             login_lockout_seconds=_env_int("AGH_LOGIN_LOCKOUT_SECONDS", 15 * 60),
