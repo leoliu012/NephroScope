@@ -34,14 +34,17 @@ registered planes.
 Everything is stored in pixels per plane, so changing the pixel size or Z step
 later needs no recomputation (``tan θ = stored * pixel_size / z_step``).
 
-GBM is continuous, and decisions respect that. Each piece of centerline gets a score
-from its tilt (weighted by how certain the slope is), its width (a tilted sheet is
-wider) and how line-like its part of the prediction is. Then the runs of equally
-judged pieces along the centerline are compared: a run flips to match its neighbours
-unless its evidence outweighs the break it would cause. So a short noisy stretch of a
-long wall stays with the wall, while a long stretch that is clearly tilted is excluded
-as a whole. Pieces are lengths of centerline about two thicknesses long, starting at
-endpoints and junctions, and they are also what a person clicks on.
+GBM is continuous, along its centerline and through Z, and decisions respect both. Each
+piece of centerline gets a score from its tilt (weighted by how certain the slope is),
+its width where the tilt is near the limit, and how line-like its part of the
+prediction is. Then every piece of the stack is decided at once: the decisions chosen
+are the ones that go against the least evidence, counting a fixed cost for each place
+they change along a centerline and for each piece that differs from the same stretch of
+sheet in a neighbouring plane. So a short noisy stretch of a long wall stays with the
+wall, a stretch that is clearly tilted is excluded as a whole, and a reading that
+appears in one plane only does not flicker in and out. Pieces are lengths of centerline
+about two thicknesses long, starting at endpoints and junctions, and they are also what
+a person clicks on.
 
 SciPy is imported lazily, so importing this module stays cheap for the web API.
 """
@@ -55,7 +58,7 @@ import numpy as np
 
 from .gbm_thickness import ThicknessGeometry
 
-ALGORITHM_VERSION = "gbm-cross-section-v3"
+ALGORITHM_VERSION = "gbm-cross-section-v4"
 MIP_PLANES = 5
 DEFAULT_MAX_WINDOW = 30
 EN_FACE_TILT_DEG = 60.0
@@ -145,7 +148,23 @@ class PlaneAnalysis:
     piece_edges: np.ndarray
     neighbour_planes: int
     median_width_px: float
+    # The same stretch of sheet in nearby analysed planes: ``piece_links[piece, column]`` is
+    # a piece of plane ``link_z[column]``, or -1. Filled in by ``analyze_stack``.
+    link_z: np.ndarray | None = None
+    piece_links: np.ndarray | None = None
+    # The piece of the stack's own analysis each piece came from, or -1. Pieces are only
+    # cut differently where someone has corrected the plane.
+    piece_origin: np.ndarray | None = None
     extra: dict = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        count = int(np.asarray(self.piece_samples).size)
+        if self.link_z is None:
+            self.link_z = np.empty(0, dtype=np.int32)
+        if self.piece_links is None:
+            self.piece_links = np.full((count, int(np.asarray(self.link_z).size)), -1, dtype=np.int32)
+        if self.piece_origin is None:
+            self.piece_origin = np.arange(count, dtype=np.int32)
 
     def to_arrays(self) -> dict[str, np.ndarray]:
         return {
@@ -177,6 +196,11 @@ class PlaneAnalysis:
             "piece_edges": self.piece_edges.astype(np.int32).reshape(-1, 2),
             "neighbour_planes": np.asarray([self.neighbour_planes], dtype=np.int32),
             "median_width_px": np.asarray([self.median_width_px], dtype=np.float32),
+            "link_z": np.asarray(self.link_z, dtype=np.int32).reshape(-1),
+            "piece_links": np.asarray(self.piece_links, dtype=np.int32).reshape(
+                int(np.asarray(self.piece_samples).size), int(np.asarray(self.link_z).size),
+            ),
+            "piece_origin": np.asarray(self.piece_origin, dtype=np.int32).reshape(-1),
         }
 
     @classmethod
@@ -213,6 +237,11 @@ class PlaneAnalysis:
             piece_edges=np.asarray(values["piece_edges"]).reshape(-1, 2),
             neighbour_planes=int(np.asarray(values["neighbour_planes"]).reshape(-1)[0]),
             median_width_px=float(np.asarray(values["median_width_px"]).reshape(-1)[0]),
+            link_z=np.asarray(values["link_z"]).reshape(-1),
+            piece_links=np.asarray(values["piece_links"]).reshape(
+                int(np.asarray(values["piece_samples"]).size), int(np.asarray(values["link_z"]).size),
+            ),
+            piece_origin=np.asarray(values["piece_origin"]).reshape(-1),
         )
 
 
@@ -571,19 +600,21 @@ def _local_slope(
     steps: np.ndarray,
     half_window: np.ndarray,
     correlated_planes: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Slope at this plane with its standard error and the Z reach used, per piece.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Slope at this plane with its standard error, the Z reach used, and its sign, per piece.
 
     A robust local fit ``d = a + b k + c k²``, weighted towards this plane. The piece
     itself counts as one point at ``k = 0``. Without enough support on both sides
     the curvature term cannot be told from the slope, so the fit is linear there.
+    The last value is the slope with its sign, along the piece's own normal.
     """
     count = displacement.shape[0]
     slope = np.full(count, np.nan)
     error = np.full(count, np.nan)
     reach = np.zeros(count)
+    signed = np.full(count, np.nan)
     if displacement.shape[1] == 0 or count == 0:
-        return slope, error, reach
+        return slope, error, reach, signed
     k = np.broadcast_to(steps, displacement.shape)
     scaled = k / half_window[:, None]
     weights = np.where(np.abs(scaled) < 1.0, (1.0 - scaled ** 2) ** 2, 0.0)
@@ -615,6 +646,7 @@ def _local_slope(
             scale = np.maximum(1.4826 * np.nanmedian(spread, axis=1), 0.5)
             robust = weights[rows] * np.minimum(1.0, 2.0 * scale[:, None] / np.maximum(np.abs(residual), 1e-9))
         slope[rows] = np.abs(beta[:, 1])
+        signed[rows] = beta[:, 1]
         total = robust.sum(axis=1)
         degrees = np.maximum(total - terms, 1.0)
         variance = np.maximum((robust * residual ** 2).sum(axis=1) / degrees, 0.25)
@@ -623,32 +655,7 @@ def _local_slope(
         # each other's noise and count for less than independent points would.
         error[rows] = np.sqrt(variance * inverse[:, 1, 1] * correlated_planes)
         reach[rows] = np.max(np.abs(k[rows]) * (weights[rows] > 0), axis=1)
-    return slope, error, reach
-
-
-def smooth_over_pieces(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
-    """Median of each piece and its centerline neighbours, ignoring missing values.
-
-    One noisy piece inside a consistent wall follows its neighbours; a real
-    change of orientation spans several pieces and survives.
-    """
-    values = np.asarray(values, dtype=np.float64)
-    count = values.size
-    if count == 0 or len(edges) == 0:
-        return values.copy()
-    neighbours: list[list[int]] = [[] for _ in range(count)]
-    for first, second in np.asarray(edges, dtype=np.int64):
-        neighbours[first].append(int(second))
-        neighbours[second].append(int(first))
-    output = values.copy()
-    for index in range(count):
-        if not neighbours[index]:
-            continue
-        window = values[[index, *neighbours[index]]]
-        window = window[np.isfinite(window)]
-        if window.size:
-            output[index] = float(np.median(window))
-    return output
+    return slope, error, reach, signed
 
 
 def _skeleton_graph(y: np.ndarray, x: np.ndarray, shape: tuple[int, int]):
@@ -908,6 +915,7 @@ def analyze_stack(
     spacing = float(np.median(np.diff(centers))) if centers.size > 1 else 1.0
 
     results: dict[int, PlaneAnalysis] = {}
+    positions_of: list[dict[str, Any]] = []
     for index, plane in enumerate(planes):
         geometry = plane.geometry
         y = geometry.skeleton_y.astype(np.int64)
@@ -923,9 +931,10 @@ def analyze_stack(
         slope = np.full(piece_count, np.nan)
         error = np.full(piece_count, np.nan)
         reach = np.zeros(piece_count)
+        signed = np.full(piece_count, np.nan)
         track_planes = np.ones(piece_count)
+        shared_y, shared_x = to_shared(registrations[index], y.astype(np.float64), x.astype(np.float64))
         if usable.size and count:
-            shared_y, shared_x = to_shared(registrations[index], y.astype(np.float64), x.astype(np.float64))
             up, down, open_up, open_down = _axial_chord(
                 shared_y, shared_x, width, fields, relative, usable, factor, median_width, registrations,
             )
@@ -937,7 +946,7 @@ def analyze_stack(
                 np.maximum(SLOPE_WINDOW_FRACTION * track_width, max(SLOPE_MIN_WINDOW_PLANES, 2.0 * spacing) + 1.0),
                 1.0, float(max_window) + 1.0,
             )
-            slope, error, reach = _local_slope(
+            slope, error, reach, signed = _local_slope(
                 displacement, relative[usable], half_window, max(1.0, MIP_PLANES / max(spacing, 1.0)),
             )
             tracked = np.isfinite(displacement)
@@ -978,12 +987,97 @@ def analyze_stack(
             neighbour_planes=int(usable.size),
             median_width_px=median_width,
         )
+        # Where each piece is and which way it drifts, in the stack's shared frame.
+        normal_x, normal_y = _piece_normals(shared_x, shared_y, piece, piece_count) if count else (np.empty(0), np.empty(0))
+        positions_of.append({
+            "analysis": results[plane.z_index],
+            "center": float(plane.center),
+            "x": _aggregate(piece, piece_count, shared_x, clean),
+            "y": _aggregate(piece, piece_count, shared_y, clean),
+            "drift_x": signed * normal_x,
+            "drift_y": signed * normal_y,
+        })
         if progress:
-            progress(0.4 + 0.6 * (index + 1) / len(planes), "Measuring GBM orientation")
+            progress(0.4 + 0.55 * (index + 1) / len(planes), "Measuring GBM orientation")
+    _link_through_z(positions_of, median_width, progress)
     return results
 
 
-# ---- Decisions (NumPy only; used by the web API at query time) ---------------
+def z_coupling_reach(centers: Sequence[float]) -> float:
+    """How far apart, in planes, two analysed planes may be for their pieces to be linked."""
+    ordered = np.unique(np.asarray(centers, dtype=np.float64))
+    if ordered.size < 2:
+        return 0.0
+    spacing = float(np.median(np.diff(ordered)))
+    if spacing > Z_COUPLING_MAX_SPACING:
+        return 0.0
+    return max(Z_COUPLING_MIN_PLANES, Z_COUPLING_SPACINGS * spacing) + 1e-6
+
+
+def match_pieces(
+    x: np.ndarray, y: np.ndarray, drift_x: np.ndarray, drift_y: np.ndarray, planes: float,
+    other_x: np.ndarray, other_y: np.ndarray, reference_px: float,
+) -> np.ndarray:
+    """For each piece, the piece of another plane on the same stretch of sheet, or -1.
+
+    Positions are in the stack's shared frame. A piece is looked for where its own drift
+    puts it ``planes`` away, within a gate that is tighter across the sheet than along it.
+    """
+    count = x.size
+    matched = np.full(count, -1, dtype=np.int32)
+    if count == 0 or other_x.size == 0:
+        return matched
+    drift_x, drift_y = np.nan_to_num(drift_x), np.nan_to_num(drift_y)
+    size = np.hypot(drift_x, drift_y)
+    # Across the sheet is along its drift; a piece that does not drift has no such direction.
+    known = size > 1e-6
+    normal_x = np.where(known, drift_x / np.maximum(size, 1e-6), 0.0)
+    normal_y = np.where(known, drift_y / np.maximum(size, 1e-6), 0.0)
+    across_gate = Z_MATCH_ACROSS * max(float(reference_px), 1.0)
+    along_gate = Z_MATCH_ALONG * max(float(reference_px), 1.0)
+    usable = np.isfinite(other_x) & np.isfinite(other_y)
+    for start in range(0, count, 512):
+        rows = slice(start, min(start + 512, count))
+        dx = other_x[None, :] - (x[rows] + drift_x[rows] * planes)[:, None]
+        dy = other_y[None, :] - (y[rows] + drift_y[rows] * planes)[:, None]
+        across = dx * normal_x[rows, None] + dy * normal_y[rows, None]
+        along_squared = np.maximum(dx * dx + dy * dy - across * across, 0.0)
+        gate = np.where(
+            known[rows, None],
+            (across / across_gate) ** 2 + along_squared / along_gate ** 2,
+            (dx * dx + dy * dy) / across_gate ** 2,
+        )
+        gate = np.where(usable[None, :] & np.isfinite(gate), gate, np.inf)
+        best = np.argmin(gate, axis=1)
+        found = gate[np.arange(best.size), best] <= 1.0
+        matched[rows] = np.where(found, best, -1)
+    return matched
+
+
+def _link_through_z(positions_of: Sequence[dict[str, Any]], reference_px: float, progress=None) -> None:
+    """Record, for every piece, the same stretch of sheet in the analysed planes around it."""
+    reach = z_coupling_reach([entry["center"] for entry in positions_of])
+    for index, entry in enumerate(positions_of):
+        analysis: PlaneAnalysis = entry["analysis"]
+        count = analysis.piece_samples.size
+        linked_z, columns = [], []
+        for other_index, other in enumerate(positions_of):
+            distance = other["center"] - entry["center"]
+            if other_index == index or reach <= 0.0 or abs(distance) > reach or abs(distance) < 1e-9:
+                continue
+            linked_z.append(other["analysis"].z_index)
+            columns.append(match_pieces(
+                entry["x"], entry["y"], entry["drift_x"], entry["drift_y"], distance, other["x"], other["y"], reference_px,
+            ))
+        analysis.link_z = np.asarray(linked_z, dtype=np.int32)
+        analysis.piece_links = (
+            np.column_stack(columns).astype(np.int32) if columns else np.full((count, 0), -1, dtype=np.int32)
+        )
+        if progress:
+            progress(0.95 + 0.05 * (index + 1) / len(positions_of), "Linking planes through Z")
+
+
+# ---- Decisions (used by the web API at query time) ---------------------------
 
 REASON_KEPT = 0
 REASON_OBLIQUE = 1
@@ -1037,12 +1131,42 @@ LINE_NEUTRAL_ASPECT = 6.0
 LINE_SCORE_WEIGHT = 0.25
 NOT_SHEET_SCORE = 1.0
 WIDE_PATCH_SCORE = 1.5
-# What a break in the centerline costs, per break, against a run's evidence (its length
-# in thicknesses times its score). Bridging a gap in kept GBM is favoured over
-# dropping a kept stretch, since kept GBM that is removed cannot be measured.
+# A piece's evidence is its length in thicknesses times its score, within this limit.
+RUN_SCORE_LIMIT = 2.0
+# What it costs, against that evidence, for the decision to change between two pieces that
+# join along the centerline, and for a piece to differ from the same stretch of sheet in a
+# nearby plane. The second is per thickness of centerline the two share, as evidence is:
+# charged per piece, it outweighed the evidence of the short pieces that fragmented masks
+# are cut into, and nothing was excluded there. Both were set on real masks with a known
+# tilt added, so that decisions break no more often along the centerline than a plane judged
+# on its own while being wrong less often.
+BREAK_COST = 1.75
+Z_LINK_COST = 0.3
+# Without SciPy each plane is decided on its own, by flipping runs of pieces. There a break
+# costs this per break: more for a gap in kept GBM than for a kept stretch on its own, since
+# kept GBM that is removed cannot be measured.
 GAP_BREAK_COST = 1.5
 ISLAND_BREAK_COST = 1.0
-RUN_SCORE_LIMIT = 2.0
+# The slope's uncertainty widens the tilt score's scale by this share of itself. On real
+# masks the tracker reads steep tilt accurately while reporting it as less certain, so in
+# full it let clearly tilted pieces be overruled.
+TILT_UNCERTAINTY_WEIGHT = 0.5
+# Width only confirms tilt that is near or past the limit: its weight falls to nothing over
+# this much tilt score below the limit. A sheet measured well short of the limit is wide
+# because it is thick, and excluding it would trim the thick end of what is being measured.
+WIDTH_GATE_SCORE = 1.0
+# Pieces are linked through Z with the analysed planes around them, as far as this many
+# planes away, or this many times the spacing of analysed planes if that is further.
+Z_COUPLING_MIN_PLANES = 3.0
+Z_COUPLING_SPACINGS = 1.5
+# Planes analysed further apart than this show different parts of a curving sheet.
+Z_COUPLING_MAX_SPACING = 6.0
+# How far, in typical thicknesses, the same stretch may sit from where its drift puts it:
+# across the sheet, and along it (pieces are about two thicknesses long).
+Z_MATCH_ACROSS = 0.6
+Z_MATCH_ALONG = 1.2
+# Costs are rounded to this many units each for the minimum cut.
+CUT_UNITS = 200
 COMPACT_ASPECT = 1.5
 # Sheets persist through Z; only something this brief can be called not a sheet.
 BRIEF_MARGIN_PLANES = 2.0
@@ -1092,8 +1216,9 @@ def decide_along_centerline(
     gap_cost: float = GAP_BREAK_COST,
     island_cost: float = ISLAND_BREAK_COST,
 ) -> np.ndarray:
-    """Final decisions, given that GBM runs on continuously along its centerline.
+    """Decisions for one plane on its own, given that GBM runs on along its centerline.
 
+    Used where SciPy is missing; otherwise ``decide_jointly`` decides the whole stack.
     A run of equally judged pieces keeps its decision only if the evidence for it
     (length in thicknesses times score) outweighs the breaks it makes. Weakest runs
     flip first, which can merge neighbours into a run that then holds. A run with no
@@ -1177,24 +1302,20 @@ class FilterSettings:
     plane_step: float = 1.0
 
 
-def classify_pieces(
+def piece_evidence(
     analysis: PlaneAnalysis,
     settings: FilterSettings,
     *,
     pixel_size_um: float,
     z_step_um: float | None,
-    expansion_factor: float = 1.0,
     tilt_limit_field: np.ndarray | None = None,
-    trusted_reasons: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Assign every piece a reason code; ``REASON_KEPT`` pieces count in measurements.
+    """Score every piece of one plane, positive when its own evidence says to exclude it.
 
-    ``tilt_limit_field`` replaces the tilt limit per piece (local corrections).
-    ``trusted_reasons`` holds, per piece, a reason code a nearby correction has
-    vouched for (or -1), so it no longer excludes that piece.
+    ``tilt_limit_field`` replaces the tilt limit per piece (local corrections). ``score``
+    is ``None`` when the cross-section filter is off or the plane has no pieces.
     """
     count = analysis.piece_samples.size
-    reasons = np.zeros(count, dtype=np.int32)
     width = np.asarray(analysis.piece_width_px, dtype=np.float64)
     has_neighbours = analysis.neighbour_planes > 0
     has_tilt = bool(z_step_um) and has_neighbours
@@ -1216,90 +1337,255 @@ def classify_pieces(
     else:
         limit = auto_max_tilt_deg(float(z_step_um), reference_um, settings.mip_planes)
     field_ = np.full(count, np.nan if limit is None else limit) if tilt_limit_field is None else np.asarray(tilt_limit_field, dtype=np.float64)
+    evidence: dict[str, Any] = {"tilt_deg": tilt, "limit_deg": limit, "reference_px": reference_px, "width": width, "score": None}
+    if not (settings.cross_section and count):
+        return evidence
 
-    if settings.cross_section and count:
-        # Tapers, spurs and junctions are not measured, sample by sample, but they are
-        # still part of the GBM. Having no opinion, they take after what they join.
-        artifact = np.asarray(analysis.piece_artifact) >= 0.5
-        length = np.asarray(analysis.piece_samples, dtype=np.float64) / max(reference_px, 1.0)
-        aspect = np.maximum(np.nan_to_num(np.asarray(analysis.piece_component_aspect, dtype=np.float64), nan=LINE_NEUTRAL_ASPECT), 0.5)
-        ratio = np.nan_to_num(width / max(reference_px, 1.0), nan=1.0)
+    # Tapers, spurs and junctions are not measured, sample by sample, but they are
+    # still part of the GBM. Having no opinion, they take after what they join.
+    artifact = np.asarray(analysis.piece_artifact) >= 0.5
+    length = np.asarray(analysis.piece_samples, dtype=np.float64) / max(reference_px, 1.0)
+    aspect = np.maximum(np.nan_to_num(np.asarray(analysis.piece_component_aspect, dtype=np.float64), nan=LINE_NEUTRAL_ASPECT), 0.5)
+    ratio = np.nan_to_num(width / max(reference_px, 1.0), nan=1.0)
+    if has_neighbours:
         chord = np.asarray(analysis.piece_chord_planes, dtype=np.float64)
         tracked = np.asarray(analysis.piece_track_planes, dtype=np.float64)
         open_ended = np.asarray(analysis.piece_censored) >= 0.5
-        if has_neighbours:
-            # Along a continuous line one piece's slope should not stand out from its
-            # neighbours', so a lone reading follows them.
-            steady = smooth_over_pieces(slope, analysis.piece_edges)
-            uncertainty = np.nan_to_num(np.asarray(analysis.piece_tan_error, dtype=np.float64))
-            with np.errstate(invalid="ignore"):
-                if has_tilt:
-                    scale = float(pixel_size_um) / float(z_step_um)
-                    angle = np.degrees(np.arctan(steady * scale))
-                    spread = np.degrees(np.arctan((steady + uncertainty) * scale)) - angle
-                    tilt_score = (angle - field_) / (TILT_SCORE_DEGREES + spread)
-                    en_face = angle > np.maximum(field_, EN_FACE_TILT_DEG)
-                    axial_scale = float(z_step_um) / float(pixel_size_um)
-                else:
-                    # Without a Z step the angle is unknown, but what it does to the
-                    # measurement is not: the projection smears a sheet sideways by
-                    # its drift per plane, in pixels, whatever the Z step is.
-                    sweep = max(0, settings.mip_planes - 1) / max(reference_px, 1.0)
-                    smear = sweep * steady
-                    tilt_score = (smear - (AUTO_TILT_INFLATION - 1.0)) / (SMEAR_SCORE_FRACTION + sweep * uncertainty)
-                    en_face = smear > EN_FACE_SMEAR
-                    axial_scale = ASSUMED_AXIAL_PX_PER_PLANE
-                # A structure no longer than the Z projection itself, neither under
-                # its medial point nor followed sideways, is not a sheet. Sparse
-                # sampling cannot show that, so it is only judged on close planes.
-                brief_limit = settings.mip_planes + BRIEF_MARGIN_PLANES
-                judged = float(settings.plane_step) <= 0.5 * brief_limit
-                transient = judged & (chord <= brief_limit) & (tracked <= brief_limit) & ~open_ended
-                # Lying flat, a sheet is far too wide and cannot be followed as a line.
-                unsure = ~np.isfinite(slope) | (np.nan_to_num(tilt_score) > 0.0)
-                patch = (ratio > WIDE_PATCH_FACTOR) & unsure
-                unmeasured = ~np.isfinite(slope)
-                # Blobs and specks only when nothing says they run through the stack.
-                persistent = (tracked > 2.0 * brief_limit) | (chord > 2.0 * brief_limit)
-            area = np.asarray(analysis.piece_cc_samples, dtype=np.float64) * axial_scale * float(settings.plane_step)
-            speck = (area < SPECK_AREA_THICKNESSES * max(reference_px, 1.0) ** 2) & ~persistent
-            compact = (aspect < COMPACT_ASPECT) & ~persistent
-            score = (
-                np.clip(np.nan_to_num(tilt_score), *TILT_SCORE_RANGE)
-                + np.clip((ratio - WIDTH_CONFIRMS_TILT) / WIDTH_SCORE_SPAN, *WIDTH_SCORE_RANGE)
-                - LINE_SCORE_WEIGHT * np.clip(np.log2(aspect / LINE_NEUTRAL_ASPECT), -1.0, 1.0)
+        uncertainty = TILT_UNCERTAINTY_WEIGHT * np.nan_to_num(np.asarray(analysis.piece_tan_error, dtype=np.float64))
+        with np.errstate(invalid="ignore"):
+            if has_tilt:
+                scale = float(pixel_size_um) / float(z_step_um)
+                angle = np.degrees(np.arctan(slope * scale))
+                spread = np.degrees(np.arctan((slope + uncertainty) * scale)) - angle
+                tilt_score = (angle - field_) / (TILT_SCORE_DEGREES + spread)
+                en_face = angle > np.maximum(field_, EN_FACE_TILT_DEG)
+                axial_scale = float(z_step_um) / float(pixel_size_um)
+            else:
+                # Without a Z step the angle is unknown, but what it does to the
+                # measurement is not: the projection smears a sheet sideways by
+                # its drift per plane, in pixels, whatever the Z step is.
+                sweep = max(0, settings.mip_planes - 1) / max(reference_px, 1.0)
+                smear = sweep * slope
+                tilt_score = (smear - (AUTO_TILT_INFLATION - 1.0)) / (SMEAR_SCORE_FRACTION + sweep * uncertainty)
+                en_face = smear > EN_FACE_SMEAR
+                axial_scale = ASSUMED_AXIAL_PX_PER_PLANE
+            # A structure no longer than the Z projection itself, neither under
+            # its medial point nor followed sideways, is not a sheet. Sparse
+            # sampling cannot show that, so it is only judged on close planes.
+            brief_limit = settings.mip_planes + BRIEF_MARGIN_PLANES
+            judged = float(settings.plane_step) <= 0.5 * brief_limit
+            transient = judged & (chord <= brief_limit) & (tracked <= brief_limit) & ~open_ended
+            # Lying flat, a sheet is far too wide and cannot be followed as a line.
+            unsure = ~np.isfinite(slope) | (np.nan_to_num(tilt_score) > 0.0)
+            patch = (ratio > WIDE_PATCH_FACTOR) & unsure
+            unmeasured = ~np.isfinite(slope)
+            # Blobs and specks only when nothing says they run through the stack.
+            persistent = (tracked > 2.0 * brief_limit) | (chord > 2.0 * brief_limit)
+        area = np.asarray(analysis.piece_cc_samples, dtype=np.float64) * axial_scale * float(settings.plane_step)
+        speck = (area < SPECK_AREA_THICKNESSES * max(reference_px, 1.0) ** 2) & ~persistent
+        compact = (aspect < COMPACT_ASPECT) & ~persistent
+        # Width counts towards tilt only as far as the measured tilt is near or past the
+        # limit. An unmeasured slope has no tilt score, so there width counts in full.
+        width_score = np.clip((ratio - WIDTH_CONFIRMS_TILT) / WIDTH_SCORE_SPAN, *WIDTH_SCORE_RANGE)
+        gate = np.clip(1.0 + np.nan_to_num(tilt_score) / WIDTH_GATE_SCORE, 0.0, 1.0)
+        width_score = np.where(width_score > 0.0, width_score * gate, width_score)
+        score = (
+            np.clip(np.nan_to_num(tilt_score), *TILT_SCORE_RANGE)
+            + width_score
+            - LINE_SCORE_WEIGHT * np.clip(np.log2(aspect / LINE_NEUTRAL_ASPECT), -1.0, 1.0)
+        )
+        not_sheet = speck | transient | compact
+        score = np.where(not_sheet, np.maximum(score, NOT_SHEET_SCORE), score)
+        score = np.where(patch, np.maximum(score, WIDE_PATCH_SCORE), score)
+        # Anything excluded for continuity alone is a stretch of oblique GBM.
+        evidence.update(default_reason=REASON_OBLIQUE, labels=(
+            (compact & ~patch, REASON_COMPACT), (patch & unmeasured, REASON_WIDE_PATCH), (en_face, REASON_EN_FACE),
+            (transient, REASON_TRANSIENT), (speck, REASON_SPECK),
+        ))
+    else:
+        # One plane only: shape is all there is. Wide, short patches are
+        # what en-face sheet looks like; compact islands are not sheets.
+        wide = ratio > WIDE_PATCH_FACTOR
+        compact = aspect < COMPACT_ASPECT
+        score = np.where(wide | compact, 1.0, -0.5)
+        evidence.update(default_reason=REASON_COMPACT, labels=((wide, REASON_WIDE_PATCH),))
+    evidence.update(score=np.where(artifact, 0.0, score), artifact=artifact, length=length)
+    return evidence
+
+
+def _minimum_cut(
+    keep_cost: np.ndarray, exclude_cost: np.ndarray, first: np.ndarray, second: np.ndarray, weight: np.ndarray,
+) -> np.ndarray | None:
+    """Which nodes to exclude so that the total cost is least; ``None`` without SciPy.
+
+    The cost is ``keep_cost`` of every kept node, ``exclude_cost`` of every excluded one,
+    and ``weight`` for every joined pair that ends up on different sides.
+    """
+    try:
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import breadth_first_order, maximum_flow
+    except ImportError:
+        return None
+    count = int(keep_cost.size)
+    source, sink = count, count + 1
+    nodes = np.arange(count)
+    keep = np.round(np.asarray(keep_cost) * CUT_UNITS).astype(np.int64)
+    # One unit towards keeping, so a piece with no evidence either way stays kept.
+    exclude = np.round(np.asarray(exclude_cost) * CUT_UNITS).astype(np.int64) + 1
+    joined = np.round(np.asarray(weight) * CUT_UNITS).astype(np.int64)
+    # Kept nodes stay on the source's side. Excluding a node cuts its arc from the source,
+    # keeping it cuts its arc to the sink, and a joined pair that differs cuts their arc.
+    rows = np.concatenate([np.full(count, source), nodes, first, second])
+    columns = np.concatenate([nodes, np.full(count, sink), second, first])
+    capacity = np.concatenate([exclude, keep, joined, joined])
+    graph = coo_matrix((capacity, (rows, columns)), shape=(count + 2, count + 2)).tocsr().astype(np.int32)
+    flow = maximum_flow(graph, source, sink).flow
+    residual = (graph - flow).tocsr()
+    residual.data = (residual.data > 0).astype(np.int8)
+    residual.eliminate_zeros()
+    reached = breadth_first_order(residual, source, directed=True, return_predecessors=False)
+    kept = np.zeros(count + 2, dtype=bool)
+    kept[reached] = True
+    return ~kept[:count]
+
+
+def decide_jointly(analyses: Sequence[PlaneAnalysis], evidence: Sequence[dict[str, Any]]) -> list[np.ndarray | None]:
+    """Which pieces to exclude, for several planes of one stack at once.
+
+    GBM runs on along its centerline and through Z, so a decision is not made piece by
+    piece. The decisions returned go against the least evidence (each piece's length in
+    thicknesses times its score), counting ``BREAK_COST`` wherever they change between
+    pieces that join along a centerline and ``Z_LINK_COST`` per thickness of centerline
+    wherever a piece differs from the same stretch of sheet in a linked plane. That
+    minimum is exact (a minimum cut).
+    Planes are linked only to others passed in with them. ``None`` is returned for a
+    plane with no cross-section evidence.
+    """
+    scored = [index for index, entry in enumerate(evidence) if entry.get("score") is not None]
+    output: list[np.ndarray | None] = [None] * len(analyses)
+    if not scored:
+        return output
+    sizes = {index: int(evidence[index]["score"].size) for index in scored}
+    offsets, total = {}, 0
+    for index in scored:
+        offsets[index] = total
+        total += sizes[index]
+    worth = np.concatenate([
+        evidence[index]["length"] * np.clip(np.nan_to_num(evidence[index]["score"]), -RUN_SCORE_LIMIT, RUN_SCORE_LIMIT)
+        for index in scored
+    ])
+    position_of = {int(analyses[index].z_index): index for index in scored}
+    first, second, weight = [], [], []
+    for index in scored:
+        analysis = analyses[index]
+        pairs = np.asarray(analysis.piece_edges, dtype=np.int64).reshape(-1, 2)
+        pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+        first.append(pairs[:, 0] + offsets[index])
+        second.append(pairs[:, 1] + offsets[index])
+        weight.append(np.full(pairs.shape[0], BREAK_COST))
+        links = np.asarray(analysis.piece_links, dtype=np.int64)
+        for column, z_index in enumerate(np.asarray(analysis.link_z).reshape(-1)):
+            other = position_of.get(int(z_index))
+            if other is None or other == index or links.shape[0] != sizes[index]:
+                continue
+            match = links[:, column]
+            found = np.nonzero((match >= 0) & (match < sizes[other]))[0]
+            first.append(found + offsets[index])
+            second.append(match[found] + offsets[other])
+            weight.append(Z_LINK_COST * np.minimum(evidence[index]["length"][found], evidence[other]["length"][match[found]]))
+    excluded = _minimum_cut(
+        np.maximum(worth, 0.0), np.maximum(-worth, 0.0),
+        np.concatenate(first), np.concatenate(second), np.concatenate(weight),
+    )
+    for index in scored:
+        if excluded is None:
+            entry = evidence[index]
+            output[index] = decide_along_centerline(
+                (entry["score"] > 0.0) & ~entry["artifact"], entry["score"], entry["length"], analyses[index].piece_edges,
             )
-            not_sheet = speck | transient | compact
-            score = np.where(not_sheet, np.maximum(score, NOT_SHEET_SCORE), score)
-            score = np.where(patch, np.maximum(score, WIDE_PATCH_SCORE), score)
-            score = np.where(artifact, 0.0, score)
-            final = decide_along_centerline((score > 0.0) & ~artifact, score, length, analysis.piece_edges)
-            # Anything excluded for continuity alone is a stretch of oblique GBM.
-            reasons[final] = REASON_OBLIQUE
-            for mask, code in (
-                (compact & ~patch, REASON_COMPACT), (patch & unmeasured, REASON_WIDE_PATCH), (en_face, REASON_EN_FACE),
-                (transient, REASON_TRANSIENT), (speck, REASON_SPECK),
-            ):
-                reasons[mask & final] = code
         else:
-            # One plane only: shape is all there is. Wide, short patches are
-            # what en-face sheet looks like; compact islands are not sheets.
-            wide = ratio > WIDE_PATCH_FACTOR
-            compact = aspect < COMPACT_ASPECT
-            excluded = (wide | compact) & ~artifact
-            final = decide_along_centerline(excluded, np.where(excluded, 1.0, np.where(artifact, 0.0, -0.5)), length, analysis.piece_edges)
-            reasons[final] = REASON_COMPACT
-            reasons[final & wide] = REASON_WIDE_PATCH
+            output[index] = excluded[offsets[index]:offsets[index] + sizes[index]]
+    return output
+
+
+def decide_from_evidence(
+    analysis: PlaneAnalysis,
+    evidence: dict[str, Any],
+    settings: FilterSettings,
+    *,
+    pixel_size_um: float,
+    expansion_factor: float = 1.0,
+    trusted_reasons: np.ndarray | None = None,
+    excluded: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Reason codes for one plane from its evidence.
+
+    ``excluded`` is what ``decide_jointly`` decided for this plane together with the
+    planes around it. Without it the plane is decided on its own.
+    """
+    count = analysis.piece_samples.size
+    reasons = np.zeros(count, dtype=np.int32)
+    if evidence["score"] is not None:
+        if excluded is None:
+            excluded = decide_jointly([analysis], [evidence])[0]
+        final = np.asarray(excluded, dtype=bool)
+        reasons[final] = evidence["default_reason"]
+        for mask, code in evidence["labels"]:
+            reasons[mask & final] = code
         if trusted_reasons is not None:
             trusted = (np.asarray(trusted_reasons) == reasons) & (reasons != REASON_KEPT)
             reasons[trusted] = REASON_KEPT
-
     if settings.thickness_limits and count:
-        thickness_nm = width * float(pixel_size_um) / float(expansion_factor) * 1000.0
+        thickness_nm = evidence["width"] * float(pixel_size_um) / float(expansion_factor) * 1000.0
         with np.errstate(invalid="ignore"):
             reasons[(thickness_nm < settings.min_nm) & (reasons == 0)] = REASON_TOO_THIN
             reasons[(thickness_nm > settings.max_nm) & (reasons == 0)] = REASON_TOO_THICK
-    return {"reasons": reasons, "tilt_deg": tilt, "limit_deg": limit, "reference_px": reference_px}
+    return {"reasons": reasons, "tilt_deg": evidence["tilt_deg"], "limit_deg": evidence["limit_deg"], "reference_px": evidence["reference_px"]}
+
+
+def classify_pieces(
+    analysis: PlaneAnalysis,
+    settings: FilterSettings,
+    *,
+    pixel_size_um: float,
+    z_step_um: float | None,
+    expansion_factor: float = 1.0,
+    tilt_limit_field: np.ndarray | None = None,
+    trusted_reasons: np.ndarray | None = None,
+    excluded: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Assign every piece of one plane a reason code; ``REASON_KEPT`` pieces count in measurements.
+
+    ``tilt_limit_field`` replaces the tilt limit per piece (local corrections).
+    ``trusted_reasons`` holds, per piece, a reason code a nearby correction has
+    vouched for (or -1), so it no longer excludes that piece. ``excluded`` is this
+    plane's part of a decision made for the whole stack (``classify_stack``); without
+    it the plane is decided on its own, which leaves out continuity through Z.
+    """
+    evidence = piece_evidence(analysis, settings, pixel_size_um=pixel_size_um, z_step_um=z_step_um, tilt_limit_field=tilt_limit_field)
+    return decide_from_evidence(
+        analysis, evidence, settings, pixel_size_um=pixel_size_um, expansion_factor=expansion_factor,
+        trusted_reasons=trusted_reasons, excluded=excluded,
+    )
+
+
+def classify_stack(
+    analyses: Sequence[PlaneAnalysis],
+    settings: FilterSettings,
+    *,
+    pixel_size_um: float,
+    z_step_um: float | None,
+    expansion_factor: float = 1.0,
+) -> dict[int, dict[str, Any]]:
+    """Reason codes for every plane of a stack, decided together. Keyed by ``z_index``."""
+    evidence = [piece_evidence(analysis, settings, pixel_size_um=pixel_size_um, z_step_um=z_step_um) for analysis in analyses]
+    decided = decide_jointly(analyses, evidence)
+    return {
+        int(analysis.z_index): decide_from_evidence(
+            analysis, entry, settings, pixel_size_um=pixel_size_um, expansion_factor=expansion_factor, excluded=excluded,
+        )
+        for analysis, entry, excluded in zip(analyses, evidence, decided)
+    }
 
 
 __all__ = [name for name in globals() if name.isupper()] + [
@@ -1308,6 +1594,14 @@ __all__ = [name for name in globals() if name.isupper()] + [
     "StackPlane",
     "analyze_stack",
     "build_pieces",
+    "classify_pieces",
+    "classify_stack",
+    "decide_along_centerline",
+    "decide_from_evidence",
+    "decide_jointly",
+    "match_pieces",
+    "piece_evidence",
+    "z_coupling_reach",
     "estimate_field_motion",
     "signed_distance",
     "to_plane",

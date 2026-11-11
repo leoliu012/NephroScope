@@ -903,5 +903,219 @@ class RefinementApiTests(StackFixture):
         self.click("positive", SIZE + 5, 10, status=400)
 
 
+
+@unittest.skipUnless(HAS_RUNTIME, "scipy and scikit-image are required")
+class JointDecisionTests(unittest.TestCase):
+    """Decisions are made for a whole stack at once: along each centerline and through Z."""
+
+    @staticmethod
+    def chain(z_index, scores, lengths=None, link_z=(), links=None):
+        """A line of pieces joined end to end, as the evidence and geometry a decision needs."""
+        from types import SimpleNamespace
+
+        scores = np.asarray(scores, dtype=np.float64)
+        count = scores.size
+        analysis = SimpleNamespace(
+            z_index=z_index,
+            piece_edges=np.array([[i, i + 1] for i in range(count - 1)]).reshape(-1, 2),
+            link_z=np.asarray(link_z, dtype=np.int32),
+            piece_links=np.full((count, len(link_z)), -1, dtype=np.int32) if links is None else np.asarray(links, dtype=np.int32),
+        )
+        evidence = {
+            "score": scores, "artifact": np.zeros(count, dtype=bool),
+            "length": np.full(count, 2.0) if lengths is None else np.asarray(lengths, dtype=np.float64),
+        }
+        return analysis, evidence
+
+    def decide(self, *planes):
+        from agh_api.gbm_cross_section import decide_jointly
+
+        return decide_jointly([plane[0] for plane in planes], [plane[1] for plane in planes])
+
+    def test_the_cut_finds_the_least_costly_decisions(self):
+        from agh_api.gbm_cross_section import _minimum_cut
+
+        rng = np.random.default_rng(0)
+        for _ in range(60):
+            count = 8
+            keep = rng.uniform(0, 2, count) * (rng.random(count) < 0.5)
+            exclude = rng.uniform(0, 2, count) * (keep == 0)
+            first, second = rng.integers(0, count, 10), rng.integers(0, count, 10)
+            distinct = first != second
+            first, second = first[distinct], second[distinct]
+            weight = rng.uniform(0.1, 1.5, first.size)
+
+            def cost(excluded):
+                return keep[~excluded].sum() + exclude[excluded].sum() + weight[excluded[first] != excluded[second]].sum()
+
+            best = min(cost(np.array([(code >> bit) & 1 for bit in range(count)], dtype=bool)) for code in range(1 << count))
+            # Costs are rounded to 1/200 and each node leans one unit towards kept.
+            self.assertLessEqual(cost(_minimum_cut(keep, exclude, first, second, weight)), best + 0.1)
+
+    def test_along_a_centerline_only_clear_evidence_breaks_the_line(self):
+        wall = np.full(10, -1.0)
+
+        lone_wobble = wall.copy()
+        lone_wobble[5] = 0.3
+        self.assertFalse(self.decide(self.chain(0, lone_wobble))[0].any(), "one slightly tilted piece does not break the line")
+
+        real_run = wall.copy()
+        real_run[3:7] = 2.0
+        np.testing.assert_array_equal(np.nonzero(self.decide(self.chain(0, real_run))[0])[0], [3, 4, 5, 6])
+
+        # One piece that is clearly tilted holds on its own: the measurement is trusted.
+        steep = wall.copy()
+        steep[5] = 2.0
+        np.testing.assert_array_equal(np.nonzero(self.decide(self.chain(0, steep))[0])[0], [5])
+
+        # A kept scrap in the middle of clearly tilted GBM goes with it.
+        scrap = np.full(10, 2.0)
+        scrap[5] = -0.2
+        self.assertTrue(self.decide(self.chain(0, scrap))[0].all())
+
+        # Pieces of no opinion, like junctions, take after what they join, and are kept on their own.
+        neutral = wall.copy()
+        neutral[5] = 0.0
+        self.assertFalse(self.decide(self.chain(0, neutral))[0].any())
+        tilted = np.full(10, 2.0)
+        tilted[5] = 0.0
+        self.assertTrue(self.decide(self.chain(0, tilted))[0].all())
+        self.assertFalse(self.decide(self.chain(0, np.zeros(4)))[0].any())
+
+        # With nothing to be continuous with, evidence stands alone.
+        analysis, evidence = self.chain(0, [0.1, -0.1])
+        analysis.piece_edges = np.empty((0, 2), dtype=np.int64)
+        np.testing.assert_array_equal(self.decide((analysis, evidence))[0], [True, False])
+
+    def test_a_reading_that_appears_in_one_plane_only_does_not_flicker(self):
+        same = np.arange(10).reshape(-1, 1)
+        wall = np.full(10, -1.0)
+        run = wall.copy()
+        run[3:6] = 0.7  # three pieces that read as tilted, clearly enough to break the line on their own
+
+        alone = self.decide(self.chain(1, run))[0]
+        np.testing.assert_array_equal(np.nonzero(alone)[0], [3, 4, 5])
+
+        # The same stretch is kept in the planes above and below, so it is kept here too.
+        linked = np.hstack([same, same])
+        below = self.chain(0, wall, link_z=[1], links=same)
+        here = self.chain(1, run, link_z=[0, 2], links=linked)
+        above = self.chain(2, wall, link_z=[1], links=same)
+        for decided in self.decide(below, here, above):
+            self.assertFalse(decided.any())
+
+        # Tilt that is there in every plane stays excluded in every plane.
+        for decided in self.decide(self.chain(0, run, link_z=[1], links=same), self.chain(1, run, link_z=[0, 2], links=linked), self.chain(2, run, link_z=[1], links=same)):
+            np.testing.assert_array_equal(np.nonzero(decided)[0], [3, 4, 5])
+
+        # A sheet that turns away through Z changes where it does: clear evidence is not smoothed over.
+        steep = wall.copy()
+        steep[3:6] = 2.0
+        decided = self.decide(self.chain(0, wall, link_z=[1], links=same), self.chain(1, steep, link_z=[0, 2], links=linked), self.chain(2, steep, link_z=[1], links=same))
+        self.assertFalse(decided[0].any())
+        np.testing.assert_array_equal(np.nonzero(decided[1])[0], [3, 4, 5])
+        np.testing.assert_array_equal(np.nonzero(decided[2])[0], [3, 4, 5])
+
+        # A link to a plane that was not passed in, or to a piece that is not there, is ignored.
+        stray = self.chain(1, run, link_z=[7, 2], links=np.hstack([same, same + 50]))
+        np.testing.assert_array_equal(np.nonzero(self.decide(stray, self.chain(2, wall))[0])[0], [3, 4, 5])
+
+    def test_fragmented_gbm_is_not_outvoted_by_its_links_through_z(self):
+        # Jittery masks are cut into many short pieces. Differing through Z costs in proportion to
+        # the centerline two pieces share, as evidence does, so twenty short pieces that are clearly
+        # tilted in this plane stay excluded although the same stretch is kept above and below.
+        count, short = 30, np.full(30, 0.4)
+        same = np.arange(count).reshape(-1, 1)
+        wall = np.full(count, -1.0)
+        steep = wall.copy()
+        steep[5:25] = 2.0
+        decided = self.decide(
+            self.chain(0, wall, lengths=short, link_z=[1], links=same),
+            self.chain(1, steep, lengths=short, link_z=[0, 2], links=np.hstack([same, same])),
+            self.chain(2, wall, lengths=short, link_z=[1], links=same),
+        )
+        np.testing.assert_array_equal(np.nonzero(decided[1])[0], np.arange(5, 25))
+        self.assertFalse(decided[0].any() or decided[2].any())
+
+    def walls(self, thick_tilt_deg):
+        """Two thin vertical walls and a wall more than twice as thick, tilted a little."""
+        from agh_api.gbm_cross_section import StackPlane, analyze_stack
+        from agh_api.gbm_thickness import prepare_thickness_geometry
+
+        size, count = 520, 25
+        _, xx = np.mgrid[:size, :size].astype(np.float64)
+        shift = Z_STEP_UM / PIXEL_UM * np.tan(np.radians(thick_tilt_deg))
+        planes = []
+        for z in range(count):
+            mask = (np.abs(xx - 90) < 10) | (np.abs(xx - 200) < 10) | (np.abs(xx - 380 - shift * (z - count // 2)) < 22 / np.cos(np.radians(thick_tilt_deg)))
+            planes.append(StackPlane(z, float(z), mask, prepare_thickness_geometry(mask)))
+        return analyze_stack(planes)
+
+    def test_thick_gbm_is_not_excluded_for_being_wide(self):
+        from agh_api.gbm_cross_section import FilterSettings, classify_stack
+
+        results = self.walls(thick_tilt_deg=13.0)
+        decided = classify_stack([results[z] for z in sorted(results)], FilterSettings(thickness_limits=False), pixel_size_um=PIXEL_UM, z_step_um=Z_STEP_UM)
+        analysis, plane = results[12], decided[12]
+        thick = analysis.piece_center_x > 300
+        self.assertGreater(np.nanmedian(analysis.piece_width_px[thick]) / plane["reference_px"], 2.0)
+        self.assertLess(np.nanmedian(plane["tilt_deg"][thick]), plane["limit_deg"] - 5.0)
+        self.assertGreater((plane["reasons"] == 0)[thick].mean(), 0.9, "measured well short of the limit, it is wide because it is thick")
+
+    def test_width_still_confirms_tilt_that_is_past_the_limit(self):
+        from agh_api.gbm_cross_section import FilterSettings, classify_stack
+
+        results = self.walls(thick_tilt_deg=32.0)
+        decided = classify_stack([results[z] for z in sorted(results)], FilterSettings(thickness_limits=False), pixel_size_um=PIXEL_UM, z_step_um=Z_STEP_UM)
+        analysis, plane = results[12], decided[12]
+        thick = analysis.piece_center_x > 300
+        self.assertLess((plane["reasons"] == 0)[thick].mean(), 0.1)
+        self.assertGreater((plane["reasons"] == 0)[~thick].mean(), 0.9)
+
+    def test_pieces_are_linked_to_the_same_stretch_of_sheet_in_nearby_planes(self):
+        from agh_api.gbm_cross_section import PlaneAnalysis
+
+        results = self.walls(thick_tilt_deg=32.0)
+        here, shift = results[12], Z_STEP_UM / PIXEL_UM * np.tan(np.radians(32.0))
+        self.assertEqual(sorted(here.link_z.tolist()), [9, 10, 11, 13, 14, 15])
+        self.assertEqual(sorted(results[0].link_z.tolist()), [1, 2, 3])
+        for column, z in enumerate(here.link_z):
+            other, match = results[int(z)], here.piece_links[:, column]
+            found = match >= 0
+            self.assertGreater(found.mean(), 0.9)
+            moved_x = other.piece_center_x[match[found]] - here.piece_center_x[found]
+            expected = np.where(here.piece_center_x[found] > 300, shift * (int(z) - 12), 0.0)
+            self.assertLess(np.abs(moved_x - expected).max(), 6.0, "a tilted wall is followed to where it has moved")
+            self.assertLess(np.abs(other.piece_center_y[match[found]] - here.piece_center_y[found]).max(), 30.0)
+
+        # Links and origins survive saving, also for a plane with nothing in it.
+        restored = PlaneAnalysis.from_arrays(here.to_arrays())
+        np.testing.assert_array_equal(restored.link_z, here.link_z)
+        np.testing.assert_array_equal(restored.piece_links, here.piece_links)
+        np.testing.assert_array_equal(restored.piece_origin, np.arange(here.piece_samples.size))
+        here.link_z, here.piece_links = np.empty(0, dtype=np.int32), np.empty((here.piece_samples.size, 0), dtype=np.int32)
+        self.assertEqual(PlaneAnalysis.from_arrays(here.to_arrays()).piece_links.shape, (here.piece_samples.size, 0))
+
+    def test_planes_analysed_far_apart_are_not_linked(self):
+        from agh_api.gbm_cross_section import z_coupling_reach
+
+        self.assertAlmostEqual(z_coupling_reach([0, 1, 2, 3]), 3.0, places=3)
+        self.assertAlmostEqual(z_coupling_reach([0, 2, 4, 6]), 3.0, places=3)
+        self.assertAlmostEqual(z_coupling_reach([0, 4, 8]), 6.0, places=3)
+        self.assertEqual(z_coupling_reach([0, 8, 16]), 0.0)
+        self.assertEqual(z_coupling_reach([5]), 0.0)
+
+    def test_without_scipy_each_plane_is_decided_on_its_own(self):
+        from unittest import mock
+        from agh_api import gbm_cross_section
+
+        run = np.full(10, -1.0)
+        run[3:7] = 2.0
+        with mock.patch.object(gbm_cross_section, "_minimum_cut", return_value=None):
+            decided = self.decide(self.chain(0, run), self.chain(1, np.full(10, -1.0)))
+        np.testing.assert_array_equal(np.nonzero(decided[0])[0], [3, 4, 5, 6])
+        self.assertFalse(decided[1].any())
+
+
 if __name__ == "__main__":
     unittest.main()

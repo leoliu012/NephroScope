@@ -52,8 +52,10 @@ GBM thickness is only true where the sheet crosses the image plane steeply.
 tabs and in Case analysis) compares each slice's prediction with the other
 segmented slices of the image, measures how tilted each short length of GBM is at
 that slice, and leaves out oblique and en-face GBM, as well as predictions too
-short-lived or small through the stack to be a sheet. Decisions run along the
-centerline, so a short noisy stretch stays with the continuous GBM around it. **Thickness limits** (default 30–3400 nm,
+short-lived or small through the stack to be a sheet. Decisions are made for the
+whole stack at once, along each centerline and through Z, so a short noisy stretch
+stays with the continuous GBM around it and a reading that shows in one slice only
+does not flicker as you move through Z. **Thickness limits** (default 30–3400 nm,
 after EF) work independently. Excluded GBM and its centerline are drawn in the colour
 of the reason it was excluded, matching the legend beside it, and thickness plots, ROI
 measurements and exports only use what is kept. A popup shows when a change of
@@ -77,7 +79,8 @@ image** remove corrections and give back exactly what the algorithm decided.
 The filter needs more than one segmented Z slice to measure tilt. With only one,
 it falls back to shape rules that catch much less, and the viewer offers to run the
 model on nearby slices. See `docs/model-inference.md` for the method, how it was
-tested, and its limits: **so far it has only been validated on synthetic stacks.**
+tested, and its limits: **it has been tested on synthetic stacks and on real predictions
+with a known tilt added, but not yet against expert review.**
 
 ### 4. Compare thickness across cases and images
 
