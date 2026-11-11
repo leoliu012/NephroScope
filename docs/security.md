@@ -92,6 +92,35 @@ AGH_LOCAL_DEV=1 python app.py                    # sign in at the login screen
 
 Set `AGH_AUTH_REQUIRED=0` to bypass login entirely while developing.
 
+## Access key for agents
+
+An agent such as Claude cannot type a password, so an access key can sign it in
+instead. It acts as one existing account, and that account's role decides what it
+can do, so make it a viewer to keep it read-only. Everyone else still logs in.
+
+```bash
+cd backend
+python manage_users.py add agent --role viewer     # any password; it is not used
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # the key
+```
+
+Set `AGH_ACCESS_KEY` to that key and `AGH_ACCESS_KEY_USER=agent` where the backend
+runs, then restart it. The server logs a warning while the key is on. Then:
+
+- **Browser:** open `https://<host>/agh/api/key-login?key=<key>` once. It signs that
+  browser in like a normal login and goes to `/agh/`. Add
+  `&next=/agh/%23/case-analysis` to land somewhere else in the app.
+- **API:** send the header `X-AGH-Access-Key: <key>` with each request.
+
+The link puts the key in the browser's history, so treat it like a password. A key
+shorter than 32 characters, or one with no such account, is ignored. Failed tries
+count towards the login lockout.
+
+**To turn it off**, remove `AGH_ACCESS_KEY` and restart the backend; sessions already
+opened with the link last until they expire or the account is disabled
+(`python manage_users.py disable agent`, which also stops the key at once). To remove
+the feature from the code, revert the commit that added it.
+
 ## Configuration reference
 
 | Variable | Default | Meaning |
@@ -100,6 +129,8 @@ Set `AGH_AUTH_REQUIRED=0` to bypass login entirely while developing.
 | `AGH_USERS_FILE` | `$AGH_STATE_DIR/users.json` | Account store path |
 | `AGH_SESSION_DIR` | `$AGH_STATE_DIR/sessions` | Server-side session records |
 | `AGH_AUTH_REQUIRED` | `1` | Enforce authentication (`0` disables, dev only) |
+| `AGH_ACCESS_KEY` | empty | Secret that signs an agent in by link or header; empty turns it off |
+| `AGH_ACCESS_KEY_USER` | empty | Existing account the access key acts as (make it a viewer) |
 | `AGH_MIN_PASSWORD_LENGTH` | `10` | Minimum length for new/changed passwords (min 1) |
 | `AGH_SESSION_TTL_SECONDS` | `43200` | Absolute session lifetime |
 | `AGH_SESSION_IDLE_SECONDS` | `28800` | Idle timeout (`0` disables) |
