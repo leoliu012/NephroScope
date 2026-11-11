@@ -235,16 +235,14 @@ class ConfigTests(unittest.TestCase):
     def test_auth_is_required_by_default(self):
         self.assertTrue(Config(data_root=Path("/tmp/data"), ann_root=Path("/tmp/ann")).auth_required)
 
-    @mock.patch.dict("os.environ", {"AGH_AUTH_REQUIRED": "0"}, clear=True)
-    def test_env_auth_bypass_requires_explicit_acknowledgement(self):
-        self.assertTrue(Config.from_env().auth_required)
-
-    @mock.patch.dict("os.environ", {
-        "AGH_AUTH_REQUIRED": "0",
-        "AGH_ALLOW_INSECURE_AUTH_BYPASS": "I_UNDERSTAND_THIS_EXPOSES_DATA",
-    }, clear=True)
-    def test_env_auth_bypass_can_be_explicitly_acknowledged(self):
+    # TEMPORARY, with login off by default: revert together with config._env_auth_required.
+    @mock.patch.dict("os.environ", {}, clear=True)
+    def test_login_is_temporarily_off_by_default(self):
         self.assertFalse(Config.from_env().auth_required)
+
+    @mock.patch.dict("os.environ", {"AGH_AUTH_REQUIRED": "1"}, clear=True)
+    def test_login_can_still_be_turned_on(self):
+        self.assertTrue(Config.from_env().auth_required)
 
 
 # --- Integration: API auth flow ----------------------------------------------
