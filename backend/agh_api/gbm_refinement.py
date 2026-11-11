@@ -20,6 +20,7 @@ adds what the probability map shows under the brush (see :func:`region_under_ban
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -29,6 +30,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Any
 
@@ -62,8 +64,10 @@ from .gbm_cross_section import (
     StackPlane,
     analyze_stack,
     build_pieces,
-    classify_pieces,
+    decide_from_evidence,
+    decide_jointly,
     estimate_field_motion,
+    piece_evidence,
     to_plane,
     to_shared,
 )
@@ -79,7 +83,7 @@ STRUCTURAL_KINDS = ("add", *PAINT_KINDS)
 MAX_STROKE_POINTS = 5000
 # Browsers keep filtered measurements under a token. Evidence from an analysis stays
 # valid when only the decision rules change, so the rules have their own version.
-DECISION_VERSION = "d2"
+DECISION_VERSION = "d3"
 SEGMENTATION_OPERATION = "gbm-segmentation"
 MAX_WINDOW_LIMIT = 200
 # A correction's influence falls off over this many typical thicknesses (Gaussian
@@ -90,6 +94,10 @@ CORRECTION_MIN_WEIGHT = 0.25
 # limit. A wrong piece that is nearly vertical is wrong for some other reason.
 TIGHTEN_FROM_LIMIT_FRACTION = 0.6
 BASE_PROBABILITY_THRESHOLD = 0.55
+# Decisions are made for a whole stack at once, so the last few stacks decided are kept.
+STACK_DECISION_CACHE = 16
+_stack_decisions: OrderedDict = OrderedDict()
+_stack_decisions_lock = threading.Lock()
 
 
 def _digest(value: Any) -> str:
@@ -267,7 +275,8 @@ def _label_path(config, stack_run: dict, z_index: int) -> Path:
     return resolve_under_root(directory, f"label_{int(z_index)}.png")
 
 
-@lru_cache(maxsize=64)
+# Deciding a stack reads every plane of it, so one stack's planes should all fit.
+@lru_cache(maxsize=256)
 def _load_plane_cached(path_text: str, mtime_ns: int) -> PlaneAnalysis:
     with np.load(path_text, allow_pickle=False) as archive:
         return PlaneAnalysis.from_arrays(archive)
@@ -513,6 +522,7 @@ def _new_plane_from_geometry(geometry: ThicknessGeometry, base: PlaneAnalysis | 
     planes = np.full(count, np.nan)
     reach = np.zeros(count)
     added = np.ones(count, dtype=bool)
+    origin = np.full(piece_count, -1, dtype=np.int32)
     neighbour_planes = 0
     if base is not None and base_geometry is not None and base_geometry.skeleton_y.size and count:
         tree = cKDTree(np.column_stack([base_geometry.skeleton_y, base_geometry.skeleton_x]))
@@ -526,6 +536,15 @@ def _new_plane_from_geometry(geometry: ThicknessGeometry, base: PlaneAnalysis | 
         reach[found] = base.sample_window_planes[nearest[found]]
         added = ~found
         neighbour_planes = base.neighbour_planes
+        if found.any():
+            # The original piece most of each new piece's centerline came from.
+            pairs, shared = np.unique(
+                np.stack([piece[found].astype(np.int64), base.sample_piece[nearest[found]].astype(np.int64)], axis=1), axis=0, return_counts=True,
+            )
+            order = np.lexsort((shared, pairs[:, 0]))
+            pairs = pairs[order]
+            most = np.concatenate([pairs[1:, 0] != pairs[:-1, 0], [True]])
+            origin[pairs[most, 0]] = pairs[most, 1]
     from .gbm_cross_section import _aggregate, _component_aspect
 
     clean = artifact == SAMPLE_OK
@@ -559,6 +578,7 @@ def _new_plane_from_geometry(geometry: ThicknessGeometry, base: PlaneAnalysis | 
         piece_edges=edges,
         neighbour_planes=neighbour_planes,
         median_width_px=base.median_width_px if base is not None else median_width,
+        piece_origin=origin,
     )
     piece_added = _aggregate(piece, piece_count, added.astype(np.float64), np.ones(count, dtype=bool)) >= 0.5
     return analysis, piece_added
@@ -741,6 +761,7 @@ def _split_for_paint(
         piece_edges=np.asarray(edges, dtype=np.int32).reshape(-1, 2),
         neighbour_planes=analysis.neighbour_planes,
         median_width_px=analysis.median_width_px,
+        piece_origin=np.asarray(analysis.piece_origin, dtype=np.int32)[source],
     )
     return split, np.asarray(piece_added, dtype=bool)[source], state[first], latest[first]
 
@@ -802,7 +823,86 @@ def label_file(config, store, run: dict, options: dict) -> Path:
     return path
 
 
-def decide(view: PlaneView, settings: FilterSettings, calibration: dict, z_step: dict, z_index: int, mip_planes: int, plane_step: float) -> dict:
+def stack_exclusions(
+    config, stack_run: dict, settings: FilterSettings, pixel: float, z_step_um: float | None,
+    all_edits: list[dict], revision: str, memo: dict | None = None,
+) -> dict[int, np.ndarray]:
+    """Which pieces the stack's analysis excludes, per plane, decided for the whole stack at once.
+
+    GBM is continuous through Z as well as along its centerline, so one plane cannot be
+    decided without the planes around it. This reads every plane's saved evidence, applies
+    the tilt limits that clicks have changed, and decides them together. Corrections to
+    single pieces are not part of it: ``decide`` puts those on top, so they always win.
+    """
+    key = (
+        "stack-exclusions", stack_run["runId"], (stack_run.get("result") or {}).get("artifactAttempt"), settings.max_tilt_deg,
+        round(float(pixel), 9), None if not z_step_um else round(float(z_step_um), 9), revision,
+    )
+    if memo is not None and key in memo:
+        return memo[key]
+    with _stack_decisions_lock:
+        decided = _stack_decisions.get(key)
+        if decided is not None:
+            _stack_decisions.move_to_end(key)
+    if decided is None:
+        members = (stack_run.get("request") or {}).get("members") or []
+        plane_step = _plane_step(members)
+        motion = _saved_motion(stack_run)
+        clicks = [edit for edit in all_edits if edit["kind"] in ("include", "exclude")]
+        analyses, evidence = [], []
+        for member in members:
+            z_index = int(member["zIndex"])
+            analysis = load_plane(config, stack_run, z_index)
+            if analysis is None:
+                continue
+            plane_settings = FilterSettings(
+                cross_section=True, max_tilt_deg=settings.max_tilt_deg, thickness_limits=False,
+                mip_planes=int(member.get("mipZ") or MIP_PLANES), plane_step=plane_step,
+            )
+            entry = piece_evidence(analysis, plane_settings, pixel_size_um=pixel, z_step_um=z_step_um)
+            if clicks:
+                field_, _ = _local_limits(analysis, entry["limit_deg"], clicks, z_index, pixel, z_step_um, entry["reference_px"], motion)
+                entry = piece_evidence(analysis, plane_settings, pixel_size_um=pixel, z_step_um=z_step_um, tilt_limit_field=field_)
+            analyses.append(analysis)
+            evidence.append(entry)
+        decided = {
+            int(analysis.z_index): excluded
+            for analysis, excluded in zip(analyses, decide_jointly(analyses, evidence)) if excluded is not None
+        }
+        with _stack_decisions_lock:
+            _stack_decisions[key] = decided
+            while len(_stack_decisions) > STACK_DECISION_CACHE:
+                _stack_decisions.popitem(last=False)
+    if memo is not None:
+        memo[key] = decided
+    return decided
+
+
+def _exclusions_for_plane(
+    config, view: PlaneView, settings: FilterSettings, evidence: dict, pixel: float, z_step_um: float | None, z_index: int, memo: dict | None,
+) -> np.ndarray | None:
+    """This plane's part of the stack's decision, or ``None`` if it has to be decided on its own.
+
+    Where a correction has cut the plane's pieces differently, each piece takes the
+    decision of the original piece it came from, so a correction changes nothing around it.
+    """
+    if evidence["score"] is None or view.stack_run is None:
+        return None
+    decided = stack_exclusions(config, view.stack_run, settings, pixel, z_step_um, view.all_edits, view.revision, memo).get(int(z_index))
+    origin = np.asarray(view.analysis.piece_origin, dtype=np.int64).reshape(-1)
+    if decided is None or origin.size != evidence["score"].size:
+        return None
+    known = (origin >= 0) & (origin < decided.size)
+    if not known.any():
+        return None
+    own = (evidence["score"] > 0.0) & ~evidence["artifact"]
+    return np.where(known, decided[np.where(known, origin, 0)], own)
+
+
+def decide(
+    config, view: PlaneView, settings: FilterSettings, calibration: dict, z_step: dict, z_index: int, mip_planes: int, plane_step: float,
+    memo: dict | None = None,
+) -> dict:
     """Reasons per piece for one plane, including all corrections."""
     analysis = view.analysis
     pixel = _mean_pixel(calibration)
@@ -812,13 +912,14 @@ def decide(view: PlaneView, settings: FilterSettings, calibration: dict, z_step:
         thickness_limits=settings.thickness_limits, min_nm=settings.min_nm, max_nm=settings.max_nm,
         mip_planes=mip_planes, plane_step=plane_step,
     )
-    first = classify_pieces(analysis, settings, pixel_size_um=pixel, z_step_um=z_step["um"], expansion_factor=expansion)
+    first = piece_evidence(analysis, settings, pixel_size_um=pixel, z_step_um=z_step["um"])
     field_, trusted = _local_limits(
         analysis, first["limit_deg"], view.all_edits, z_index, pixel, z_step["um"], first["reference_px"], _saved_motion(view.stack_run),
     )
-    result = classify_pieces(
-        analysis, settings, pixel_size_um=pixel, z_step_um=z_step["um"], expansion_factor=expansion,
-        tilt_limit_field=field_, trusted_reasons=trusted,
+    evidence = piece_evidence(analysis, settings, pixel_size_um=pixel, z_step_um=z_step["um"], tilt_limit_field=field_)
+    result = decide_from_evidence(
+        analysis, evidence, settings, pixel_size_um=pixel, expansion_factor=expansion, trusted_reasons=trusted,
+        excluded=_exclusions_for_plane(config, view, settings, evidence, pixel, z_step["um"], z_index, memo),
     )
     reasons = result["reasons"]
     # People outrank the algorithm, and a later click outranks an earlier one.
@@ -892,7 +993,7 @@ def filtered_samples(config, store, run: dict, settings: FilterSettings, options
     z_step = resolve_z_step(config, run, options.get("zStepUm"))
     members = ((view.stack_run or {}).get("request") or {}).get("members") or []
     mip_planes = len((run.get("request") or {}).get("zWindow") or [MIP_PLANES])
-    decided = decide(view, settings, calibration, z_step, int(run["zIndex"]), mip_planes, _plane_step(members))
+    decided = decide(config, view, settings, calibration, z_step, int(run["zIndex"]), mip_planes, _plane_step(members), options.get("memo"))
     pieces = view.analysis.sample_piece
     pinned = decided["pinned"][pieces]
     sample_reason = decided["reasons"][pieces]
@@ -1003,7 +1104,7 @@ def refinement_frames(config, store, runs: dict[str, dict], settings: FilterSett
         members = ((stack_run or {}).get("request") or {}).get("members") or []
         mip_planes = len((run.get("request") or {}).get("zWindow") or [MIP_PLANES])
         z_step = resolve_z_step(config, run, options.get("zStepUm"))
-        decided = decide(view, settings, calibration, z_step, z_index, mip_planes, _plane_step(members))
+        decided = decide(config, view, settings, calibration, z_step, z_index, mip_planes, _plane_step(members), memo)
         frames[run_id] = {
             "zIndex": z_index,
             "reason": decided["reasons"].astype(int).tolist(),

@@ -173,28 +173,44 @@ recomputation (`tan θ = stored × pixel / dz`).
 
 ### Deciding
 
-GBM is continuous, so decisions are made along its centerline rather than piece by
-piece. Pieces are lengths of centerline about two thicknesses long, starting at
-endpoints and junctions.
+GBM is continuous along its centerline and through Z, so decisions are made for the whole
+stack at once and not piece by piece. Pieces are lengths of centerline about two thicknesses
+long, starting at endpoints and junctions.
 
-Each piece first gets a score, positive when the evidence says to exclude it:
+Each piece first gets a score, positive when its own evidence says to exclude it:
 
-- **Tilt**: degrees past the limit, over 8° plus the uncertainty of its slope. Tilt is
-  first smoothed over neighbouring pieces, since orientation changes gradually along
-  a continuous sheet.
-- **Width**: more than 20% wider than the best-oriented GBM counts towards tilt, since
-  a tilted sheet is wider. Clearly uniform narrow GBM counts against it.
+- **Tilt**: degrees past the limit, over 8° plus half the uncertainty of its slope. The
+  slope is used as measured. Earlier it was first evened out over neighbouring pieces, and
+  its uncertainty counted in full; on real masks both let clearly tilted pieces be overruled.
+- **Width**, only where tilt is near or past the limit: more than 20% wider than the
+  best-oriented GBM counts towards tilt, since a tilted sheet is wider. This weight falls to
+  nothing 8° of tilt score below the limit. A sheet measured well short of the limit is wide
+  because it is thick, and thickness is what is being measured: before this, GBM at 12–22°
+  that was 1.6–2.2 times the reference width was kept 74% of the time against 99% for
+  narrow GBM at the same tilt. Clearly uniform narrow GBM still counts against tilt.
 - **Line-likeness**: a long connected line counts slightly against tilt, and a short
   fragment slightly for it, since true cross-sections trace long continuous curves.
 
-Then runs of equally judged pieces along the centerline are compared. A run keeps its
-decision only if its evidence (length in thicknesses times score) outweighs the breaks
-it makes. Each break costs 1.5 for a gap in kept GBM and 1 for a kept stretch inside
-excluded GBM, weakest runs flipping first. So a short noisy stretch stays with the wall
-around it, while a long stretch that is clearly tilted is excluded as a whole, and a
-part of the prediction with no neighbours keeps what its own evidence says. Tapers,
-spurs and junctions have no opinion and take after what they join; their samples are
-not measured, but they do not break the GBM.
+Then the decisions chosen are the ones that go against the least evidence (each piece's
+length in thicknesses times its score), counting a cost of 1.75 wherever the decision changes
+between two pieces that join along a centerline, and 0.6 wherever a piece differs from the
+same stretch of sheet in a nearby plane. This is solved exactly, as a minimum cut. So a short
+noisy stretch stays with the wall around it, a stretch that is clearly tilted is excluded as a
+whole, a single piece that is clearly tilted holds on its own, and a reading that shows in one
+plane only does not flicker in and out while moving through Z. A sheet that really turns away
+through Z still changes where it does, because clear evidence outweighs the cost. Tapers,
+spurs and junctions have no opinion and take after what they join; their samples are not
+measured, but they do not break the GBM.
+
+**The same stretch in nearby planes** is found when the stack is analysed: each piece is
+looked for where its own drift puts it in the analysed planes within three planes, or within
+1.5 times the spacing of analysed planes if that is further, in the stack's shared frame, with
+a gate tighter across the sheet (0.6 thicknesses) than along it (1.2). Planes analysed more
+than six planes apart are not linked, since they show different parts of a curving sheet, and
+each is then decided on its own.
+
+Without SciPy on the API server each plane is decided on its own by the earlier rule
+(flipping runs of pieces whose evidence does not outweigh the breaks they make).
 
 Excluded GBM is labelled as:
 
@@ -232,7 +248,8 @@ version; saved masks are never touched, so removing them restores the prediction
 
 Corrections are applied after continuity, so they always win. A **brush stroke** is
 exact: the centerline samples owning painted mask pixels become
-their own pieces, kept or removed (later corrections win), and nothing nearby changes.
+their own pieces, kept or removed (later corrections win), and nothing nearby changes: every
+other piece of that plane keeps the decision the stack gave the piece it came from.
 Where a keeping stroke crosses background, what it adds is cut from the smoothed
 probability map at half height between the signal under the brush and the local
 background, so thickness comes from the image and not the brush. A **click** also
@@ -255,6 +272,12 @@ no segmentation of that image is running, and the previous analysis stays in use
 meanwhile (reported as stale). Its cache key covers the member runs, so any change
 to the segmented slices makes a new one, and the older one is then deleted.
 
+Decisions are not stored. A request for any slice decides the whole stack from the saved
+analysis, the current calibration and tilt limit, and the clicks that change limits, which
+takes about 30–120 ms for 20–45 slices of 2304 × 2304, and the last 16 stacks decided are
+kept in memory. An analysis from before links through Z were saved (`gbm-cross-section-v3`) is not
+used; opening the image queues a new one.
+
 A worker reports every 30 seconds. When it restarts, it queues again whatever a
 worker that no longer exists left running, instead of waiting for that run's lease
 to expire. Until then, the viewer says the worker has stopped rather than showing
@@ -267,33 +290,90 @@ distributions under a token of analysis run and corrections.
 
 ### Validation
 
-Decisions were tuned on synthetic stacks: tube shells and spheres of known orientation and
-true thickness 2.5 µm, imaged like the pipeline (blur, 5-plane projection, thresholding
-with boundary noise and dropouts), with non-GBM specks and fibres added. Tightly curved
-stacks use spheres of 6–16 µm radius. "Kept" columns are shares of centerline with that
-true tilt. Breaks are places a decision changes along the centerline, per 100 thicknesses
-of centerline, before and after deciding along it.
+There is still no expert ground truth for tilt on real images. What follows tests the method
+against truth that can be constructed: a known tilt added to real stacks, and synthetic stacks.
+"Before" is the previous rule (`gbm-cross-section-v3`: each plane decided on its own, slopes
+evened out over neighbouring pieces, width counted at any tilt).
 
-| Stack | Mean, unfiltered → kept (µm) | Kept, tilt < 10° | Kept, 30–45° | Breaks |
-|---|---|---|---|---|
-| dz 0.4 µm, 60 planes | 3.74 → 2.69 | 93% | 18% | 20 → 4 |
-| dz 0.2 µm | 2.79 → 2.71 | 92% | 35% | 23 → 2 |
-| dz 0.8 µm, 30 planes | 4.46 → 2.61 | 88% | 9% | 24 → 4 |
-| Every 4th slice segmented | 3.86 → 2.75 | 92% | 23% | 23 → 4 |
-| Noisy masks (±5 px jitter, dropouts) | 2.27 → 2.13 | 67% | 34% | 61 → 1 |
-| Tightly curved | 3.89 → 3.51 | 87% | 59% | 41 → 4 |
-| Tightly curved, jittery masks | 3.97 → 3.46 | 88% | 37% | 46 → 3 |
-| Tightly curved, heavy jitter | 2.71 → 2.46 | 63% | 14% | 61 → 1 |
+**Real masks with a known tilt added.** Sliding every plane of a stack sideways by `s` pixels
+per plane tilts every sheet in it by a known amount: a piece whose slope along its normal `n`
+was `a` now has slope `a + s (e · n)`, with `e` the direction of the slide. Done through each
+plane's registration, the masks and pieces stay exactly as predicted, so the jitter is the real
+model's. Five stacks (AGH1, AGH7, AGH9 ×2, AGH10; v10 masks on every second slice, 0.3 µm Z
+step), slid by 30°, 45° and 60° along x and along y. Scored on pieces whose slope before the
+slide was certain enough for the tilt after it to be known within 5°.
 
-The cost of continuity shows on tightly curved GBM: tilted arcs that vary smoothly along
-a line are more often kept, raising the mean from 3.34 to 3.51 µm on the clean curved
-stack. On the others the mean stayed about the same or improved. The long-line term
-makes accuracy on these stacks slightly worse, not better; it is kept at a low weight
-because on real tissue oblique GBM is expected to look patchier than these phantoms.
-On noisy masks most of what is still lost is skeleton artifacts rather than tilt.
+The tracker reads these tilts as they are: GBM whose true tilt is 0–10°, 10–20°, 20–30°,
+30–45°, 45–60° and 60–75° reads 5°, 14°, 24°, 37°, 51° and 65° (medians). So wrong decisions
+come from the deciding, not the measuring.
+
+| | Kept, true tilt < 10° | 10–20° | 20–30° | 30–45° | 45–60° | > 60° | Breaks | Stacks as they are: kept | breaks | differ between neighbouring slices |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Before | 92% | 90% | 79% | 51% | 15% | 6% | 3.8 | 77.6% | 3.0 | 7.9% |
+| Now | 96% | 95% | 85% | 48% | 9% | 3% | 4.4 | 77.6% | 3.4 | 2.1% |
+
+The limit is 27–31° on these stacks. Below 20°, wrongly excluded centerline fell from 9.3% to
+4.2%; above 45°, wrongly kept from 12.1% to 7.2%. Breaks are changes of decision along the
+centerline per 100 thicknesses. The last column is the share of centerline whose decision
+differs from the same place in the next analysed slice, 0.6 µm away.
+
+What this cannot show: the slide adds the same tilt through the whole stack, so it says
+nothing about sheets whose tilt changes quickly through Z, and the masks do not widen as a
+tilted sheet's would. The next two tests cover those.
+
+**The same, with the model seeing the tilt.** For one stack (AGH9-2-2 ROI2) the raw planes were
+slid by 30°, 45° and 60°, projected and predicted again with the deployed model. At the 45°
+slide the model still draws 93% of GBM whose tilt became 45–60°, and 89% above 60°. On the new
+masks the tracker reads true tilts of 0–10°, 10–20°, 20–30°, 30–45°, 45–60° and over 60° as 8°,
+15°, 25°, 36°, 51° and 61°. Below 20°, wrongly excluded went from 9.4% to 7.1%; above 45°,
+wrongly kept from 14.0% to 7.8%; breaks 4.7 and 5.2. The masks widen far less than the
+projection's smear alone would make them: at the 45° slide by 7–10%, where the smear predicts
+31%. So the model draws roughly the core of a smeared sheet, and the 35% apparent thickening
+that the automatic tilt limit allows for overstates what reaches a measurement. On the stacks
+as they are, width rises with measured tilt by a fifth to three quarters, depending on the
+stack, of what `1 / cos θ` plus the full smear predicts.
+
+**Synthetic stacks at the jitter of real masks.** Tube shells and spheres of every orientation,
+true thickness 2.5 µm, imaged like the pipeline, with specks added. Their boundary noise is set
+so that a centerline moves between analysed slices as it does on real v10 masks: by 4–5% of the
+GBM's width (1.2–2.0 px), uncorrelated from slice to slice, measured on the five stacks above.
+The noisy stacks this section used before were at about twice that, and the conclusion drawn
+from them, that steep GBM is under-read, does not hold on real masks. These stacks curve
+through Z, and their steep stretches are shorter than in tissue, which is hard on continuity.
+
+| Stack (mean thickness unfiltered) | | Kept, true tilt < 10° | 20–30° | 30–45° | 45–60° | > 60° | Mean kept (µm) | Breaks | Differ between slices |
+|---|---|---|---|---|---|---|---|---|---|
+| Real jitter, every 2nd slice (3.31 µm) | Before | 99% | 88% | 61% | 57% | 42% | 3.07 | 6.3 | 11.1% |
+| | Now | 99% | 87% | 49% | 41% | 18% | 3.01 | 7.2 | 4.6% |
+| Real jitter, every slice (3.32 µm) | Before | 99% | 86% | 56% | 48% | 32% | 3.02 | 7.8 | 14.3% |
+| | Now | 98% | 80% | 41% | 35% | 7% | 2.96 | 6.7 | 1.8% |
+| Real jitter, every 4th slice (3.30 µm) | Before | 99% | 95% | 70% | 64% | 49% | 3.11 | 5.0 | 9.2% |
+| | Now | 100% | 93% | 71% | 59% | 45% | 3.11 | 4.3 | 5.2% |
+| Twice real jitter (3.03 µm) | Before | 98% | 90% | 75% | 76% | 63% | 2.90 | 4.2 | 14.6% |
+| | Now | 99% | 88% | 71% | 58% | 22% | 2.86 | 3.3 | 1.7% |
+| Clean masks (3.82 µm) | Before | 95% | 52% | 19% | 14% | 9% | 3.13 | 12.6 | 10.1% |
+| | Now | 98% | 54% | 17% | 7% | 4% | 3.10 | 13.3 | 2.4% |
+
+With real jitter a good part of the steep GBM is still kept on these stacks, before and now:
+there the tracker's slope is less certain and the steep stretches are short. With slices four
+planes apart there is little to gain from Z.
+
+**Width and what is measured.** On the five stacks as they are, among pieces whose tilt is
+well measured at 12–22°, the share kept by width over the reference width (< 1.1, 1.1–1.3,
+1.3–1.6, 1.6–2.2, > 2.2) was 99%, 99%, 88%, 74%, 67% before and is 99%, 99%, 98%, 97%, 94% now.
+Kept GBM in that band was 3.9% narrower than all of it and is now 0.5% narrower; the mean
+width of all kept GBM rose by 1.5%. Thick GBM is no longer excluded for being thick.
+
+**Costs.** The cost of a break along the centerline trades breaks for accuracy: at 2.0 instead
+of 1.75, breaks on the real stacks fall to 2.7 (below the 3.0 before), wrong decisions rise
+slightly (4.8% and 7.8%), and on the synthetic stacks more steep GBM is kept (51% at 45–60°).
+Charging the cost through Z per piece instead of per thickness of centerline gave less flicker
+on real masks (1.3%) but excluded nothing at all at twice the real jitter, where masks are cut
+into many short pieces.
 
 **Whole-field movement on real stacks.** Five real stacks, with v10 masks on every second
 slice, before and after removing the movement. Movement is the largest anywhere in the field.
+The shares kept and excluded are from the decision rule before this one.
 
 | Stack | Movement, px per plane | Median tilt | Kept | Excluded as oblique |
 |---|---|---|---|---|
@@ -317,12 +397,14 @@ from the same images (0.59 against 0.30), but that shares its input. Width, whic
 says should rise with tilt, relates more to tracked tilt (0.27 against 0.16). So neither is
 shown to be better, and there is no ground truth here.
 
-**Decisions have not been validated on real images.** Tracked tilt has a median near 18° on
-real stacks with almost no movement, against about 11° from the image-based estimate, and
-the filter excludes about 30% of GBM there. Whether that is real or a bias from mask jitter
-is not known, so the defaults should be checked against expert review before results are
-relied on. To do that, compare a few images with the filter on and off, looking at what the
-coloured overlays exclude.
+**What is still not validated.** Decisions have not been checked against expert review. Tracked
+tilt has a median near 18° on real stacks that barely move, and the filter excludes a fifth to a
+third of GBM on four of the five stacks above. That is the size to expect: if a sheet's orientation were equally likely in every
+direction, its trace in a section would have a median tilt of 24° and 39% of it would be tilted
+past 30°, and steep GBM is fainter and less often predicted. This is an argument from geometry,
+not a measurement, so the defaults should still be compared with what an expert would keep.
+To do that, compare a few images with the filter on and off, looking at what the coloured
+overlays exclude; corrections made in the viewer are the labels such a comparison needs.
 
 ### Drawing predictions
 
