@@ -624,19 +624,21 @@ class AnalysisStore:
             )
             conn.commit()
 
-    def list_case_analyses(self, owner: str) -> list[dict]:
+    def list_case_analyses(self, owner: str | None) -> list[dict]:
+        """One owner's saved analyses, or everyone's when ``owner`` is ``None``."""
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT * FROM case_analyses WHERE owner = ?
+                SELECT * FROM case_analyses WHERE (? IS NULL OR owner = ?)
                 ORDER BY updated_at DESC, rowid DESC
                 """,
-                (owner,),
+                (owner, owner),
             ).fetchall()
             jobs = self._case_analysis_jobs(conn, [str(row["analysis_id"]) for row in rows])
         return [_case_analysis_to_dict(row, jobs.get(str(row["analysis_id"]), [])) for row in rows]
 
-    def get_case_analysis(self, owner: str, analysis_id: str) -> dict:
+    def get_case_analysis(self, owner: str | None, analysis_id: str) -> dict:
+        """A saved analysis of this owner, or of anyone when ``owner`` is ``None``."""
         with self._connect() as conn:
             row = self._require_case_analysis(conn, owner, analysis_id)
             jobs = self._case_analysis_jobs(conn, [analysis_id])
@@ -651,10 +653,10 @@ class AnalysisStore:
             conn.commit()
 
     @staticmethod
-    def _require_case_analysis(conn, owner: str, analysis_id: str):
+    def _require_case_analysis(conn, owner: str | None, analysis_id: str):
         row = conn.execute(
-            "SELECT * FROM case_analyses WHERE analysis_id = ? AND owner = ?",
-            (str(analysis_id), owner),
+            "SELECT * FROM case_analyses WHERE analysis_id = ? AND (? IS NULL OR owner = ?)",
+            (str(analysis_id), owner, owner),
         ).fetchone()
         if row is None:
             raise NotFound("Case analysis not found")

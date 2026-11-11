@@ -18,7 +18,7 @@ from flask import g, jsonify, request
 from .analysis_artifacts import ensure_run_id
 from .analysis_store import RUN_PRIORITY
 from .audit import audit_event
-from .auth import has_permission
+from .auth import has_permission, reads_all_analyses
 from .errors import APIError, BadRequest
 from .path_guard import image_path
 from .segmentation_service import (
@@ -222,7 +222,7 @@ def register_case_analysis_routes(app, config, store):
         denied = require_view()
         if denied:
             return denied
-        records = store.list_case_analyses(actor())
+        records = store.list_case_analyses(None if reads_all_analyses() else actor())
         best = store.best_runs_for_cache_keys(key for record in records for key in _job_keys(record["jobs"]))
         return jsonify({"analyses": [_analysis_payload(record, best, include_jobs=False) for record in records]})
 
@@ -261,7 +261,7 @@ def register_case_analysis_routes(app, config, store):
         denied = require_view()
         if denied:
             return denied
-        return jsonify(analysis_response(actor(), _analysis_id(analysis_id)))
+        return jsonify(analysis_response(None if reads_all_analyses() else actor(), _analysis_id(analysis_id)))
 
     @app.route("/agh/api/case-analyses/<analysis_id>", methods=["DELETE"])
     def delete_case_analysis(analysis_id):
@@ -539,6 +539,7 @@ def _analysis_payload(record: dict, best: dict, *, include_jobs: bool) -> dict:
     images = definition.get("images") or []
     payload = {
         "id": record["id"],
+        "owner": record["owner"],
         "state": record["state"],
         "status": _derived_status(record["state"], counts),
         "createdAt": record["createdAt"],

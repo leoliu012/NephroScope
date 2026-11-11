@@ -112,6 +112,10 @@ runs, then restart it. The server logs a warning while the key is on. Then:
   `&next=/agh/%23/case-analysis` to land somewhere else in the app.
 - **API:** send the header `X-AGH-Access-Key: <key>` with each request.
 
+That account can also open every account's saved case analyses, read only: it
+cannot delete, interrupt or change anyone else's. Other accounts still see only
+their own.
+
 The link puts the key in the browser's history, so treat it like a password. A key
 shorter than 32 characters, or one with no such account, is ignored. Failed tries
 count towards the login lockout.
