@@ -1020,6 +1020,33 @@ class JointDecisionTests(unittest.TestCase):
         stray = self.chain(1, run, link_z=[7, 2], links=np.hstack([same, same + 50]))
         np.testing.assert_array_equal(np.nonzero(self.decide(stray, self.chain(2, wall))[0])[0], [3, 4, 5])
 
+    def test_one_excluded_stretch_has_one_tilt_reason(self):
+        from agh_api.gbm_cross_section import (
+            REASON_COMPACT, REASON_EN_FACE, REASON_KEPT, REASON_OBLIQUE, _one_tilt_reason_per_stretch,
+        )
+
+        line = np.array([[i, i + 1] for i in range(11)])
+        length = np.full(12, 2.0)
+        O, E, K = REASON_OBLIQUE, REASON_EN_FACE, REASON_KEPT
+
+        # A stretch near 60 degrees reads as oblique and en-face by turns: mostly oblique here, so all oblique.
+        reasons = np.array([K, O, E, O, O, E, O, K, K, E, E, O])
+        _one_tilt_reason_per_stretch(reasons, length, line)
+        np.testing.assert_array_equal(reasons, [K, O, O, O, O, O, O, K, K, E, E, E])
+
+        # Length decides, not the number of pieces, and kept pieces and other reasons are left alone.
+        reasons = np.array([K, E, O, O, K, REASON_COMPACT, O, E, K, K, K, K])
+        long_first = length.copy()
+        long_first[1] = 6.0
+        _one_tilt_reason_per_stretch(reasons, long_first, line)
+        np.testing.assert_array_equal(reasons, [K, E, E, E, K, REASON_COMPACT, O, O, K, K, K, K])
+
+        # Kept and excluded are untouched whatever the reasons were.
+        reasons = np.array([O, E, K, E, O, O, K, O, K, E, K, K])
+        before = reasons != K
+        _one_tilt_reason_per_stretch(reasons, length, line)
+        np.testing.assert_array_equal(reasons != K, before)
+
     def test_fragmented_gbm_is_not_outvoted_by_its_links_through_z(self):
         # Jittery masks are cut into many short pieces. Differing through Z costs in proportion to
         # the centerline two pieces share, as evidence does, so twenty short pieces that are clearly
