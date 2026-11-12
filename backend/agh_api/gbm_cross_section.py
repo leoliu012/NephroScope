@@ -1508,6 +1508,36 @@ def decide_jointly(analyses: Sequence[PlaneAnalysis], evidence: Sequence[dict[st
     return output
 
 
+def _one_tilt_reason_per_stretch(reasons: np.ndarray, length: np.ndarray, edges: np.ndarray) -> None:
+    """Along one excluded stretch, call it oblique or en-face as a whole, in place.
+
+    Both mean the sheet is tilted past the limit, and en-face only that it is also past 60°.
+    Judged piece by piece, a stretch near 60° alternates between the two with the noise in each
+    slope, which says nothing and reads as if the decision were changing. The stretch takes
+    whichever covers more of its length. What is kept or excluded does not change.
+    """
+    tilted = (reasons == REASON_OBLIQUE) | (reasons == REASON_EN_FACE)
+    if not tilted.any() or not (reasons == REASON_EN_FACE).any():
+        return
+    pairs = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
+    pairs = pairs[tilted[pairs[:, 0]] & tilted[pairs[:, 1]]]
+    stretch = np.arange(reasons.size)
+    for _ in range(reasons.size):
+        lowest = np.minimum(stretch[pairs[:, 0]], stretch[pairs[:, 1]])
+        updated = stretch.copy()
+        np.minimum.at(updated, pairs[:, 0], lowest)
+        np.minimum.at(updated, pairs[:, 1], lowest)
+        updated = updated[updated]
+        if np.array_equal(updated, stretch):
+            break
+        stretch = updated
+    weight = np.where(tilted, np.maximum(np.nan_to_num(length), 1e-6), 0.0)
+    whole = np.bincount(stretch, weights=weight, minlength=reasons.size)
+    flat = np.bincount(stretch, weights=np.where(reasons == REASON_EN_FACE, weight, 0.0), minlength=reasons.size)
+    # On a tie it is the lesser claim, oblique.
+    reasons[tilted] = np.where(flat[stretch[tilted]] > 0.5 * whole[stretch[tilted]], REASON_EN_FACE, REASON_OBLIQUE)
+
+
 def decide_from_evidence(
     analysis: PlaneAnalysis,
     evidence: dict[str, Any],
@@ -1532,6 +1562,7 @@ def decide_from_evidence(
         reasons[final] = evidence["default_reason"]
         for mask, code in evidence["labels"]:
             reasons[mask & final] = code
+        _one_tilt_reason_per_stretch(reasons, evidence["length"], analysis.piece_edges)
         if trusted_reasons is not None:
             trusted = (np.asarray(trusted_reasons) == reasons) & (reasons != REASON_KEPT)
             reasons[trusted] = REASON_KEPT

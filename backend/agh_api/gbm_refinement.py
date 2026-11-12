@@ -83,7 +83,7 @@ STRUCTURAL_KINDS = ("add", *PAINT_KINDS)
 MAX_STROKE_POINTS = 5000
 # Browsers keep filtered measurements under a token. Evidence from an analysis stays
 # valid when only the decision rules change, so the rules have their own version.
-DECISION_VERSION = "d3"
+DECISION_VERSION = "d4"
 SEGMENTATION_OPERATION = "gbm-segmentation"
 MAX_WINDOW_LIMIT = 200
 # A correction's influence falls off over this many typical thicknesses (Gaussian

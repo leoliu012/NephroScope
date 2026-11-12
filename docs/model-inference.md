@@ -217,13 +217,19 @@ Excluded GBM is labelled as:
 | Reason | Meaning |
 |---|---|
 | Oblique | The evidence above, or part of a stretch that is |
-| En-face | Tilted beyond both the limit and 60° |
+| En-face | Tilted beyond both the limit and 60°, over most of the excluded stretch |
 | Wide patch | Over 2.5 times the width of the best-oriented GBM, and its slope could not be measured |
 | Brief in Z | Neither its medial point nor its followed centerline lasts longer than the projection plus 2 planes, and it is not cut off by the stack's ends. Not judged when slices are sampled too sparsely to tell |
 | Speck | Its 3D component has less area than about 4 thickness², and it does not persist through Z |
 | Compact | Its component is shorter than 1.5 times its width, and it does not persist through Z |
 | Below minimum / Above maximum | Thickness limits, per sample |
 | Removed by you | A correction |
+
+Oblique and en-face are given to an excluded stretch as a whole: whichever covers more of its
+length, oblique on a tie. Judged piece by piece, a stretch near 60° alternated between the two
+with the noise in each slope, which looked like the decision changing when it was not. On four
+real stacks this removed 26–41% of the changes of colour along the centerline, and what is kept
+or excluded was identical in every slice.
 
 The automatic tilt limit is the largest tilt at which apparent thickening stays
 within 35%, given the Z step and the reference thickness of the best-oriented
