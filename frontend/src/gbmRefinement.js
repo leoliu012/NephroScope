@@ -4,6 +4,7 @@
 // the prediction, a Z stack analysis and people's corrections, and these are the
 // browser's side of that.
 import { authFetch } from './auth.js'
+import { parseVolume } from './gbmVolume.js'
 import { stableModelJson } from './modelAnalysis.js'
 
 const SETTINGS_KEY = 'agh-viewer:gbm-filter:v1'
@@ -275,6 +276,25 @@ export function fetchRefinementFrames(runIds, { calibration, filter }, { signal 
   return withRetries(() => requestJson('/agh/api/analysis-runs/refinement-frames', {
     method: 'POST', body: JSON.stringify({ runIds, calibration, filter }), signal,
   }), { signal })
+}
+
+// Every slice's prediction as one coarse volume, for the 3D mode.
+export function fetchGbmVolume(runIds, { calibration, filter }, { signal } = {}) {
+  return withRetries(async () => {
+    const response = await authFetch('/agh/api/analysis-runs/gbm-volume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/octet-stream' },
+      body: JSON.stringify({ runIds, calibration, filter }),
+      signal,
+    })
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      const error = new Error(body?.error || `The 3D model request failed with ${response.status}`)
+      error.status = response.status
+      throw error
+    }
+    return parseVolume(await response.arrayBuffer())
+  }, { signal })
 }
 
 export function createPredictionEdit(runId, { kind, x, y, stroke, radius, calibration, filter }, { signal } = {}) {

@@ -239,6 +239,7 @@ class FieldMotionTests(unittest.TestCase):
 class StackFixture(unittest.TestCase):
     """A saved prediction for every other plane of ``scene_volume``, on a raw stack."""
 
+    PLANE_STEP = 2
     calibration = {"pixelSizeXUm": PIXEL_UM, "pixelSizeYUm": PIXEL_UM, "expansionEnabled": False, "expansionFactor": 1}
     filter = {"crossSection": True, "thicknessLimits": True, "minNm": 30, "maxNm": 3400, "zStepUm": Z_STEP_UM}
 
@@ -274,7 +275,7 @@ class StackFixture(unittest.TestCase):
         # A faint GBM-like line the model left below its threshold.
         yy, xx = np.mgrid[:SIZE, :SIZE]
         self.faint = (np.abs(yy - 20) < 6) & (xx > 170) & (xx < 280)
-        for z in range(0, PLANES, 2):
+        for z in range(0, PLANES, self.PLANE_STEP):
             request, key = prepare_analysis_request(self.config, self.path, {"zIndex": z, "channelIndex": 0})
             run, _ = self.store.create_or_reuse_run("case1", "stack.tif", OPERATION, request, cache_key=key)
             self.store.claim_next_run("test-worker")

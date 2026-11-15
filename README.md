@@ -82,6 +82,32 @@ model on nearby slices. See `docs/model-inference.md` for the method, how it was
 tested, and its limits: **it has been tested on synthetic stacks and on real predictions
 with a known tilt added, but not yet against expert review.**
 
+### 3D model of the GBM
+
+When an image has more than 10 Z slices and a prediction on every one of them, the
+**3D** button in the viewer's top bar shows all of them as one model. (Run thickness
+analysis with every slice selected is the quickest way to get there; the button's
+tooltip says how many slices are still missing.)
+
+- **Drag** to rotate, **Shift-drag or right-drag** to move, **scroll** to zoom towards
+  the pointer. **Top**, **Front**, **Side** and **Angled** jump to fixed views; from the
+  top, the model lies as the 2D viewer shows the image.
+- **Click the GBM** to open the Z slice nearest that point. The viewer returns to
+  that slice with the clicked place in view and marked. The label beside the pointer
+  says which slice a click would open.
+- **Colour** shows either the filter's decisions, in the same colours as on the slices
+  (measured GBM, and why the rest is not), or depth through the stack. **Excluded**
+  hides what the filter leaves out. **Z stretch** draws slices further apart than they
+  are, to see along Z in a thin stack.
+- The white line around the model is the slice open in the 2D viewer; the Z slider
+  moves it. **Save image** saves the view as a PNG.
+
+The model is each slice's prediction as the viewer shows it, corrections included,
+stacked at the recorded Z step and put in register where the Z analysis measured the
+field moving. Nothing is smoothed or filled in between slices. It is reduced so the
+longer side of the image is at most 512 voxels, so it shows shape, not thickness.
+See `docs/model-inference.md` for details.
+
 ### 4. Compare thickness across cases and images
 
 Open **Case analysis** to select cases and images, sample their Z slices, and
@@ -298,6 +324,7 @@ GET  /agh/api/analysis-runs/:id/refinement/label.png           (which piece each
 POST /agh/api/analysis-runs/refinement-frames                  (decisions for every slice of a stack)
 POST /agh/api/analysis-runs/refinement-tokens                  (is a cached filtered result still valid?)
 POST|DELETE /agh/api/analysis-runs/:id/edits                   (correct a prediction, or undo and restore)
+POST /agh/api/analysis-runs/gbm-volume                         (every slice's prediction as one 3D volume)
 GET  /agh/api/case-analyses                (your saved analyses)
 POST /agh/api/case-analyses                (create, or merge an identical one)
 GET  /agh/api/case-analyses/:id

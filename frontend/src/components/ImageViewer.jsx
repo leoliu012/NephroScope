@@ -37,6 +37,7 @@ import {
   Eye,
   EyeOff,
   BarChart3,
+  Box,
 } from 'lucide-react'
 import { jsPDF } from 'jspdf'
 import { annotationListPages, canvasBlob, downloadBlob } from '../exportPages.js'
@@ -56,6 +57,8 @@ import {
 } from '../gbmRefinement.js'
 import MultiChannelCanvas from './MultiChannelCanvas.jsx'
 import ZSliceSlider from './ZSliceSlider.jsx'
+import Gbm3DView from './Gbm3DView.jsx'
+import { volumeAvailability } from '../gbmVolume.js'
 import { zIndexForAnnotation } from '../zSliceMarkers.js'
 import { autoWindowChannelSettings, loadChannelSettings, normalizeChannelSettings, saveChannelSettings } from '../channelDisplay.js'
 import { APP_NAME, APP_VERSION } from '../appInfo.js'
@@ -390,6 +393,8 @@ export default function ImageViewer({
   const [gbmFilter, setGbmFilter] = useState(loadFilterSettings)
   const [gbmZStepOverride, setGbmZStepOverride] = useState(null)
   const [gbmEditsVersion, setGbmEditsVersion] = useState(0)
+  const [threeDOpen, setThreeDOpen] = useState(false)
+  const [slicePing, setSlicePing] = useState(null)
   const gbmHoverRef = useRef(null)
   const [annColor, setAnnColor] = useState('#000000')
   const [strokeWidth, setStrokeWidth] = useState(DEFAULT_ANNOTATION_STROKE_WIDTH)
@@ -1277,6 +1282,38 @@ export default function ImageViewer({
     filter: gbmFilterPayload,
     refreshKey: `${gbmEditsVersion}|${stackStateRef.current}`,
   })
+  // 3D mode: for stacks of more than ten slices with a prediction on every one.
+  const threeD = useMemo(() => {
+    const availability = volumeAvailability(zCount, modelRunsByZ, imageKey)
+    if (availability.available && !(currentCalibration.pixelSizeXUm > 0)) {
+      return { ...availability, available: false, reason: 'Set the pixel size of this image to view it in 3D' }
+    }
+    return availability
+  }, [zCount, modelRunsByZ, imageKey, currentCalibration.pixelSizeXUm])
+  useEffect(() => { if (!threeD.available) setThreeDOpen(false) }, [threeD.available])
+  useEffect(() => { setThreeDOpen(false); setSlicePing(null) }, [imageKey])
+  const closeThreeD = useCallback(() => setThreeDOpen(false), [])
+  // A click on the model opens its slice, with the clicked place in view and marked.
+  const openSliceFromModel = useCallback(({ zIndex: slice, x, y }) => {
+    setThreeDOpen(false)
+    commitZSlice(slice)
+    const bounds = viewportRef.current?.getBoundingClientRect()
+    if (bounds) {
+      const view = viewRef.current
+      const screenX = view.tx + x * view.scale, screenY = view.ty + y * view.scale
+      const margin = 48
+      if (screenX < margin || screenY < margin || screenX > bounds.width - margin || screenY > bounds.height - margin) {
+        setTx(bounds.width / 2 - x * view.scale)
+        setTy(bounds.height / 2 - y * view.scale)
+      }
+    }
+    setSlicePing({ x, y, key: Date.now() })
+  }, [commitZSlice])
+  useEffect(() => {
+    if (!slicePing) return undefined
+    const timer = window.setTimeout(() => setSlicePing(null), 2600)
+    return () => window.clearTimeout(timer)
+  }, [slicePing])
   const predictionAppearance = useMemo(() => ({
     visible: modelOverlaySettings.visible || modelSkeletonSettings.visible,
     showMask: modelOverlaySettings.visible,
@@ -2137,6 +2174,15 @@ export default function ImageViewer({
             title="Choose Z slices and analyze full-image GBM thickness">
             <BarChart3 size={14} />Run thickness analysis
           </button>
+          <button type="button" onClick={() => setThreeDOpen(open => !open)}
+            disabled={!threeD.available}
+            className={`ux-button ux-button-secondary whitespace-nowrap ${threeDOpen ? 'gf-tool-active' : ''}`}
+            aria-pressed={threeDOpen}
+            title={threeD.available
+              ? (threeDOpen ? 'Back to the slices' : 'Show the GBM predictions of every Z slice as a 3D model')
+              : threeD.reason}>
+            <Box size={14} />3D
+          </button>
           <div className="ux-divider mx-1 h-5 w-px" />
           <button onClick={setActualSize}
             className="ux-button ux-button-ghost font-mono">
@@ -2171,6 +2217,20 @@ export default function ImageViewer({
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
         >
+          {threeDOpen && threeD.available && (
+            <Gbm3DView
+              runIds={threeD.runIds}
+              calibration={currentCalibration}
+              filter={gbmFilterPayload}
+              refreshKey={`${gbmEditsVersion}|${stackStateRef.current}`}
+              zIndex={zIndex}
+              keptColor={modelOverlaySettings.color}
+              imageName={filename}
+              showExcludedDefault={gbmFilter.showExcluded}
+              onOpenSlice={openSliceFromModel}
+              onClose={closeThreeD}
+            />
+          )}
           <div ref={gbmHoverRef} className="gf-hover" role="status" style={{ display: 'none' }} />
           <GbmRecalculatingPopup message={gbmRecalculationMessage} />
           {canAnnotate && annotationToolsOpen && (
@@ -2350,6 +2410,13 @@ export default function ImageViewer({
                   zIndex={zIndex}
                   zCount={zCount}
                   readOnly={!canAnnotate}
+                />
+              )}
+              {slicePing && (
+                <div
+                  key={slicePing.key}
+                  className="slice-ping"
+                  style={{ left: slicePing.x, top: slicePing.y, '--ping-size': `${44 / Math.max(scale, 1e-6)}px`, '--ping-line': `${2 / Math.max(scale, 1e-6)}px` }}
                 />
               )}
               {imgMeta && modelOverlayAligned && (
@@ -2922,17 +2989,20 @@ export default function ImageViewer({
         </aside>
       )}
 
-      <button
-        type="button"
-        onClick={() => setExportPanelOpen(open => !open)}
-        className="fixed z-[55] ux-button ux-button-primary px-4 py-2 shadow-2xl"
-        style={exportFloatingStyle}
-        aria-expanded={exportPanelOpen}
-      >
-        <Download size={14} /> Export
-      </button>
+      {/* Export is of the slice; the 3D view saves its own picture. */}
+      {!threeDOpen && (
+        <button
+          type="button"
+          onClick={() => setExportPanelOpen(open => !open)}
+          className="fixed z-[55] ux-button ux-button-primary px-4 py-2 shadow-2xl"
+          style={exportFloatingStyle}
+          aria-expanded={exportPanelOpen}
+        >
+          <Download size={14} /> Export
+        </button>
+      )}
 
-      {exportPanelOpen && (
+      {exportPanelOpen && !threeDOpen && (
         <div
           role="dialog"
           aria-labelledby="image-export-title"

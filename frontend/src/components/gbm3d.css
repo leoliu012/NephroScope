@@ -1,0 +1,42 @@
+.g3-root { position: absolute; inset: 0; z-index: 45; overflow: hidden; background: #0b0f16; color: var(--text-muted); font-size: 12px; user-select: none; }
+.g3-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; outline: none; }
+.g3-panel { position: absolute; display: flex; flex-direction: column; gap: 6px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: rgba(16, 19, 23, 0.86); backdrop-filter: blur(6px); line-height: 1.45; }
+.g3-info { top: 10px; left: 10px; max-width: min(360px, calc(100% - 20px)); }
+.g3-info strong { color: var(--text); font-size: 13px; }
+.g3-info span { font-variant-numeric: tabular-nums; }
+.g3-warning { color: var(--warning); }
+.g3-error { color: var(--danger); }
+.g3-busy { display: inline-flex; align-items: center; gap: 6px; color: var(--accent); }
+.g3-controls { top: 50px; right: 10px; }
+.g3-row { display: flex; align-items: center; gap: 6px; }
+.g3-label { width: 54px; flex-shrink: 0; color: var(--text-subtle); font-size: 11px; font-weight: 600; }
+.g3-chip { display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border: 1px solid var(--border-strong); border-radius: 999px; background: var(--surface-2); color: var(--text-muted); font-size: 11px; font-weight: 600; cursor: pointer; }
+.g3-chip:hover { background: var(--surface-hover); color: var(--text); }
+.g3-chip-active { border-color: var(--accent); background: var(--accent-soft); color: var(--text); }
+.g3-check { display: inline-flex; align-items: center; gap: 5px; margin-left: 6px; color: var(--text-muted); font-size: 11px; cursor: pointer; }
+.g3-check input { accent-color: var(--accent); }
+.g3-controls input[type="range"] { flex: 1; min-width: 110px; accent-color: var(--accent); }
+.g3-value { width: 30px; text-align: right; color: var(--text); font-variant-numeric: tabular-nums; }
+.g3-actions { position: absolute; top: 10px; right: 10px; display: flex; gap: 6px; }
+.g3-actions .ux-button { min-height: 30px; padding: 0 10px; background: rgba(16, 19, 23, 0.86); }
+.g3-legend { right: 10px; bottom: 10px; max-width: 240px; font-size: 11px; }
+.g3-legend ul { display: flex; flex-direction: column; gap: 3px; }
+.g3-legend li, .g3-legend p { display: flex; align-items: center; gap: 7px; }
+.g3-legend i { width: 10px; height: 10px; flex-shrink: 0; border-radius: 2px; }
+.g3-legend p { padding-top: 5px; border-top: 1px solid var(--border); color: var(--text-subtle); }
+.g3-legend .g3-line { height: 2px; border-radius: 1px; background: #fff; }
+.g3-depth { display: grid; grid-template-columns: auto minmax(90px, 1fr) auto; align-items: center; gap: 7px; font-variant-numeric: tabular-nums; }
+.g3-depth i { width: auto; height: 8px; border-radius: 4px; }
+.g3-hint { position: absolute; left: 10px; bottom: 10px; max-width: calc(100% - 20px); color: var(--text-subtle); font-size: 11px; pointer-events: none; }
+.g3-hover { position: absolute; z-index: 2; transform: translate(-50%, calc(-100% - 16px)); padding: 4px 10px; border-radius: 999px; background: rgba(15, 23, 42, 0.92); border: 1px solid rgba(255, 209, 102, 0.55); color: #f8fafc; font-size: 12px; white-space: nowrap; pointer-events: none; font-variant-numeric: tabular-nums; }
+.g3-cover { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; background: #0b0f16; color: var(--text-muted); font-size: 13px; text-align: center; padding: 24px; }
+.g3-cover svg { color: var(--accent); }
+
+/* Where a click on the 3D model landed, once its slice is open. */
+.slice-ping { position: absolute; z-index: 35; width: var(--ping-size); height: var(--ping-size); margin: calc(var(--ping-size) / -2) 0 0 calc(var(--ping-size) / -2); border: var(--ping-line) solid #ffd166; border-radius: 50%; box-shadow: 0 0 0 var(--ping-line) rgba(8, 10, 13, 0.7); pointer-events: none; animation: slice-ping 2.6s ease-out forwards; }
+@keyframes slice-ping {
+  0% { transform: scale(2.4); opacity: 0; }
+  15% { transform: scale(1); opacity: 1; }
+  70% { transform: scale(1); opacity: 1; }
+  100% { transform: scale(1); opacity: 0; }
+}

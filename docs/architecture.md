@@ -40,6 +40,8 @@ infra/
   selected v13 halo/D4 whole-image inference contract around that v10 model.
 - `gbm_thickness.py` implements full-mask skeleton and Euclidean-distance ROI
   thickness.
+- `gbm_volume.py` stacks every slice's prediction, as the viewer shows it, into the
+  coarse volume the viewer's 3D mode draws.
 - `file_lock.py` provides `fcntl.flock()` locks for single-server writes.
 - `__init__.py` is the application factory and route wiring.
 

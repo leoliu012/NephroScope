@@ -1,9 +1,10 @@
 """Routes for cross-section filtering and human corrections of GBM predictions."""
 from __future__ import annotations
 
+import gzip
 import math
 
-from flask import g, jsonify, request, send_file
+from flask import Response, g, jsonify, request, send_file
 
 from .analysis_artifacts import ensure_run_id
 from .audit import audit_event
@@ -24,6 +25,7 @@ from .gbm_refinement import (
     stack_state,
 )
 from .gbm_refinement import _public_state
+from .gbm_volume import build_gbm_volume
 from .path_guard import image_path
 from .segmentation_service import validate_thickness_request
 
@@ -123,6 +125,34 @@ def register_gbm_refinement_routes(app, config, store):
             "roi": {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]]},
         }, next(iter(runs.values())))
         return jsonify(refinement_frames(config, store, runs, settings, options, calibration))
+
+    @app.route("/agh/api/analysis-runs/gbm-volume", methods=["POST"])
+    def gbm_volume():
+        """Every slice's prediction as one coarse 3D volume, for the viewer's 3D mode."""
+        denied = require("view")
+        if denied:
+            return denied
+        body = _json_body()
+        run_ids = body.get("runIds")
+        if not isinstance(run_ids, list) or not run_ids or len(run_ids) > MAX_TOKEN_RUNS:
+            raise BadRequest(f"runIds must list 1 to {MAX_TOKEN_RUNS} runs")
+        runs = store.get_runs(ensure_run_id(run_id) for run_id in run_ids)
+        if len(runs) != len(set(run_ids)):
+            raise Conflict("Some of these predictions no longer exist")
+        settings, options = parse_filter(body.get("filter") if body.get("filter") is not None else {})
+        _, calibration = validate_thickness_request({
+            "calibration": body.get("calibration"),
+            "roi": {"type": "polygon", "points": [[0, 0], [1, 0], [1, 1]]},
+        }, next(iter(runs.values())))
+        payload = build_gbm_volume(config, store, runs, settings, options, calibration)
+        response = Response(payload, mimetype="application/octet-stream")
+        if "gzip" in (request.headers.get("Accept-Encoding") or "").lower():
+            response.headers["Content-Encoding"] = "gzip"
+            response.headers["Vary"] = "Accept-Encoding"
+        else:
+            response.set_data(gzip.decompress(payload))
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.route("/agh/api/analysis-runs/<run_id>/edits", methods=["POST"])
     def gbm_create_edit(run_id):

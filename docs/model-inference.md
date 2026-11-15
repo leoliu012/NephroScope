@@ -438,6 +438,70 @@ from 4–11 images and no predictions shown, at 18–48 frames per second with s
 100 ms, to all 44 of each at 58–60 frames per second with no stalls, once the slices are loaded.
 The first pass over slices not yet loaded shows about 30 of the 44.
 
+## 3D model
+
+Implemented in `backend/agh_api/gbm_volume.py` (the volume), `frontend/src/gbmVolume.js`
+(its surface, and what a click points at) and `frontend/src/gbm3dRenderer.js` (drawing).
+
+The 3D mode is offered for an image with more than 10 Z slices once every slice has a
+finished prediction. It adds nothing to the predictions: it shows them together.
+
+### The volume
+
+`POST /analysis-runs/gbm-volume` takes the run of every slice and returns one layer per
+slice. A layer is what the viewer shows on that slice: the piece image the overlay draws
+from, with the decision for each piece, so corrections and the current filter settings are
+in it. Where the Z analysis is not ready, a layer is the plain prediction and all of it is
+shown as measured; the 3D view says how many layers that is.
+
+- **Reduced, not smoothed.** Each layer is reduced by whole pixels so the longer side of the
+  image is at most 512 voxels (4 times for a 1952 px image). A voxel holds the share of its
+  block that is GBM, the share that is measured GBM, and the reason code found in the block.
+  Nothing is blurred, closed or interpolated between slices.
+- **In register.** Where the Z analysis measured the field moving, each layer is placed in
+  the frame shared by the stack, with the same registration the tilt measurement uses, so a
+  wall that is vertical in the sample is vertical in the model. The volume is widened to
+  hold the slices, by at most a quarter of the image on each side. The header says where
+  each voxel of each layer is in that slice's own image, which is how a click finds its
+  place again.
+- **Proportions.** Voxels are drawn at the pixel size times the reduction, and slices at the
+  Z step the filter uses (entered, or from the file). With no Z step, slices are drawn one
+  voxel apart and the view says so. Expansion is not applied: the model is as imaged.
+- **The ends repeat.** The first and last two slices are predicted from the same five planes
+  as their neighbour, so those layers repeat it.
+
+The response is three volumes of one byte per voxel behind a small JSON header, sent
+gzip-compressed. Built volumes are kept in memory for the last few requests.
+
+### The surface, and a click
+
+The browser turns the volume into a surface where half a voxel is GBM (surface nets, in a
+worker), treating the volume as empty beyond its faces, so GBM cut by the first or last
+slice ends in a flat cap. Each vertex is coloured by whether the GBM around it is measured,
+and otherwise by its reason, with the colours the slices use.
+
+A click sends a ray from the camera through the pointer and takes the first place it meets
+GBM that is drawn, by stepping through the volume. The slice is the layer nearest that
+place, and the position in the slice's image comes from the layer's registration. The
+viewer opens that slice and marks the place.
+
+### What it is good for, and not
+
+At 4 times reduction a GBM 12 px wide is 3 voxels wide. The model shows shape, continuity
+through Z and where the filter's decisions fall on the sheet. It is not for reading
+thickness, and gaps or bridges narrower than a voxel can close or open in it.
+
+### Checked
+
+On synthetic stacks (shells around overlapping balls, a prediction on every slice, masks
+jittered between slices): a 1952 × 1952, 60-slice stack took 1.3 s to build on the server
+(2.7 MB sent) and 1.7 s from pressing **3D** to a drawn model, and turned at 60 frames per
+second on an Apple-silicon laptop. Clicks opened the slice the pointer label named, with the
+mark on the clicked wall. Tests cover reduction, registration and the way back from a voxel
+to a slice (`backend/tests/test_gbm_volume.py`), and that the surface is closed, faces
+outwards, and is hit where expected (`frontend/src/gbmVolume.selftest.mjs`). **It has not
+been run on real stacks yet**, and not on other graphics hardware.
+
 ## Persistence and Z status
 
 Queued, running, failed, and successful runs are stored in the analysis SQLite
