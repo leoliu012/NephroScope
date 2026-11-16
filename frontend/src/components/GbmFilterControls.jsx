@@ -88,6 +88,11 @@ export default function GbmFilterControls({
           onChange={event => patch({ maxTiltDeg: Number(event.target.value) })} />
         <span>{settings.maxTiltDeg}°</span>
       </label>}
+      <label className="gf-switch">
+        <input type="checkbox" checked={settings.tiltCorrection && !noZStep} disabled={noZStep} onChange={event => patch({ tiltCorrection: event.target.checked })} />
+        <span>Correct thickness for tilt</span>
+      </label>
+      {settings.tiltCorrection && !noZStep && <p className="gf-note">A slice cuts a leaning sheet obliquely, so each width is multiplied by the cosine of its sheet's tilt. With that, the automatic limit excludes for tilt only past 40°.</p>}
       <div className="gf-row">
         <span>Z window</span>
         <select className="ux-input" aria-label="Z window" value={settings.windowAuto ? 'auto' : 'manual'} onChange={event => patch({ windowAuto: event.target.value === 'auto' })}>

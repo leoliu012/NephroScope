@@ -424,6 +424,19 @@ def _points_in_polygon(
     return inside | boundary
 
 
+# Tilt-corrected diameters are rounded to a tenth of a nanometre before counting.
+SCALED_DIAMETER_DECIMALS = 4
+
+
+def _sample_scale(sample_scale: Any, count: int) -> np.ndarray | None:
+    if sample_scale is None:
+        return None
+    scale = np.asarray(sample_scale, dtype=np.float64)
+    if scale.shape != (count,) or not np.isfinite(scale).all() or np.any(scale <= 0) or np.any(scale > 1):
+        raise ValueError("sample_scale must hold one factor in (0, 1] per centerline sample")
+    return scale
+
+
 def gbm_thickness_distribution_from_geometry(
     geometry: ThicknessGeometry,
     *,
@@ -431,11 +444,17 @@ def gbm_thickness_distribution_from_geometry(
     pixel_size_y_um: float | None = None,
     expansion_factor: float = 1.0,
     sample_mask: np.ndarray | None = None,
+    sample_scale: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """All full-mask centerline diameters, losslessly encoded as value/count pairs.
 
     Repeated measurements retain their multiplicity; these are not image means
     or histogram bins. The diameter/calibration calculation matches ROI means.
+
+    ``sample_scale`` multiplies each sample's diameter (the cosine of its sheet's
+    tilt, see ``gbm_cross_section.tilt_correction_factor``). Scaled diameters no
+    longer repeat, so they are rounded to ``SCALED_DIAMETER_DECIMALS`` to keep the
+    value/count encoding small.
     """
     size_x, size_y, expansion = _calibration(
         pixel_size_x_um, pixel_size_y_um, expansion_factor,
@@ -445,6 +464,9 @@ def gbm_thickness_distribution_from_geometry(
         geometry.nearest_background_dx_pixels.astype(np.float64) * size_x,
     ) / expansion
     components = geometry.skeleton_component
+    scale = _sample_scale(sample_scale, diameters.size)
+    if scale is not None:
+        diameters = np.round(diameters * scale, SCALED_DIAMETER_DECIMALS)
     if sample_mask is not None:
         diameters = diameters[sample_mask]
         components = components[sample_mask]
@@ -456,6 +478,7 @@ def gbm_thickness_distribution_from_geometry(
         "borderSampleCount": int(np.isin(components, geometry.border_components).sum()),
         "coverage": "full-mask-centerline",
         "unit": "µm",
+        "tiltCorrected": scale is not None,
     }
 
 
@@ -467,8 +490,12 @@ def measure_gbm_thickness_from_geometry(
     pixel_size_y_um: float | None = None,
     expansion_factor: float = 1.0,
     sample_mask: np.ndarray | None = None,
+    sample_scale: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Measure one ROI from a saved geometry artifact using NumPy only."""
+    """Measure one ROI from a saved geometry artifact using NumPy only.
+
+    ``sample_scale`` multiplies each sample's diameter, as for the distribution.
+    """
     if not isinstance(geometry, ThicknessGeometry):
         raise TypeError("geometry must be a loaded ThicknessGeometry")
     polygon = _polygon(roi_vertices)
@@ -501,6 +528,10 @@ def measure_gbm_thickness_from_geometry(
     dy_pixels = geometry.nearest_background_dy_pixels[inside].astype(np.float64)
     dx_pixels = geometry.nearest_background_dx_pixels[inside].astype(np.float64)
     observed_um = 2.0 * np.hypot(dy_pixels * size_y, dx_pixels * size_x)
+    scale = _sample_scale(sample_scale, geometry.skeleton_y.size)
+    if scale is not None:
+        local_pixels = local_pixels * scale[inside]
+        observed_um = observed_um * scale[inside]
     corrected_um = observed_um / expansion
     selected_degree = geometry.skeleton_degree[inside]
     selected_component = geometry.skeleton_component[inside]
@@ -526,7 +557,9 @@ def measure_gbm_thickness_from_geometry(
         "measurement_method": (
             "2 * full-mask nearest-background EDT vector, skeleton-pixel mean "
             "at centerline samples inside ROI"
+            + (", each sample times the cosine of its sheet's tilt" if scale is not None else "")
         ),
+        "tiltCorrected": scale is not None,
         "mean_thickness_pixels": float(np.mean(local_pixels)),
         "median_thickness_pixels": float(np.median(local_pixels)),
         "observed_mean_um": float(np.mean(observed_um)),

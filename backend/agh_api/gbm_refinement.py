@@ -68,6 +68,7 @@ from .gbm_cross_section import (
     decide_jointly,
     estimate_field_motion,
     piece_evidence,
+    tilt_correction_factor,
     to_plane,
     to_shared,
 )
@@ -83,7 +84,7 @@ STRUCTURAL_KINDS = ("add", *PAINT_KINDS)
 MAX_STROKE_POINTS = 5000
 # Browsers keep filtered measurements under a token. Evidence from an analysis stays
 # valid when only the decision rules change, so the rules have their own version.
-DECISION_VERSION = "d4"
+DECISION_VERSION = "d5"
 SEGMENTATION_OPERATION = "gbm-segmentation"
 MAX_WINDOW_LIMIT = 200
 # A correction's influence falls off over this many typical thicknesses (Gaussian
@@ -132,6 +133,7 @@ def parse_filter(raw: Any) -> tuple[FilterSettings, dict] | None:
         thickness_limits=raw.get("thicknessLimits", True) is not False,
         min_nm=number("minNm", 0, 100000, DEFAULT_MIN_THICKNESS_NM),
         max_nm=number("maxNm", 0, 1000000, DEFAULT_MAX_THICKNESS_NM),
+        tilt_correction=raw.get("tiltCorrection", False) is True,
     )
     if settings.min_nm >= settings.max_nm:
         raise BadRequest("filter.minNm must be below filter.maxNm")
@@ -836,6 +838,7 @@ def stack_exclusions(
     """
     key = (
         "stack-exclusions", stack_run["runId"], (stack_run.get("result") or {}).get("artifactAttempt"), settings.max_tilt_deg,
+        bool(settings.tilt_correction),
         round(float(pixel), 9), None if not z_step_um else round(float(z_step_um), 9), revision,
     )
     if memo is not None and key in memo:
@@ -858,6 +861,7 @@ def stack_exclusions(
             plane_settings = FilterSettings(
                 cross_section=True, max_tilt_deg=settings.max_tilt_deg, thickness_limits=False,
                 mip_planes=int(member.get("mipZ") or MIP_PLANES), plane_step=plane_step,
+                tilt_correction=settings.tilt_correction,
             )
             entry = piece_evidence(analysis, plane_settings, pixel_size_um=pixel, z_step_um=z_step_um)
             if clicks:
@@ -910,7 +914,7 @@ def decide(
     settings = FilterSettings(
         cross_section=settings.cross_section, max_tilt_deg=settings.max_tilt_deg,
         thickness_limits=settings.thickness_limits, min_nm=settings.min_nm, max_nm=settings.max_nm,
-        mip_planes=mip_planes, plane_step=plane_step,
+        mip_planes=mip_planes, plane_step=plane_step, tilt_correction=settings.tilt_correction,
     )
     first = piece_evidence(analysis, settings, pixel_size_um=pixel, z_step_um=z_step["um"])
     field_, trusted = _local_limits(
@@ -967,6 +971,7 @@ def filtered_samples(config, store, run: dict, settings: FilterSettings, options
     geometry = view.geometry
     count = geometry.skeleton_y.size
     within_limits = np.ones(count, dtype=bool)
+    thickness_nm = None
     if settings.thickness_limits:
         thickness_nm = 2.0 * np.hypot(
             geometry.nearest_background_dy_pixels.astype(np.float64) * float(calibration["pixelSizeYUm"]),
@@ -985,11 +990,12 @@ def filtered_samples(config, store, run: dict, settings: FilterSettings, options
         "keptSamples": int(within_limits.sum()),
         "byReason": {},
         "crossSection": settings.cross_section,
+        "tiltCorrection": False,
     }
     if view.analysis is None:
         if not info["pending"]:
             info["applied"] = True
-        return {"geometry": geometry, "keep": within_limits, "info": info, "view": view}
+        return {"geometry": geometry, "keep": within_limits, "scale": None, "info": info, "view": view}
     z_step = resolve_z_step(config, run, options.get("zStepUm"))
     members = ((view.stack_run or {}).get("request") or {}).get("members") or []
     mip_planes = len((run.get("request") or {}).get("zWindow") or [MIP_PLANES])
@@ -997,6 +1003,14 @@ def filtered_samples(config, store, run: dict, settings: FilterSettings, options
     pieces = view.analysis.sample_piece
     pinned = decided["pinned"][pieces]
     sample_reason = decided["reasons"][pieces]
+    # A sheet's own thickness is what a slice shows of it times the cosine of its tilt.
+    # Tilt is only known with a Z step and neighbouring planes; without, nothing is corrected.
+    scale = None
+    if settings.tilt_correction and settings.cross_section and decided.get("tilt_deg") is not None:
+        scale = tilt_correction_factor(decided["tilt_deg"])[pieces]
+        if thickness_nm is not None:
+            corrected_nm = thickness_nm * scale
+            within_limits = (corrected_nm >= settings.min_nm) & (corrected_nm <= settings.max_nm)
     keep = (sample_reason == REASON_KEPT) & (within_limits | pinned)
     if settings.cross_section:
         # Tapers, spurs and junctions belong to the GBM but are not measured.
@@ -1012,8 +1026,9 @@ def filtered_samples(config, store, run: dict, settings: FilterSettings, options
         limitDeg=decided["limit_deg"],
         zStep=z_step,
         hasNeighbours=view.analysis.neighbour_planes > 0,
+        tiltCorrection=scale is not None,
     )
-    return {"geometry": geometry, "keep": keep, "info": info, "view": view, "decided": decided, "zStep": z_step}
+    return {"geometry": geometry, "keep": keep, "scale": scale, "info": info, "view": view, "decided": decided, "zStep": z_step}
 
 
 def _plane_step(members: list[dict]) -> float:

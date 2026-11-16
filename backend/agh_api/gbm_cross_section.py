@@ -1109,6 +1109,12 @@ CROSS_SECTION_REASONS = (
 
 AUTO_TILT_INFLATION = 1.35
 AUTO_TILT_RANGE_DEG = (20.0, 40.0)
+# With thickness corrected for tilt, a leaning sheet no longer reads wide, so the automatic
+# limit is where the correction itself stops holding. On four real stacks the corrected
+# width of kept GBM stayed within a tenth of upright GBM up to 40 degrees, with no trend
+# across stacks; from 40 to 45 it read 8 percent low on average, because the model marks
+# less of a steep sheet than geometry says.
+CORRECTED_TILT_LIMIT_DEG = 40.0
 # With no Z step on record: a sheet smeared sideways by this multiple of its own
 # thickness cannot be measured as a cross-section at all.
 EN_FACE_SMEAR = 1.0
@@ -1300,6 +1306,21 @@ class FilterSettings:
     max_nm: float = DEFAULT_MAX_THICKNESS_NM
     mip_planes: int = MIP_PLANES
     plane_step: float = 1.0
+    # Report each kept sample's width times the cosine of its sheet's tilt, and exclude
+    # for tilt only past ``CORRECTED_TILT_LIMIT_DEG`` unless a limit is given.
+    tilt_correction: bool = False
+
+
+def tilt_correction_factor(tilt_deg: np.ndarray) -> np.ndarray:
+    """What a width seen in a slice is multiplied by to give the sheet's own thickness.
+
+    A slice cuts a sheet leaning by ``tilt`` from vertical obliquely, so the cut is wider
+    than the sheet by 1 / cos(tilt). Where no tilt was measured nothing is corrected.
+    """
+    tilt = np.asarray(tilt_deg, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        factor = np.cos(np.radians(np.clip(tilt, 0.0, 89.0)))
+    return np.where(np.isfinite(tilt), factor, 1.0)
 
 
 def piece_evidence(
@@ -1334,6 +1355,8 @@ def piece_evidence(
         limit = None
     elif settings.max_tilt_deg is not None:
         limit = float(settings.max_tilt_deg)
+    elif settings.tilt_correction:
+        limit = CORRECTED_TILT_LIMIT_DEG
     else:
         limit = auto_max_tilt_deg(float(z_step_um), reference_um, settings.mip_planes)
     field_ = np.full(count, np.nan if limit is None else limit) if tilt_limit_field is None else np.asarray(tilt_limit_field, dtype=np.float64)
@@ -1568,6 +1591,8 @@ def decide_from_evidence(
             reasons[trusted] = REASON_KEPT
     if settings.thickness_limits and count:
         thickness_nm = evidence["width"] * float(pixel_size_um) / float(expansion_factor) * 1000.0
+        if settings.tilt_correction:
+            thickness_nm = thickness_nm * tilt_correction_factor(evidence["tilt_deg"])
         with np.errstate(invalid="ignore"):
             reasons[(thickness_nm < settings.min_nm) & (reasons == 0)] = REASON_TOO_THIN
             reasons[(thickness_nm > settings.max_nm) & (reasons == 0)] = REASON_TOO_THICK
@@ -1632,6 +1657,7 @@ __all__ = [name for name in globals() if name.isupper()] + [
     "decide_jointly",
     "match_pieces",
     "piece_evidence",
+    "tilt_correction_factor",
     "z_coupling_reach",
     "estimate_field_motion",
     "signed_distance",

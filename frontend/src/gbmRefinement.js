@@ -15,6 +15,8 @@ export const DEFAULT_FILTER_SETTINGS = Object.freeze({
   crossSection: true,
   tiltAuto: true,
   maxTiltDeg: 25,
+  // A width is reported as the sheet's own thickness: times the cosine of its tilt.
+  tiltCorrection: true,
   windowAuto: true,
   window: 30,
   thicknessLimits: true,
@@ -60,6 +62,7 @@ export function normalizeFilterSettings(raw) {
     crossSection: value.crossSection !== false,
     tiltAuto: value.tiltAuto !== false,
     maxTiltDeg: clamp(Math.round(finite(value.maxTiltDeg, base.maxTiltDeg)), 1, 89),
+    tiltCorrection: value.tiltCorrection !== false,
     windowAuto: value.windowAuto !== false,
     window: clamp(Math.round(finite(value.window, base.window)), 1, MAX_WINDOW),
     thicknessLimits: value.thicknessLimits !== false,
@@ -116,6 +119,8 @@ export function filterPayload(settings, zStepUm = null) {
     maxNm: value.maxNm,
     window: value.windowAuto ? DEFAULT_FILTER_SETTINGS.window : value.window,
     ...(value.tiltAuto ? {} : { maxTiltDeg: value.maxTiltDeg }),
+    // Tilt is only measured by the cross-section filter, so without it nothing can be corrected.
+    ...(value.crossSection && value.tiltCorrection ? { tiltCorrection: true } : {}),
     ...(zStepUm ? { zStepUm } : {}),
   }
 }
@@ -130,6 +135,7 @@ export function filterLabel(settings) {
   const parts = []
   if (value.crossSection) {
     parts.push(`Cross-sections only (tilt ${value.tiltAuto ? 'limit auto' : `≤ ${value.maxTiltDeg}°`}, Z window ${value.windowAuto ? 'auto up to ±30' : `±${value.window}`})`)
+    parts.push(value.tiltCorrection ? 'thickness corrected for tilt' : 'thickness not corrected for tilt')
   }
   if (value.thicknessLimits) parts.push(`thickness ${value.minNm}–${value.maxNm} nm`)
   return parts.length ? parts.join(' · ') : 'All model predictions'

@@ -54,6 +54,32 @@ class DistributionGeometryTests(unittest.TestCase):
         expected = 2 * np.hypot(np.array([1, 1, 1, 2, 3]) * 0.5, np.array([2, 0, 2, 1, 0]) * 0.25) / 3
         np.testing.assert_allclose(np.repeat(result["valuesUm"], result["counts"]), np.sort(expected))
 
+    def test_a_factor_per_sample_scales_every_diameter(self):
+        geometry = sample_geometry()
+        calibration = dict(pixel_size_x_um=0.2, pixel_size_y_um=0.5, expansion_factor=2)
+        scale = np.array([1.0, 0.5, 1.0, 0.8, 0.9])
+        distribution = gbm_thickness.gbm_thickness_distribution_from_geometry(geometry, **calibration, sample_scale=scale)
+        self.assertTrue(distribution["tiltCorrected"])
+        expected = np.array([0.5, 0.5, 0.5, 1.0, 1.5]) * scale
+        np.testing.assert_allclose(np.repeat(distribution["valuesUm"], distribution["counts"]), np.sort(expected))
+        keep = np.array([True, True, False, True, False])
+        kept = gbm_thickness.gbm_thickness_distribution_from_geometry(geometry, **calibration, sample_scale=scale, sample_mask=keep)
+        np.testing.assert_allclose(np.repeat(kept["valuesUm"], kept["counts"]), np.sort(expected[keep]))
+        roi = gbm_thickness.measure_gbm_thickness_from_geometry(
+            geometry, [[0, 0], [12, 0], [12, 12], [0, 12]], **calibration, sample_scale=scale, sample_mask=keep,
+        )
+        self.assertTrue(roi["tiltCorrected"])
+        self.assertAlmostEqual(roi["meanThicknessUm"], expected[keep].mean())
+        self.assertAlmostEqual(roi["meanThicknessPixels"], (geometry.local_thickness_pixels * scale)[keep].mean())
+        self.assertFalse(gbm_thickness.gbm_thickness_distribution_from_geometry(geometry, **calibration)["tiltCorrected"])
+
+    def test_a_factor_that_cannot_be_a_cosine_is_refused(self):
+        geometry = sample_geometry()
+        for bad in (np.ones(4), np.array([1.0, 1.0, 1.0, 1.0, 1.2]), np.array([1.0, 1.0, 0.0, 1.0, 1.0]), np.array([1.0, np.nan, 1.0, 1.0, 1.0])):
+            with self.subTest(scale=bad):
+                with self.assertRaises(ValueError):
+                    gbm_thickness.gbm_thickness_distribution_from_geometry(geometry, pixel_size_x_um=0.5, sample_scale=bad)
+
     def test_empty_mask_has_no_fabricated_zero_thickness_sample(self):
         result = gbm_thickness.gbm_thickness_distribution_from_geometry(sample_geometry(True), pixel_size_x_um=0.5)
         self.assertEqual(result["valuesUm"], [])

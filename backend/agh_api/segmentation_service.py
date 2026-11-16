@@ -288,10 +288,11 @@ def measure_run_thickness(config, run: dict, payload, store=None) -> dict:
 
     parsed = parse_filter(raw_filter)
     filter_info = None
-    sample_mask = None
+    sample_mask = sample_scale = None
     if parsed is not None and store is not None:
         outcome = filtered_samples(config, store, run, parsed[0], parsed[1], calibration)
         geometry, sample_mask, filter_info = outcome["geometry"], outcome["keep"], outcome["info"]
+        sample_scale = outcome.get("scale")
     else:
         geometry = load_thickness_geometry(
             thickness_geometry_path(
@@ -312,6 +313,7 @@ def measure_run_thickness(config, run: dict, payload, store=None) -> dict:
                 else 1.0
             ),
             sample_mask=sample_mask,
+            sample_scale=sample_scale,
         )
     except ValueError as exc:
         raise BadRequest(str(exc)) from exc
@@ -365,10 +367,11 @@ def measure_run_distribution(config, run: dict, payload, store=None, memo: dict 
 
     parsed = parse_filter(payload.get("filter"))
     filter_info = None
-    sample_mask = None
+    sample_mask = sample_scale = None
     if parsed is not None and store is not None:
         outcome = filtered_samples(config, store, run, parsed[0], {**parsed[1], "memo": memo}, calibration)
         geometry, sample_mask, filter_info = outcome["geometry"], outcome["keep"], outcome["info"]
+        sample_scale = outcome.get("scale")
     else:
         geometry = load_thickness_geometry(thickness_geometry_path(
             config.analysis_root, run["runId"],
@@ -380,6 +383,7 @@ def measure_run_distribution(config, run: dict, payload, store=None, memo: dict 
         pixel_size_y_um=calibration["pixelSizeYUm"],
         expansion_factor=calibration["expansionFactor"] if calibration["expansionEnabled"] else 1.0,
         sample_mask=sample_mask,
+        sample_scale=sample_scale,
     )
     return {"analysisRunId": run["runId"], "calibration": calibration, "filter": filter_info, **distribution}
 

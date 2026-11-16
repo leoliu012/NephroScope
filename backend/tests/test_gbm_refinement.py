@@ -905,6 +905,103 @@ class RefinementApiTests(StackFixture):
 
 
 
+LEAN_DEG = 35.0
+
+
+@unittest.skipUnless(HAS_RUNTIME, "scipy and scikit-image are required")
+class TiltCorrectionApiTests(StackFixture):
+    """A sheet leaning 35 degrees: as a slice shows it, it is 1 / cos(35) too wide."""
+
+    corrected = {**StackFixture.filter, "tiltCorrection": True}
+    sheet = {"type": "polygon", "points": [[130, 160], [260, 160], [260, 270], [130, 270]]}
+
+    def mask_volume(self) -> np.ndarray:
+        yy, xx = np.mgrid[:SIZE, :SIZE]
+        volume = np.zeros((PLANES, SIZE, SIZE), dtype=bool)
+        radius = np.hypot(yy - RING[0], xx - RING[1])
+        shift = Z_STEP_UM / PIXEL_UM * np.tan(np.radians(LEAN_DEG))
+        # Narrowed by what five planes smear it, so each projection is exactly the oblique cut.
+        half_width = 0.5 * THICKNESS_PX / np.cos(np.radians(LEAN_DEG)) - 2.0 * shift
+        for z in range(PLANES):
+            volume[z] = np.abs(radius - RING[2]) < THICKNESS_PX / 2
+            volume[z] |= (np.abs(xx - 195 - shift * (z - PLANES / 2)) < half_width) & (yy > 150) & (yy < 280)
+        return volume
+
+    def roi_mean_nm(self, filter_):
+        body = {"calibration": self.calibration, "roi": self.sheet}
+        if filter_ is not None:
+            body["filter"] = filter_
+        response = self.client.post(f"/agh/api/analysis-runs/{self.middle}/measurements/gbm-thickness", json=body)
+        return response.status_code, response.get_json()
+
+    def test_a_leaning_sheet_is_kept_and_reads_its_own_thickness(self):
+        self.distribution()
+        self.run_stack_job()
+        truth = THICKNESS_PX * PIXEL_UM * 1000.0
+        cut = truth / np.cos(np.radians(LEAN_DEG))
+
+        as_now = self.distribution()
+        self.assertFalse(as_now["tiltCorrected"])
+        self.assertFalse(as_now["filter"]["tiltCorrection"])
+        self.assertGreater(as_now["filter"]["byReason"].get("oblique", 0), 0)
+        status, _ = self.roi_mean_nm(self.filter)
+        self.assertEqual(status, 400, "past the usual limit, the sheet is not measured at all")
+
+        status, raw = self.roi_mean_nm(None)
+        self.assertEqual(status, 200)
+        self.assertLess(abs(raw["meanThicknessUm"] * 1000.0 - cut), 0.08 * cut, "uncorrected, it reads as wide as the cut")
+        self.assertGreater(raw["meanThicknessUm"] * 1000.0, 1.12 * truth)
+
+        corrected = self.distribution(filter=self.corrected)
+        self.assertTrue(corrected["tiltCorrected"])
+        self.assertTrue(corrected["filter"]["tiltCorrection"])
+        self.assertEqual(corrected["filter"]["limitDeg"], 40.0)
+        self.assertEqual(corrected["filter"]["byReason"].get("oblique", 0), 0)
+        self.assertGreater(corrected["sampleCount"], as_now["sampleCount"])
+        status, sheet = self.roi_mean_nm(self.corrected)
+        self.assertEqual(status, 200, sheet)
+        self.assertTrue(sheet["tiltCorrected"])
+        # Pixels make the drawn sheet a little wider than the cut; the correction is exact for what is drawn.
+        self.assertAlmostEqual(sheet["meanThicknessUm"] / raw["meanThicknessUm"], np.cos(np.radians(LEAN_DEG)), delta=0.01)
+        self.assertLess(abs(sheet["meanThicknessUm"] * 1000.0 - truth), 0.08 * truth)
+        # The upright tube reads what it read before.
+        self.assertLess(abs(self.mean_nm(corrected) - truth), 0.06 * truth)
+
+    def test_the_3d_model_and_the_viewer_follow_the_same_setting(self):
+        self.distribution()
+        self.run_stack_job()
+        for filter_, excluded in ((self.filter, True), (self.corrected, False)):
+            with self.subTest(corrected=not excluded):
+                response = self.client.post(
+                    f"/agh/api/analysis-runs/{self.middle}/refinement", json={"calibration": self.calibration, "filter": filter_},
+                )
+                self.assertEqual(response.status_code, 200, response.get_json())
+                reasons = np.asarray(response.get_json()["pieces"]["reason"])
+                self.assertEqual(bool((reasons == 1).any()), excluded)
+
+    def test_thickness_limits_are_applied_to_the_corrected_thickness(self):
+        self.distribution()
+        self.run_stack_job()
+        truth = THICKNESS_PX * PIXEL_UM * 1000.0
+        cut = truth / np.cos(np.radians(LEAN_DEG))
+        between = {"maxNm": round(0.5 * (truth + cut))}
+        kept = self.distribution(filter={**self.corrected, **between})
+        self.assertEqual(kept["filter"]["byReason"].get("too-thick", 0), 0)
+        # The same limit on what the slice shows, with the sheet let through by a custom tilt limit.
+        uncorrected = self.distribution(filter={**self.filter, **between, "maxTiltDeg": 45})
+        self.assertGreater(uncorrected["filter"]["byReason"].get("too-thick", 0), 0)
+
+    def test_nothing_is_corrected_without_the_cross_section_filter(self):
+        self.distribution()
+        self.run_stack_job()
+        off = {**self.corrected, "crossSection": False}
+        result = self.distribution(filter=off)
+        self.assertFalse(result["tiltCorrected"])
+        plain = self.distribution(filter={**self.filter, "crossSection": False})
+        self.assertEqual(result["valuesUm"], plain["valuesUm"])
+        self.assertEqual(result["counts"], plain["counts"])
+
+
 @unittest.skipUnless(HAS_RUNTIME, "scipy and scikit-image are required")
 class JointDecisionTests(unittest.TestCase):
     """Decisions are made for a whole stack at once: along each centerline and through Z."""
@@ -1099,6 +1196,38 @@ class JointDecisionTests(unittest.TestCase):
         thick = analysis.piece_center_x > 300
         self.assertLess((plane["reasons"] == 0)[thick].mean(), 0.1)
         self.assertGreater((plane["reasons"] == 0)[~thick].mean(), 0.9)
+
+    def test_with_thickness_corrected_a_leaning_wall_is_measured_and_a_flat_one_is_not(self):
+        from agh_api.gbm_cross_section import CORRECTED_TILT_LIMIT_DEG, FilterSettings, classify_stack, tilt_correction_factor
+
+        corrected = FilterSettings(thickness_limits=False, tilt_correction=True)
+        for tilt, measured in ((32.0, True), (58.0, False)):
+            with self.subTest(tilt=tilt):
+                results = self.walls(thick_tilt_deg=tilt)
+                decided = classify_stack([results[z] for z in sorted(results)], corrected, pixel_size_um=PIXEL_UM, z_step_um=Z_STEP_UM)
+                analysis, plane = results[12], decided[12]
+                thick = analysis.piece_center_x > 300
+                self.assertEqual(plane["limit_deg"], CORRECTED_TILT_LIMIT_DEG)
+                self.assertEqual((plane["reasons"] == 0)[thick].mean() > 0.9, measured)
+                self.assertGreater((plane["reasons"] == 0)[~thick].mean(), 0.9)
+                if measured:
+                    # The wall is 44 px across itself, whatever its lean.
+                    width = np.nanmedian(analysis.piece_width_px[thick] * tilt_correction_factor(plane["tilt_deg"][thick]))
+                    self.assertLess(abs(width - 44.0), 0.06 * 44.0)
+                    self.assertGreater(np.nanmedian(analysis.piece_width_px[thick]), 1.12 * 44.0)
+        # A limit someone chose still wins.
+        results = self.walls(thick_tilt_deg=32.0)
+        chosen = FilterSettings(thickness_limits=False, tilt_correction=True, max_tilt_deg=20.0)
+        plane = classify_stack([results[z] for z in sorted(results)], chosen, pixel_size_um=PIXEL_UM, z_step_um=Z_STEP_UM)[12]
+        self.assertEqual(plane["limit_deg"], 20.0)
+        self.assertLess((plane["reasons"] == 0)[results[12].piece_center_x > 300].mean(), 0.1)
+
+    def test_tilt_that_was_not_measured_is_not_corrected(self):
+        from agh_api.gbm_cross_section import tilt_correction_factor
+
+        factor = tilt_correction_factor(np.array([0.0, 60.0, np.nan, 95.0]))
+        np.testing.assert_allclose(factor[:3], [1.0, 0.5, 1.0])
+        self.assertGreater(factor[3], 0.0)
 
     def test_pieces_are_linked_to_the_same_stretch_of_sheet_in_nearby_planes(self):
         from agh_api.gbm_cross_section import PlaneAnalysis

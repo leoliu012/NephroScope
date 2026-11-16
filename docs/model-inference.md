@@ -86,6 +86,9 @@ Thickness mirrors
 5. apply physical X/Y pixel calibration and divide by the linear expansion
    factor when expansion correction is enabled.
 
+With the cross-section filter and its tilt correction on, each sample's diameter is first
+multiplied by the cosine of its sheet's tilt (see *Thickness corrected for tilt*).
+
 Endpoint, junction, border-component, sample-count, median, standard deviation,
 and 5th/95th-percentile values are returned for quality control. The ROI is
 transient viewer state and is not written into the user's annotations.
@@ -231,10 +234,41 @@ with the noise in each slope, which looked like the decision changing when it wa
 real stacks this removed 26–41% of the changes of colour along the centerline, and what is kept
 or excluded was identical in every slice.
 
-The automatic tilt limit is the largest tilt at which apparent thickening stays
-within 35%, given the Z step and the reference thickness of the best-oriented
-pieces, and held between 20° and 40°. A coarser Z step therefore earns a stricter
-limit.
+The automatic tilt limit depends on whether thickness is corrected for tilt (next section).
+Corrected, it is 40°. Uncorrected, it is the largest tilt at which apparent thickening stays
+within 35%, given the Z step and the reference thickness of the best-oriented pieces, and
+held between 20° and 40°; a coarser Z step therefore earns a stricter limit. A limit someone
+sets replaces either.
+
+### Thickness corrected for tilt
+
+A slice cuts a sheet that leans by `θ` from vertical obliquely, so what the slice shows is
+`1 / cos θ` wider than the sheet. The stack says what `θ` is for every piece: it is the tilt
+measured above, from how the same stretch of centerline moves through the neighbouring
+slices. With **Correct thickness for tilt** on (the viewer's default; `filter.tiltCorrection`
+in the API, off unless sent), every kept sample's diameter is multiplied by the cosine of its
+piece's tilt before it is reported, in ROI measurements, distributions and exports alike.
+Thickness limits apply to the corrected value. A piece whose tilt could not be measured is
+not corrected.
+
+GBM that leans moderately then does not have to be left out, which is what the automatic
+limit of 40° reflects. Between about 27° and 40°, GBM that used to be excluded is measured.
+
+Three things are deliberately not done:
+
+- **The projection's smear is not subtracted.** Geometry says a 5-plane projection widens a
+  leaning sheet by a further `4 dz tan θ`. Real predictions do not show that much: taking it
+  off made GBM at 40–50° read 15–36% thinner than upright GBM (table under Validation).
+- **No correction is fitted to each stack.** How fast width grows with tilt differs between
+  stacks, and fitting it would flatten each by construction, but it would also hide a tilt
+  that is read wrongly.
+- **Thickness is not taken as a distance in 3D**, from a centerline point to the nearest
+  surface in any slice. That is as flat across tilt, but it reads 5–15% lower for upright GBM
+  too, more where masks are noisier, so it would not compare between cases.
+
+The correction is only as good as the tilt. Where tilt is read too high, as it may be on a
+stack whose field moves between slices and is slightly overcorrected, exclusion used to
+lose GBM and correction now reads it thin.
 
 ### When the file records no Z step
 
@@ -403,6 +437,69 @@ from the same images (0.59 against 0.30), but that shares its input. Width, whic
 says should rise with tilt, relates more to tracked tilt (0.27 against 0.16). So neither is
 shown to be better, and there is no ground truth here.
 
+**Thickness corrected for tilt.** A sheet's own thickness does not depend on which way it
+leans, so a good measurement is flat across tilt. Four real stacks (AGH1 botL, AGH9-1-1
+60x_2, AGH9-2-2 ROI2, AGH10 2-2; every second slice), pieces whose tilt is known within 6°,
+median width relative to the same stack's pieces at 0–10°, as the range over the four stacks:
+
+| Tilt | In the slice | × cos(tilt) | Smear also taken off | 3D distance |
+|---|---|---|---|---|
+| 10–20° | 1.03–1.11 | 0.99–1.09 | 0.94–1.04 | 0.99–1.06 |
+| 20–30° | 1.03–1.21 | 0.94–1.10 | 0.83–0.96 | 0.92–1.02 |
+| 30–40° | 1.15–1.36 | 0.95–1.10 | 0.76–0.89 | 0.92–0.99 |
+| 40–50° | 1.23–1.51 | 0.87–1.08 | 0.64–0.85 | 0.85–0.94 |
+| 50–60° | 1.30–1.71 | 0.77–0.99 | | 0.71–0.88 |
+
+Uncorrected, width grows with tilt in every stack. Times the cosine it stays within a tenth
+up to 40°, with no common direction across stacks, and falls off past 50°. On the two stacks
+predicted on every slice (AGH1 botL, AGH9-2-2 ROI2) the largest departure up to 50° was
+9.5%, against 52% uncorrected. The 3D distance is a second measurement that uses no tracking,
+and it is flat as well; the tilt it implies (the arc cosine of 3D distance over in-slice
+width) rises in step with the tracked tilt, about 8° above it (medians 33–39°, 41–48°,
+50–58° for tracked 20–30°, 30–40°, 40–50°).
+
+What the app then reports, with the decisions as shipped and every piece counted:
+
+| Stack | Kept centerline | Excluded for tilt | Mean kept thickness, µm as imaged | Breaks per 100 thicknesses | Differ between neighbouring slices |
+|---|---|---|---|---|---|
+| AGH1 botL, every slice | 76.4% → 89.6% | 19.8% → 7.0% | 2.97 → 2.84 | 3.7 → 2.1 | 1.7% → 1.1% |
+| AGH9-2-2 ROI2, every slice | 68.2% → 86.6% | 28.9% → 10.6% | 3.20 → 3.15 | 4.2 → 3.0 | 1.7% → 1.5% |
+| AGH9-1-1 60x_2, every 2nd | 85.1% → 92.7% | 11.5% → 4.1% | 4.22 → 3.93 | 2.7 → 1.5 | 2.9% → 1.6% |
+| AGH10 2-2, every 2nd | 79.7% → 87.7% | 13.3% → 5.6% | 4.19 → 3.97 | 2.8 → 1.9 | 2.9% → 2.0% |
+
+So 8 to 18 points more of the centerline is measured, and decisions change less often along
+it and through Z. **Mean thickness reads 2–7% lower than uncorrected**, and which of the two
+is nearer the truth is not known: uncorrected, kept GBM at 10–30° was 0–11% wider than
+upright GBM; corrected, kept GBM at 10–40° is within −9% to +7% of it. AGH9-1-1 60x_2 is the
+stack that reads low (0.93 and 0.91 at 20–30° and 30–40°), and it is the one whose field
+motion may be overcorrected (above). Numbers measured with and without the correction
+should not be compared with each other; reports and exports say which was used.
+
+Through the running app (AGH9-2-2 ROI2, v10 predictions on all 40 slices, measured over the
+API): kept samples went from 56.8% to 72.4% of all centerline samples, junctions and tapers
+included, oblique from 31.5% to 12.4%, and mean thickness from 3.24 to 3.18 µm as imaged. In
+the 3D model what stays excluded is the membrane that lies flat; the blocks on upright-looking
+walls are gone.
+
+The tilt this rests on repeats: with the planes of a stack split into two interleaved halves
+and each tracked on its own, a piece's tilt in one half and the tilt of the same stretch in
+the other differ by a median 1.7° (RMS 4.7°, 2,298 pieces), and fall on the same side of the
+limit 95% of the time. Where a decision changes along a centerline, the measured tilt steps
+by a median 23° between the two pieces, against 9° between neighbours that are decided alike.
+
+Synthetic stacks cannot test this: their masks are exact projections, so they carry the full
+smear that real predictions do not, and there the cosine alone would leave GBM at 30–40°
+about a fifth too thick.
+
+**Tried alongside it and not used.** Taking the median of each slice's mask with the slice
+either side before analysis: on synthetic stacks with noise drawn afresh in every slice it
+halved steep GBM wrongly kept (45–60°: 34% to 15%), but real masks are not noisy in that way,
+and on real stacks it changed nothing that could be measured (Dice against annotation 0.738
+to 0.739, wrong decisions with a known tilt 3.6% and 3.9% to 3.6% and 4.3%). Requiring an
+excluded patch to hold clear evidence as a whole: half as many patches, but steep GBM
+wrongly kept rose from 7.2% to 8.0%. Charging more for a decision to change between slices:
+changes fell, and wrong decisions rose in step, because steep sheet is short in Z by geometry.
+
 **What is still not validated.** Decisions have not been checked against expert review. Tracked
 tilt has a median near 18° on real stacks that barely move, and the filter excludes a fifth to a
 third of GBM on four of the five stacks above. That is the size to expect: if a sheet's orientation were equally likely in every
@@ -490,6 +587,9 @@ viewer opens that slice and marks the place.
 At 4 times reduction a GBM 12 px wide is 3 voxels wide. The model shows shape, continuity
 through Z and where the filter's decisions fall on the sheet. It is not for reading
 thickness, and gaps or bridges narrower than a voxel can close or open in it.
+
+Stretching Z makes leaning sheets look upright. At 4 times, a sheet 45° from vertical is drawn
+14° from vertical, so GBM excluded for tilt can look like a straight wall. Judge tilt at 1.
 
 ### Checked
 

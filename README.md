@@ -61,6 +61,13 @@ of the reason it was excluded, matching the legend beside it, and thickness plot
 measurements and exports only use what is kept. A popup shows when a change of
 settings or a correction is being recalculated.
 
+**Correct thickness for tilt** (on by default, under Cross-sections only) reports each
+width as the sheet's own thickness: a slice cuts a leaning sheet obliquely, so the width
+it shows is multiplied by the cosine of the tilt measured from the neighbouring slices.
+GBM is then left out for tilt only past 40°, so more of it is measured and it breaks
+less often. Mean thickness reads 2–7% lower than without the correction on the stacks
+tested, so do not compare numbers measured the two ways; reports say which was used.
+
 To correct a prediction, choose **Add GBM** or **Remove GBM** on the tool rail, set
 the brush size (`[` and `]` also change it), and paint or click:
 
@@ -98,7 +105,8 @@ tooltip says how many slices are still missing.)
 - **Colour** shows either the filter's decisions, in the same colours as on the slices
   (measured GBM, and why the rest is not), or depth through the stack. **Excluded**
   hides what the filter leaves out. **Z stretch** draws slices further apart than they
-  are, to see along Z in a thin stack.
+  are, to see along Z in a thin stack; it also makes leaning GBM look upright, so judge
+  tilt at 1×.
 - The white line around the model is the slice open in the 2D viewer; the Z slider
   moves it. **Save image** saves the view as a PNG.
 
