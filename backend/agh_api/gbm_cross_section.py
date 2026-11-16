@@ -58,7 +58,7 @@ import numpy as np
 
 from .gbm_thickness import ThicknessGeometry
 
-ALGORITHM_VERSION = "gbm-cross-section-v4"
+ALGORITHM_VERSION = "gbm-cross-section-v5"
 MIP_PLANES = 5
 DEFAULT_MAX_WINDOW = 30
 EN_FACE_TILT_DEG = 60.0

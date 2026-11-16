@@ -46,6 +46,13 @@ function stackMessage(stack, summary) {
   return null
 }
 
+// Small holes the Z analysis closed: on this Z, and in the whole image.
+function holesNote(here, image) {
+  const count = number => `${number.toLocaleString()} small ${number === 1 ? 'hole' : 'holes'}`
+  const where = here > 0 ? `${count(here)} closed in this Z's GBM (${image.toLocaleString()} in the image)` : `${count(image)} closed in this image's GBM, none on this Z`
+  return `${where}: the slices just below and above have GBM there. The saved prediction is unchanged.`
+}
+
 function zStepText(zStep) {
   if (!zStep?.um) return 'Not recorded in this file'
   const value = `${Number(zStep.um.toPrecision(3))} µm`
@@ -103,6 +110,7 @@ export default function GbmFilterControls({
       {!settings.windowAuto && <NumberField label="Up to ±" unit="Z" min={1} max={200} value={settings.window} onCommit={value => patch({ window: value ?? DEFAULT_FILTER_SETTINGS.window })} />}
       {Number.isFinite(stack?.medianReachPlanes) && stack.medianReachPlanes > 0 && <p className="gf-note">Each point measures its own range; here the median reached ±{Math.round(stack.medianReachPlanes)} Z.</p>}
       {stack?.fieldMotion?.corrected && <p className="gf-note">The whole field moved between Z, up to {Number(stack.fieldMotion.maxPxPerPlane.toPrecision(2))} px per Z. This was removed before measuring tilt.</p>}
+      {stack?.holesFilled > 0 && <p className="gf-note">{holesNote(view?.holesFilled || 0, stack.holesFilled)}</p>}
       {stack?.fieldMotion?.measured === false && <p className="gf-note gf-warning">Whole-field movement could not be measured for this stack, so tilt may read too high if the stage slid or focus changed the magnification.</p>}
       {onZStepOverride && view?.pieces && <div className="gf-row">
         <span>Z step</span>

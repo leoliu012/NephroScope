@@ -61,6 +61,12 @@ of the reason it was excluded, matching the legend beside it, and thickness plot
 measurements and exports only use what is kept. A popup shows when a change of
 settings or a correction is being recalculated.
 
+Small holes in the middle of a membrane are closed when the slices just below and just
+above both have GBM there and the hole lasts no more than three planes: the model leaves
+them where its probability dips under the threshold, and the centerline would otherwise
+split around them. The saved prediction keeps the hole (turn the filter off to see it),
+and the filter panel says how many were closed.
+
 **Correct thickness for tilt** (on by default, under Cross-sections only) reports each
 width as the sheet's own thickness: a slice cuts a leaning sheet obliquely, so the width
 it shows is multiplied by the cosine of the tilt measured from the neighbouring slices.
@@ -112,7 +118,8 @@ tooltip says how many slices are still missing.)
 
 The model is each slice's prediction as the viewer shows it, corrections included,
 stacked at the recorded Z step and put in register where the Z analysis measured the
-field moving. Nothing is smoothed or filled in between slices. It is reduced so the
+field moving. Nothing is smoothed or filled in between slices, apart from the small holes
+the filter closes. It is reduced so the
 longer side of the image is at most 512 voxels, so it shows shape, not thickness.
 See `docs/model-inference.md` for details.
 

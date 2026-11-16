@@ -72,6 +72,7 @@ from .gbm_cross_section import (
     to_plane,
     to_shared,
 )
+from .gbm_holes import holes_to_fill
 from .gbm_thickness import ThicknessGeometry, load_thickness_geometry, thickness_geometry_to_arrays
 from .path_guard import image_path
 
@@ -277,6 +278,46 @@ def _label_path(config, stack_run: dict, z_index: int) -> Path:
     return resolve_under_root(directory, f"label_{int(z_index)}.png")
 
 
+def _fill_path(config, stack_run: dict, z_index: int) -> Path:
+    attempt = (stack_run.get("result") or {}).get("artifactAttempt")
+    directory = attempt_directory(config.analysis_root, stack_run["runId"], attempt)
+    return resolve_under_root(directory, f"fill_{int(z_index)}.json")
+
+
+def _filled_geometry_path(config, stack_run: dict, z_index: int) -> Path:
+    attempt = (stack_run.get("result") or {}).get("artifactAttempt")
+    directory = attempt_directory(config.analysis_root, stack_run["runId"], attempt)
+    return resolve_under_root(directory, f"geometry_{int(z_index)}.npz")
+
+
+@lru_cache(maxsize=512)
+def _load_fill_cached(path_text: str, mtime_ns: int) -> dict:
+    return json.loads(Path(path_text).read_text(encoding="utf-8"))
+
+
+def load_fill(config, stack_run: dict | None, z_index: int) -> dict | None:
+    """The small holes the Z analysis closed on this plane: ``region`` and ``holes``, or ``None``.
+
+    A plane with a fill has its own centerline geometry beside it, since closing a hole
+    moves the centerline. The saved prediction keeps the hole.
+    """
+    if not stack_run or not ((stack_run.get("result") or {}).get("holesFilled")):
+        return None
+    path = _fill_path(config, stack_run, z_index)
+    if not path.is_file() or not _filled_geometry_path(config, stack_run, z_index).is_file():
+        return None
+    return _load_fill_cached(str(path), path.stat().st_mtime_ns)
+
+
+def plane_mask(config, run: dict, fill: dict | None) -> np.ndarray:
+    """The plane's GBM as the Z analysis sees it: the saved prediction with its small holes closed."""
+    attempt = (run.get("result") or {}).get("artifactAttempt")
+    mask = np.asarray(read_mask(config.analysis_root, run["runId"], attempt=attempt), dtype=bool).copy()
+    if fill:
+        _rle_paint(mask, fill["region"])
+    return mask
+
+
 # Deciding a stack reads every plane of it, so one stack's planes should all fit.
 @lru_cache(maxsize=256)
 def _load_plane_cached(path_text: str, mtime_ns: int) -> PlaneAnalysis:
@@ -350,6 +391,18 @@ def execute_stack_analysis(config, job: dict, *, progress=None, before_publish=N
         planes.append(StackPlane(int(member["zIndex"]), float(member["center"]), mask, geometry, registration))
         report(0.08 + 0.02 * (index + 1) / len(members), "Reading saved Z predictions")
 
+    # Small holes that slices below and above both cover are closed before anything is
+    # measured, so the centerline runs through them. The saved predictions keep them.
+    fills = holes_to_fill(planes)
+    if fills:
+        from .gbm_thickness import prepare_thickness_geometry
+
+        for index, plane in enumerate(planes):
+            fill = fills.get(plane.z_index)
+            if fill is not None:
+                mask = np.asarray(plane.mask, dtype=bool) | fill.pixels
+                planes[index] = StackPlane(plane.z_index, plane.center, mask, prepare_thickness_geometry(mask), plane.registration)
+
     started = time.monotonic()
     results = analyze_stack(
         planes,
@@ -366,6 +419,15 @@ def execute_stack_analysis(config, job: dict, *, progress=None, before_publish=N
             resolve_under_root(directory, f"label_{plane.z_index}.png"),
             _encode_label(plane.geometry, plane.mask, analysis.sample_piece, analysis.sample_artifact),
         )
+        fill = fills.get(plane.z_index)
+        if fill is not None:
+            payload = BytesIO()
+            np.savez_compressed(payload, **thickness_geometry_to_arrays(plane.geometry))
+            write_bytes_atomic(resolve_under_root(directory, f"geometry_{plane.z_index}.npz"), payload.getvalue())
+            write_bytes_atomic(
+                resolve_under_root(directory, f"fill_{plane.z_index}.json"),
+                json.dumps({"holes": int(fill.holes), "pixels": int(fill.pixels.sum()), "region": _rle_encode(fill.pixels)}).encode("utf-8"),
+            )
         if analysis.sample_piece.size:
             reach.append(analysis.sample_window_planes)
         report(0.85 + 0.15 * (index + 1) / len(planes), "Saving Z analysis")
@@ -379,6 +441,8 @@ def execute_stack_analysis(config, job: dict, *, progress=None, before_publish=N
         "window": int(request.get("window") or DEFAULT_MAX_WINDOW),
         "medianReachPlanes": float(np.median(reach_all)) if reach_all.size else 0.0,
         "fieldMotion": _motion_summary(motion, measured),
+        "holesFilled": int(sum(fill.holes for fill in fills.values())),
+        "planesWithHolesFilled": len(fills),
     }
 
 
@@ -622,6 +686,8 @@ class PlaneView:
     piece_paint: np.ndarray | None
     piece_paint_edit: np.ndarray | None
     revision: str
+    # Small holes of this plane that the Z analysis closed (``load_fill``), if any.
+    fill: dict | None = None
 
 
 def _effective_directory(config, run: dict, key: str) -> Path:
@@ -641,6 +707,9 @@ def plane_view(config, store, run: dict, options: dict, *, ensure: bool = True) 
     stack_run = state.get("usable")
     attempt = (run.get("result") or {}).get("artifactAttempt")
     geometry = load_thickness_geometry(thickness_geometry_path(config.analysis_root, run["runId"], attempt=attempt))
+    fill = load_fill(config, stack_run, z_index)
+    if fill is not None:
+        geometry = load_thickness_geometry(_filled_geometry_path(config, stack_run, z_index))
     analysis = load_plane(config, stack_run, z_index) if stack_run else None
     # An analysis older than this run's mask describes different samples.
     if analysis is not None and analysis.sample_piece.size != geometry.skeleton_y.size:
@@ -652,9 +721,11 @@ def plane_view(config, store, run: dict, options: dict, *, ensure: bool = True) 
     piece_added = piece_paint = piece_paint_edit = None
     if structural:
         geometry, analysis, piece_added, piece_paint, piece_paint_edit = _effective_plane(
-            config, run, geometry, analysis, structural, stack_run,
+            config, run, geometry, analysis, structural, stack_run, fill,
         )
-    return PlaneView(geometry, analysis, stack_run, state, edits, all_edits, piece_added, piece_paint, piece_paint_edit, edits_revision(all_edits))
+    return PlaneView(
+        geometry, analysis, stack_run, state, edits, all_edits, piece_added, piece_paint, piece_paint_edit, edits_revision(all_edits), fill,
+    )
 
 
 def _require_scipy() -> None:
@@ -768,8 +839,11 @@ def _split_for_paint(
     return split, np.asarray(piece_added, dtype=bool)[source], state[first], latest[first]
 
 
-def _effective_plane(config, run, base_geometry, base_analysis, structural, stack_run):
-    """The plane with added regions and painted pieces. Saved predictions stay as they are."""
+def _effective_plane(config, run, base_geometry, base_analysis, structural, stack_run, fill=None):
+    """The plane with added regions and painted pieces. Saved predictions stay as they are.
+
+    ``fill`` is what the Z analysis closed on this plane; ``base_geometry`` already has it.
+    """
     from .gbm_thickness import prepare_thickness_geometry
 
     directory = _effective_directory(config, run, _effective_key(structural, stack_run))
@@ -785,8 +859,7 @@ def _effective_plane(config, run, base_geometry, base_analysis, structural, stac
                 extras["added"], extras["paint"], extras["paint_edit"],
             )
     _require_scipy()
-    attempt = (run.get("result") or {}).get("artifactAttempt")
-    mask = read_mask(config.analysis_root, run["runId"], attempt=attempt).copy()
+    mask = plane_mask(config, run, fill)
     regions = [(edit.get("payload") or {}).get("region") for edit in structural]
     regions = [region for region in regions if region and region.get("h")]
     for region in regions:
@@ -1052,6 +1125,7 @@ def refinement_view(config, store, run: dict, settings: FilterSettings, options:
         "edits": [_public_edit(edit) for edit in view.edits],
         "editCount": len(view.all_edits),
         "probabilityAvailable": bool((run.get("result") or {}).get("probabilityAvailable")),
+        "holesFilled": int((view.fill or {}).get("holes") or 0),
         "pieces": None,
     }
     if view.analysis is None or "decided" not in outcome:
@@ -1147,6 +1221,7 @@ def _public_state(state: dict) -> dict:
         "analysedPlanes": result.get("planes"),
         "medianReachPlanes": result.get("medianReachPlanes"),
         "fieldMotion": _public_motion(result.get("fieldMotion")),
+        "holesFilled": result.get("holesFilled"),
     }
 
 
@@ -1283,7 +1358,7 @@ def create_stroke_edit(config, store, run: dict, kind: str, stroke: list, radius
     path = image_path(config.active_data_root, case, filename)
     attempt = (run.get("result") or {}).get("artifactAttempt")
     view = plane_view(config, store, run, options)
-    mask = read_mask(config.analysis_root, run["runId"], attempt=attempt).copy()
+    mask = plane_mask(config, run, view.fill)
     for edit in view.edits:
         region = (edit.get("payload") or {}).get("region")
         if region and region.get("h"):
@@ -1345,7 +1420,7 @@ def create_edit(config, store, run: dict, kind: str, x: float, y: float, actor: 
     reference = float(np.median(width)) if width.size else 20.0
     index, distance = _nearest_sample(geometry, x, y)
     attempt = (run.get("result") or {}).get("artifactAttempt")
-    mask = read_mask(config.analysis_root, run["runId"], attempt=attempt)
+    mask = plane_mask(config, run, view.fill)
     # On the prediction: inside the saved mask, or close to any centerline
     # (which also covers regions people added).
     near = index >= 0 and (bool(mask[int(y), int(x)]) or distance <= max(0.6 * float(width[index]), 4.0))

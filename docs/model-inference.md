@@ -152,6 +152,51 @@ registering planes before projecting and predicting again, which has not been te
 Tilt is corrected, thickness is not. Magnification change also means a pixel is not quite
 the same size through a stack; that is not corrected either.
 
+### Small holes
+
+Implemented in `backend/agh_api/gbm_holes.py`, as the first step of the Z analysis.
+
+The model leaves small holes in the middle of a membrane where its probability dips just
+under the threshold: inside small holes on two real stacks it was 0.44–0.55 (10th to 90th
+percentile), against 0.55 to enter the mask and about 0.03 in background. The centerline
+then runs around the hole as two branches, each reading half the membrane's thickness,
+with a junction at either end.
+
+A hole is closed when all of this holds:
+
+- it is background enclosed by the GBM of one slice, joined to nothing outside it along a
+  pixel edge;
+- it is small: no more than one thickness² in area and 0.7 of the thickness at its widest,
+  against the typical thickness of that slice. Larger enclosed background is a lumen or a
+  space between membranes;
+- GBM covers at least 90% of it in a slice below and in a slice above, at the same place in
+  the sample (so after the field's movement is removed), with **at most three planes
+  uncovered** between those two slices.
+
+The last is the evidence. Every slice is a projection of five planes that overlaps its
+neighbours', and a leaning sheet moves steadily across them, so GBM at one place both
+below and above is GBM in between. The limit of three planes is where real stacks divide:
+small holes that were covered on both sides lasted 1, 2 or 3 planes (6, 4 and 1 of them on
+AGH1 botL; 3, 1 and 0 on AGH9-2-2 ROI2) or 5 and more (7 and 4), and none lasted 4. A
+projection shows a hole only where all five of its planes lack GBM, so a real opening is
+several planes deep and shows in several slices; a dip of the probability comes and goes.
+Every slice of one hole gets the same answer, because each is judged by how long the hole
+lasts. A stack's first and last slices repeat a neighbour's projection, and the same
+prediction twice does not count as a second slice. Analysed more than two planes apart,
+slices cannot close each other's holes.
+
+The saved prediction is not changed. The fill and the plane's centerline with the hole
+closed are kept with the Z analysis, and everything that uses the filter (overlays, the
+3D model, measurements, corrections) sees the plane with the hole closed. With the filter
+off, the viewer shows the prediction as the model made it, hole included. The filter panel
+says how many holes were closed on the slice and in the image.
+
+Not closed: holes covered on one side only (a space where two membranes meet closes in one
+direction), and breaks that cut a membrane through. Short-lived breaks do exist with the
+same kind of evidence (about 2 per slice on AGH1 botL and 0.3 on AGH9-2-2 ROI2, probability
+inside 0.38–0.52), but of the seven that fell on annotated planes the share annotated as
+GBM ran from 0.10 to 1.00, which is not enough to add GBM on.
+
 ### Measuring tilt
 
 What matters is the tilt **at this slice**. A loop that is vertical here and curves
@@ -491,6 +536,15 @@ Synthetic stacks cannot test this: their masks are exact projections, so they ca
 smear that real predictions do not, and there the cosine alone would leave GBM at 30–40°
 about a fifth too thick.
 
+**Small holes.** AGH1 botL (41 slices, every slice): 11 holes closed on 8 slices, median 75
+px. Two of them are on annotated slices, and both are annotated as GBM throughout. Within
+1.5 thicknesses of the closed holes, centerline samples reading under 0.6 of the typical
+thickness fell from 182 to 59, and junction points from 104 to 41. AGH9-2-2 ROI2 through
+the app (40 slices): 2 holes closed (36 and 60 px, probability inside 0.54); mean kept
+thickness moved from 3.177 to 3.170 µm. So this removes local errors and stray branches and
+does not move a stack's mean. The annotated planes are ones the model was trained on, where
+it has fewer holes than elsewhere; there is no annotation on planes it has not seen.
+
 **Tried alongside it and not used.** Taking the median of each slice's mask with the slice
 either side before analysis: on synthetic stacks with noise drawn afresh in every slice it
 halved steep GBM wrongly kept (45–60°: 34% to 15%), but real masks are not noisy in that way,
@@ -541,7 +595,8 @@ Implemented in `backend/agh_api/gbm_volume.py` (the volume), `frontend/src/gbmVo
 (its surface, and what a click points at) and `frontend/src/gbm3dRenderer.js` (drawing).
 
 The 3D mode is offered for an image with more than 10 Z slices once every slice has a
-finished prediction. It adds nothing to the predictions: it shows them together.
+finished prediction. It adds nothing to the predictions: it shows them together, as the
+filter shows each slice, which includes the small holes the Z analysis closed.
 
 ### The volume
 

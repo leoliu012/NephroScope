@@ -4,7 +4,8 @@ Every slice of the stack becomes one layer, and each layer is what the viewer sh
 slice: the saved prediction with people's corrections, and the decision about which GBM
 counts. Layers are reduced so the longer side of the image is at most ``MAX_SIDE`` voxels,
 and put in register with each other where the stack analysis measured the field moving.
-Nothing is smoothed or filled in between slices.
+Nothing is smoothed or filled in between slices here; a layer does carry the small holes
+the Z analysis closed on its slice (``gbm_holes``).
 
 The first and last two slices of a stack are predicted from the same five planes as their
 neighbour (see ``docs/model-inference.md``), so those layers repeat it.
