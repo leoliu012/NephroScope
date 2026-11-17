@@ -473,6 +473,27 @@ class AnalysisStore:
                 return run
         return None
 
+    def delete_finished_runs(self, run_ids) -> list[str]:
+        """Forget these runs if they have finished; running and queued ones are left."""
+        ids = list(dict.fromkeys(str(run_id) for run_id in run_ids if run_id))
+        removed: list[str] = []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for chunk in _chunks(ids):
+                rows = conn.execute(
+                    f"""
+                    SELECT run_id FROM analysis_runs
+                    WHERE run_id IN ({_placeholders(chunk)}) AND status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+                    """,
+                    tuple(chunk),
+                ).fetchall()
+                found = [str(row["run_id"]) for row in rows]
+                if found:
+                    conn.execute(f"DELETE FROM analysis_runs WHERE run_id IN ({_placeholders(found)})", tuple(found))
+                    removed.extend(found)
+            conn.commit()
+        return removed
+
     def remove_superseded_stack_runs(self, run: dict) -> list[str]:
         """Forget older analyses of the same image, channel and window as this one.
 

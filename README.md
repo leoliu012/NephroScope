@@ -308,6 +308,13 @@ Production runs with Gunicorn:
 gunicorn --bind 127.0.0.1:5055 --workers 2 --threads 4 --timeout 120 "agh_api:create_app()"
 ```
 
+After updating the code, restart **both** Gunicorn and the model worker (`worker.py`):
+each keeps running the code it started with. If only the website is restarted, the
+worker answers it with the older version's Z analysis, which the website cannot read.
+It then throws that analysis away and asks again, twice, and after that shows
+"Z analysis failed: the analysis worker is running a different version" with **Retry**
+on the image until the worker has been restarted.
+
 Health check:
 
 ```bash

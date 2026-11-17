@@ -42,6 +42,7 @@ from .analysis_artifacts import (
     probability_path,
     read_mask,
     read_probability,
+    remove_run_artifacts,
     resolve_under_root,
     thickness_geometry_path,
     write_bytes_atomic,
@@ -62,6 +63,7 @@ from .gbm_cross_section import (
     PlaneAnalysis,
     FieldMotion,
     StackPlane,
+    UnsupportedArtifactVersion,
     analyze_stack,
     build_pieces,
     decide_from_evidence,
@@ -100,6 +102,26 @@ BASE_PROBABILITY_THRESHOLD = 0.55
 STACK_DECISION_CACHE = 16
 _stack_decisions: OrderedDict = OrderedDict()
 _stack_decisions_lock = threading.Lock()
+
+
+# The website and the analysis worker are separate processes, and each runs the code it
+# started with. After an update, a worker that was not restarted answers the website's
+# requests with the older version's analysis, which the website cannot read. Such an
+# analysis is thrown away and asked for again, this many times per website process;
+# after that the image says the worker has to be restarted, instead of every request
+# keeping an outdated worker busy for as long as it runs.
+MAX_VERSION_REQUEUES = 2
+OUTDATED_WORKER_MESSAGE = (
+    "the analysis worker is running a different version of NephroScope than the website. "
+    "Restart the worker (backend/worker.py), then retry"
+)
+_version_requeues: dict[str, int] = {}
+_version_requeues_lock = threading.Lock()
+
+
+def _made_by_this_version(run: dict | None) -> bool:
+    """Whether a finished stack analysis holds what this code can read."""
+    return ((run or {}).get("result") or {}).get("algorithm") == ALGORITHM_VERSION
 
 
 def _digest(value: Any) -> str:
@@ -201,17 +223,36 @@ def stack_state(
     }
     key = _digest({"case": case, "filename": filename, **request})
     job = store.best_runs_for_cache_keys([key]).get(key)
+    finished = store.get_run(job["runId"]) if job is not None and job["status"] == "SUCCEEDED" else None
+    outdated = finished is not None and not _made_by_this_version(finished)
+    if outdated and (ensure or retry) and not active:
+        # A worker still running older code answered. Ask again, a limited number of times.
+        with _version_requeues_lock:
+            asked = _version_requeues.get(key, 0)
+            again = retry or asked < MAX_VERSION_REQUEUES
+            if again:
+                _version_requeues[key] = asked + 1
+        if again:
+            for run_id in store.delete_finished_runs([job["runId"]]):
+                remove_run_artifacts(config.analysis_root, run_id)
+            job, finished, outdated = None, None, False
     wanted = job is None or job["status"] == "CANCELED" or (job["status"] == "FAILED" and retry)
     if wanted and (ensure or retry) and not active:
         job, _ = store.create_or_reuse_run(case, filename, STACK_OPERATION, request, cache_key=key, requested_by="")
-    if job is not None and job["status"] == "SUCCEEDED":
-        state.update(state="ready", usable=store.get_run(job["runId"]))
+    if finished is not None and not outdated:
+        state.update(state="ready", usable=finished)
         state["job"] = {"runId": job["runId"], "status": job["status"], "progress": job.get("progress")}
         return state
     previous = store.latest_stack_run(case, filename, channel, window, operation=STACK_OPERATION)
-    if previous is not None and all((previous.get("request") or {}).get(name) == request[name] for name in ("sourceKey", "algorithm")):
+    if (
+        previous is not None and _made_by_this_version(previous)
+        and all((previous.get("request") or {}).get(name) == request[name] for name in ("sourceKey", "algorithm"))
+    ):
         state.update(usable=previous, stale=True)
-    if job is not None and job["status"] != "CANCELED":
+    if outdated:
+        state["job"] = {"runId": job["runId"], "status": "FAILED", "progress": None, "error": OUTDATED_WORKER_MESSAGE, "heartbeatAgeSeconds": None}
+        state["state"] = "failed"
+    elif job is not None and job["status"] != "CANCELED":
         state["job"] = {"runId": job["runId"], "status": job["status"], "progress": job.get("progress"),
                         "error": job.get("error"), "heartbeatAgeSeconds": _seconds_since(job.get("heartbeatAt"))}
         state["state"] = {"QUEUED": "queued", "RUNNING": "running"}.get(job["status"], "failed")
@@ -326,10 +367,15 @@ def _load_plane_cached(path_text: str, mtime_ns: int) -> PlaneAnalysis:
 
 
 def load_plane(config, stack_run: dict, z_index: int) -> PlaneAnalysis | None:
+    """One plane of a stack analysis, or ``None`` if it has none this code can read."""
     path = _plane_path(config, stack_run, z_index)
     if not path.is_file():
         return None
-    return _load_plane_cached(str(path), path.stat().st_mtime_ns)
+    try:
+        return _load_plane_cached(str(path), path.stat().st_mtime_ns)
+    except UnsupportedArtifactVersion:
+        # Written by another version; ``stack_state`` asks for it again.
+        return None
 
 
 def _encode_label(geometry: ThicknessGeometry, mask: np.ndarray, piece: np.ndarray, artifact: np.ndarray) -> bytes:
@@ -374,6 +420,13 @@ def execute_stack_analysis(config, job: dict, *, progress=None, before_publish=N
     attempt = job.get("attempts")
     if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
         raise RuntimeError("Stack analysis job is missing its claimed attempt number")
+    asked = request.get("algorithm")
+    if asked and asked != ALGORITHM_VERSION:
+        # The website that queued this runs other code than this worker, and could not read the answer.
+        raise Conflict(
+            f"the website asked for analysis {asked} and this worker makes {ALGORITHM_VERSION}. "
+            "Restart the website and the worker so both run the same version, then retry"
+        )
 
     def report(fraction, message):
         if progress:

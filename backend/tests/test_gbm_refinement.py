@@ -905,6 +905,99 @@ class RefinementApiTests(StackFixture):
 
 
 
+@unittest.skipUnless(HAS_RUNTIME, "scipy and scikit-image are required")
+class OutdatedWorkerTests(StackFixture):
+    """After an update the website is restarted and the worker is not: it answers with the older version's analysis."""
+
+    OLD = "gbm-cross-section-v4"
+
+    def setUp(self):
+        from agh_api import gbm_refinement
+
+        super().setUp()
+        gbm_refinement._version_requeues.clear()
+
+    def run_stack_job_as_an_older_worker(self) -> dict:
+        """Run the queued analysis as code that only knows the older version would."""
+        from unittest import mock
+        from agh_api import gbm_cross_section, gbm_refinement
+
+        job = self.store.claim_next_run("old-worker")
+        self.assertIsNotNone(job, "a stack analysis should be queued")
+        self.assertEqual(job["operation"], gbm_refinement.STACK_OPERATION)
+        seen = {**job, "request": {**job["request"], "algorithm": self.OLD}}
+        with mock.patch.object(gbm_cross_section, "ALGORITHM_VERSION", self.OLD), mock.patch.object(gbm_refinement, "ALGORITHM_VERSION", self.OLD):
+            result = gbm_refinement.execute_stack_analysis(self.config, seen)
+        self.assertEqual(result["algorithm"], self.OLD)
+        self.store.mark_succeeded(job["runId"], "old-worker", result)
+        return self.store.get_run(job["runId"])
+
+    def test_what_an_older_worker_saved_is_not_read(self):
+        from agh_api.gbm_refinement import load_plane
+
+        self.distribution()
+        old = self.run_stack_job_as_an_older_worker()
+        self.assertIsNone(load_plane(self.config, old, 12))
+
+    def test_its_analysis_is_thrown_away_and_asked_for_again(self):
+        from agh_api.analysis_artifacts import run_directory
+        from agh_api.errors import NotFound
+
+        self.distribution()
+        old = self.run_stack_job_as_an_older_worker()
+        for request in (self.distribution, self.refinement):
+            with self.subTest(request=request.__name__):
+                answer = request()
+                state = answer["filter"] if "filter" in answer else answer["summary"]
+                self.assertFalse(state["applied"], "nothing readable yet, and no error either")
+                self.assertTrue(state["pending"])
+                self.assertEqual(state["state"], "queued")
+        with self.assertRaises(NotFound):
+            self.store.get_run(old["runId"])
+        self.assertFalse(run_directory(self.config.analysis_root, old["runId"]).exists())
+        frames = self.client.post("/agh/api/analysis-runs/refinement-frames", json={
+            "runIds": [self.middle], "calibration": self.calibration, "filter": self.filter,
+        })
+        self.assertEqual(frames.status_code, 200, frames.get_json())
+        # Once the worker runs this version, the image is analysed and measured as usual.
+        self.run_stack_job()
+        ready = self.distribution()["filter"]
+        self.assertTrue(ready["applied"])
+        self.assertEqual(ready["state"], "ready")
+
+    def test_a_worker_that_stays_outdated_is_named_instead_of_being_kept_busy(self):
+        from agh_api.gbm_refinement import MAX_VERSION_REQUEUES
+
+        self.distribution()
+        for _ in range(MAX_VERSION_REQUEUES):
+            self.run_stack_job_as_an_older_worker()
+            self.assertEqual(self.distribution()["filter"]["state"], "queued")
+        self.run_stack_job_as_an_older_worker()
+        state = self.distribution()["filter"]
+        self.assertEqual(state["state"], "failed")
+        self.assertFalse(state["applied"])
+        self.assertIsNone(self.store.claim_next_run("test-worker"), "it is not queued again by every request")
+        stack = self.refinement()["stack"]
+        self.assertEqual(stack["state"], "failed")
+        self.assertIn("Restart the worker", stack["job"]["error"])
+        # Retry is the person saying the worker has been restarted.
+        retried = self.client.post("/agh/api/cases/case1/files/stack.tif/gbm-refinement?channel=0").get_json()
+        self.assertEqual(retried["state"], "queued")
+        self.run_stack_job()
+        self.assertTrue(self.distribution()["filter"]["applied"])
+
+    def test_a_worker_refuses_what_a_website_of_another_version_asked_for(self):
+        from agh_api.errors import Conflict
+        from agh_api.gbm_refinement import execute_stack_analysis
+
+        self.distribution()
+        job = self.store.claim_next_run("test-worker")
+        asked = {**job, "request": {**job["request"], "algorithm": "gbm-cross-section-v99"}}
+        with self.assertRaises(Conflict) as raised:
+            execute_stack_analysis(self.config, asked)
+        self.assertIn("same version", raised.exception.message)
+
+
 LEAN_DEG = 35.0
 
 

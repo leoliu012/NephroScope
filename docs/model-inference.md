@@ -373,6 +373,14 @@ applied and `filter.pending = true`, and the UI says so rather than presenting t
 as filtered. A failed analysis is not retried automatically. Browsers cache filtered
 distributions under a token of analysis run and corrections.
 
+The website and the worker are separate processes, and each runs the code it started
+with. A Z analysis records which version of the method made it, and the website only uses
+one made by its own version: after an update, a worker that was not restarted answers with
+the older version's analysis, which is thrown away and queued again, at most twice per
+website process, and then reported on the image as a failed analysis that names the
+worker, with Retry. A worker in turn refuses a request that a website of another version
+queued.
+
 ### Validation
 
 There is still no expert ground truth for tilt on real images. What follows tests the method

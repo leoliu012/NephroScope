@@ -102,6 +102,10 @@ SAMPLE_SPUR = 2
 SAMPLE_JUNCTION = 3
 
 
+class UnsupportedArtifactVersion(ValueError):
+    """A saved plane analysis was written by another version of this module."""
+
+
 @dataclass
 class StackPlane:
     """One saved prediction: its plane, Z projection centre, mask and geometry.
@@ -207,7 +211,7 @@ class PlaneAnalysis:
     def from_arrays(cls, values) -> "PlaneAnalysis":
         version = str(np.asarray(values["algorithm_version"]).reshape(-1)[0])
         if version != ALGORITHM_VERSION:
-            raise ValueError(f"Unsupported cross-section artifact version: {version}")
+            raise UnsupportedArtifactVersion(f"Unsupported cross-section artifact version: {version}")
         shape = np.asarray(values["shape"]).reshape(-1)
         return cls(
             z_index=int(np.asarray(values["z_index"]).reshape(-1)[0]),
@@ -1646,6 +1650,7 @@ def classify_stack(
 
 __all__ = [name for name in globals() if name.isupper()] + [
     "PlaneAnalysis",
+    "UnsupportedArtifactVersion",
     "FieldMotion",
     "StackPlane",
     "analyze_stack",
